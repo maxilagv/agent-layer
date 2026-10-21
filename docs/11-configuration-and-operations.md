@@ -43,6 +43,12 @@ layeragent serve
 
 The default listener is loopback. For remote access, use TLS termination, correctly forwarded host/origin information, a private service environment and scoped delegated tokens. Review `deploy/layeragent.service` before installing it as a user service. Do not expose owner MCP to callers who should have only delegated workspace access.
 
+## Encrypted remote bridge
+
+The optional remote coordinator and project runners use separate mTLS identities and signed/encrypted jobs. Their JSON configuration, grants, pairing, rotation and recovery are documented in [remote execution and MCP trust](14-remote-execution-and-mcp-trust.md). The coordinator directly terminates mTLS; its identities are not forwarded-header or owner-gateway bearer credentials.
+
+`python3 tests/verify.py --native-user` selects the same native checks through an already delegated systemd user manager. It does not install policy or weaken unavailable checks.
+
 ## Troubleshooting
 
 | Symptom | Check |

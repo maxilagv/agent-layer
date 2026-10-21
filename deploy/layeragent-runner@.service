@@ -1,0 +1,30 @@
+[Unit]
+Description=LayerAgent paired project runner %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Create a distinct unprivileged Linux account for each project boundary.
+User=layeragent-%i
+Group=layeragent-%i
+ExecStart=/usr/local/bin/layeragent remote runner --config /var/lib/layeragent-remote/runners/%i/runner.json
+EnvironmentFile=-/var/lib/layeragent-remote/runners/%i/runner.env
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+# Native Bubblewrap/Landlock/seccomp remain mandatory. Do not add an
+# unconfined fallback if host policy prevents namespace creation.
+Delegate=memory pids cpu
+DelegateSubgroup=supervisor
+TasksMax=256
+MemoryMax=2G
+LimitNOFILE=4096
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

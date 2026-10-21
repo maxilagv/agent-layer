@@ -42,6 +42,8 @@ Live platform qualification requires separate accounts and credentials. Durable 
 
 ## MCP
 
-Client transports: confined stdio subprocesses and configured HTTP endpoints. Discovery/calls are approval gated. HTTP redirects are disabled, responses and discovery pagination are bounded, and calls are cancellable with deadlines.
+The enabled client adapter is `project-files`: an application-owned catalog with explicit identity/project/tool/operation/destination grants. File effects are checked in the service through descriptor-relative resolution and per-operation Linux Landlock workers. Discovery and calls retain the core approval boundary. Base read-only policy further removes mutation tools.
 
-Server tools currently expose `layeragent_run` and `layeragent_sessions`. HTTP server access is owner-only; it is not a general delegated remote-execution endpoint. Richer authentication and integration administration remain roadmap work.
+Arbitrary stdio/HTTP clients are disabled until an adapter can verify effective restrictions. Existing `enabled = true` configurations without reviewed grants fail validation; tool annotations and a displayed approval are not proof of read-only behavior.
+
+Runtime server tools remain `layeragent_run` and `layeragent_sessions`. HTTP access is owner-only; the encrypted remote bridge uses a separate `/remote/v1` mTLS service. See [remote execution and MCP trust](14-remote-execution-and-mcp-trust.md) for pairing, schema/catalog pinning, queue states and deployment boundaries.

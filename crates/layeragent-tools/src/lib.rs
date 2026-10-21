@@ -11,6 +11,7 @@ use std::{
     sync::Arc,
 };
 pub mod git;
+#[cfg(test)]
 mod mcp_http;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -886,10 +887,7 @@ impl Tools {
         }
     }
     async fn mcp(&self, call: &ToolCall, ctx: &ToolContext<'_>) -> Result<Value> {
-        use rmcp::{
-            ServiceExt,
-            transport::{StreamableHttpClientTransport, TokioChildProcess},
-        };
+        use rmcp::ServiceExt;
         let name = call.arguments["server"]
             .as_str()
             .context("server required")?;
@@ -899,92 +897,74 @@ impl Tools {
             .get(name)
             .context("MCP server is not configured")?;
         ensure!(config.enabled, "MCP server is disabled");
-        // Per-run sandbox state (for example macOS temp dirs) must outlive the connection.
-        let mut guards: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
-        let connection = async {
-            if let Some(url) = &config.url {
-                let client = mcp_http::BoundedClient::new(
-                    url,
-                    ctx.config.policy.max_output_bytes,
-                    ctx.config.policy.timeout_secs,
-                )?;
-                let mut transport_config = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.clone());
-                transport_config.max_sse_event_size = ctx.config.policy.max_output_bytes;
-                transport_config.max_concurrent_requests = 1;
-                transport_config.reinit_on_expired_session = false;
-                Ok::<_, anyhow::Error>(
-                    ().serve(StreamableHttpClientTransport::with_client(
-                        client,
-                        transport_config,
-                    ))
-                    .await?,
-                )
-            } else {
-                let argv = config
-                    .command
-                    .clone()
-                    .context("MCP command or URL required")?;
-                let native = NativeSandbox::new(std::env::current_exe()?);
-                let launch = native.confined_command(&ExecRequest {
-                    argv,
-                    workspace: ctx.workspace.into(),
-                    policy: ctx.config.policy.clone(),
-                    stdin: None,
-                })?;
-                guards.extend(launch.guards);
-                Ok(().serve(TokioChildProcess::new(launch.command)?).await?)
-            }
-        };
-        let service = tokio::select! {_=ctx.cancel.cancelled()=>bail!("MCP cancelled"),r=tokio::time::timeout(std::time::Duration::from_secs(15),connection)=>r??};
-        let operation = async {
-            if call.name == "mcp_list" {
-                // Bound pagination; untrusted servers may return an endless sequence of cursors.
-                let mut cursor = None;
-                let mut tools = Vec::new();
-                let mut bytes = 0usize;
-                for _ in 0..32 {
-                    let page = service
-                        .list_tools(cursor.map(|cursor| {
-                            rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor))
-                        }))
-                        .await?;
-                    bytes = bytes.saturating_add(serde_json::to_vec(&page)?.len());
-                    ensure!(
-                        bytes <= ctx.config.policy.max_output_bytes,
-                        "MCP tool discovery exceeds limit"
-                    );
-                    tools.extend(page.tools);
-                    cursor = page.next_cursor;
-                    if cursor.is_none() {
-                        return Ok::<_, anyhow::Error>(serde_json::to_value(tools)?);
-                    }
-                }
-                bail!("MCP tool discovery pagination limit exceeded")
-            } else {
-                let name = call.arguments["tool"]
-                    .as_str()
-                    .context("tool required")?
-                    .to_string();
-                let args = call.arguments["arguments"]
-                    .as_object()
-                    .cloned()
-                    .context("arguments must be object")?;
-                let p = rmcp::model::CallToolRequestParams::new(name).with_arguments(args);
-                Ok(serde_json::to_value(service.call_tool(p).await.context("MCP tool failed; external action outcome may be uncertain, reconcile before retrying")?)?)
-            }
-        };
-        let result = tokio::select! {
-            _ = ctx.cancel.cancelled() => Err(anyhow::anyhow!("MCP cancelled; external action outcome may be uncertain")),
-            r = tokio::time::timeout(std::time::Duration::from_secs(ctx.config.policy.timeout_secs), operation) =>
-                r.context("MCP operation timed out; external action outcome may be uncertain")?,
-        };
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), service.cancel()).await;
-        let result = result?;
         ensure!(
-            serde_json::to_vec(&result)?.len() <= ctx.config.policy.max_output_bytes,
-            "MCP result exceeds limit"
+            config.adapter.as_deref() == Some("project-files"),
+            "MCP integration lacks verified effect restrictions; review and configure a supported adapter"
         );
-        Ok(result)
+        let grant = config
+            .grant
+            .as_ref()
+            .context("MCP project grant required")?;
+        grant.validate()?;
+        ensure!(&grant.scope == ctx.scope, "MCP identity outside grant");
+        ensure!(
+            grant.root.canonicalize()? == ctx.workspace.canonicalize()?,
+            "MCP project outside grant"
+        );
+        ensure!(
+            config.command.is_none() && config.url.is_none(),
+            "verified project-files adapter cannot be redirected"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let mut effective = grant.clone();
+            if !ctx.config.policy.write {
+                effective.tools.retain(|tool, _| {
+                    layeragent_policy::operation(tool)
+                        .is_ok_and(|op| op == layeragent_policy::Operation::Read)
+                });
+            }
+            let broker = Arc::new(layeragent_policy::files::FileBroker::open(
+                effective.clone(),
+            )?);
+            let adapter = layeragent_policy::mcp::ProjectFiles {
+                broker,
+                grant: effective,
+                cancel: ctx.cancel.clone(),
+            };
+            let (client_io, server_io) =
+                tokio::io::duplex(ctx.config.policy.max_output_bytes.clamp(1024, 65536));
+            let (server, client) = tokio::join!(adapter.serve(server_io), ().serve(client_io));
+            let (server, client) = (server?, client?);
+            let work = async {
+                if call.name == "mcp_list" {
+                    return Ok::<_, anyhow::Error>(serde_json::to_value(
+                        client.list_tools(None).await?.tools,
+                    )?);
+                }
+                let tool = call.arguments["tool"].as_str().context("tool required")?;
+                grant.authorize(ctx.scope, tool, &call.arguments["arguments"])?;
+                let params = rmcp::model::CallToolRequestParams::new(tool.to_owned())
+                    .with_arguments(
+                        call.arguments["arguments"]
+                            .as_object()
+                            .cloned()
+                            .context("object arguments required")?,
+                    );
+                Ok(serde_json::to_value(client.call_tool(params).await?)?)
+            };
+            let result = tokio::select! {_=ctx.cancel.cancelled()=>Err(anyhow::anyhow!("MCP cancelled; reconcile mutations before retrying")),r=tokio::time::timeout(std::time::Duration::from_secs(ctx.config.policy.timeout_secs),work)=>r.context("MCP deadline exceeded; reconcile mutations before retrying")?};
+            let _ = client.cancel().await;
+            let _ = server.cancel().await;
+            let value = result?;
+            ensure!(
+                serde_json::to_vec(&value)?.len() <= ctx.config.policy.max_output_bytes,
+                "MCP result exceeds limit"
+            );
+            Ok(value)
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("verified project-files adapter requires Linux");
     }
 }
 fn browser_approval_context(snapshot: &Value, call: &ToolCall) -> Result<Value> {

@@ -15,6 +15,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--check-current', action='store_true', help='fail if stored verification evidence does not match maintained inputs')
     parser.add_argument('--native', action='store_true', help='also run full Linux confinement in an administrator-authorized delegated service')
+    parser.add_argument('--native-user', action='store_true', help='run unchanged native assertions through an already delegated systemd user manager')
+    parser.add_argument('--remote', action='store_true', help='also run disposable PostgreSQL/mTLS bridge qualification (requires Docker and OpenSSL)')
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[1]
     cargo = shutil.which('cargo') or str(pathlib.Path.home() / '.cargo/bin/cargo')
@@ -46,8 +48,18 @@ def main():
         ('source_signing', [sys.executable, 'tests/source_signing.py']),
         ('live_provider_parser', [sys.executable, 'tests/live_provider.py', '--self-test']),
     ]
-    if args.native:
-        checks.append(('native_confinement', [sys.executable, 'scripts/run_native_tests.py']))
+    if args.remote:
+        remote = [sys.executable, 'tests/remote_smoke.py']
+        if args.native or args.native_user:
+            remote.append('--native')
+        if args.native_user:
+            remote.append('--user-service')
+        checks.append(('remote_bridge', remote))
+    if args.native or args.native_user:
+        native = [sys.executable, 'scripts/run_native_tests.py']
+        if args.native_user:
+            native.append('--user-service')
+        checks.append(('native_confinement', native))
     report = {'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(), **source, 'checks': []}
     for name, command in checks:
         start = time.monotonic()
@@ -66,6 +78,7 @@ def main():
     required_count = len([name for name, _ in checks if name != 'native_confinement'])
     required = [entry for entry in report['checks'] if entry['name'] != 'native_confinement']
     report['development_checks_passed'] = len(required) == required_count and all(entry['passed'] for entry in required) and not report['source_changed_during_verification']
+    report['remote_bridge_verified'] = any(entry['name'] == 'remote_bridge' and entry['passed'] for entry in report['checks'])
     report['native_confinement_verified'] = any(entry['name'] == 'native_confinement' and entry['passed'] for entry in report['checks'])
     (root / 'docs/verification.json').write_text(json.dumps(report, indent=2) + '\n')
     return 0 if report['development_checks_passed'] and all(entry['passed'] for entry in report['checks']) else 1

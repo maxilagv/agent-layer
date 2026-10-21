@@ -33,12 +33,15 @@ def payload(root):
         if not path.is_file():
             continue
         if any(p == '.env' or p.startswith('.env.') or p.endswith(('.pem', '.key'))
-               or p in {'service.env', 'credentials.json', 'secrets.json'} for p in rel.parts):
+               or p.endswith('.keys.json') or p.startswith(('submission-', 'control-')) and p.endswith('.json')
+               or p.startswith('receipts.sqlite') or p in {'service.env', 'credentials.json', 'secrets.json', 'authority.guard'} for p in rel.parts):
             raise ValueError(f'credential file refused: {rel}')
         raw = path.read_bytes()
         # Reject actual user paths and internal dossier links, including escaped
         # spaces in file URLs. These are publication boundaries, not a secret scanner.
         text = raw.decode('utf-8', errors='replace')
+        if re.search(r'AGE-SECRET-KEY-1[A-Z0-9]{20,}', text):
+            raise ValueError(f'private age identity refused: {rel}')
         markers = ('file' + ':///home/', 'file' + ':///Users/', 'file' + ':///private/', 'file' + ':///private-research/',
                    '../' + 'codex', '../' + 'hermes', '../' + 'evidence', '../' + 'dossiers')
         private_home = any(match.group(1) not in {'user', 'operator', 'developer', 'runner', '*', '<user>'}

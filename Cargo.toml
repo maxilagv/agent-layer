@@ -35,6 +35,8 @@ layeragent-core = { version = "0.1.0", path = "crates/layeragent-core" }
 layeragent-gateway = { version = "0.1.0", path = "crates/layeragent-gateway" }
 layeragent-browser = { version = "0.1.0", path = "crates/layeragent-browser" }
 layeragent-ui = { version = "0.1.0", path = "crates/layeragent-ui" }
+layeragent-policy = { version = "0.1.0", path = "crates/layeragent-policy" }
+layeragent-remote = { version = "0.1.0", path = "crates/layeragent-remote" }
 
 [profile.release]
 lto = "thin"

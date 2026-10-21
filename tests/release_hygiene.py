@@ -49,6 +49,17 @@ def main():
             raise AssertionError('secret filename accepted')
         except ValueError:
             pass
+        (root / 'crates/.env').unlink()
+        for name in ['runner.keys.json', 'submission-job.json', 'control-revoke.json', 'receipts.sqlite']:
+            private_file = root / 'crates' / name
+            private_file.write_text('private operational fixture')
+            try:
+                payload(root)
+                raise AssertionError('remote operational file accepted: ' + name)
+            except ValueError:
+                pass
+            finally:
+                private_file.unlink()
     # Audit the actual source tree as well, without producing an export.
     count = len(payload(pathlib.Path(__file__).resolve().parents[1]))
     print(json.dumps({'release_hygiene': 'passed', 'allowlisted_files': count}))

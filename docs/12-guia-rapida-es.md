@@ -33,3 +33,11 @@ El modo `privacy.local_models_only = true` restringe los modelos a endpoints loc
 - [Política de seguridad](../SECURITY.md).
 
 Preparar un paquete local no publica el proyecto ni crea un repositorio Git.
+
+## Permisos MCP y puente remoto
+
+La integración MCP inicial es `project-files`: permisos por proyecto, herramienta, operación y destino, con restricciones reales en el broker Linux. Los servidores arbitrarios permanecen deshabilitados hasta contar con un adaptador verificable.
+
+`layeragent remote --help` reúne emparejamiento, permisos, trabajos cifrados, estado, TUI, cancelación, desconexión y revocación. El coordinador usa PostgreSQL; cada equipo mantiene su autorización local y sus comprobantes de efectos. Las escrituras inciertas requieren revisión explícita, no reintentos automáticos.
+
+Consultá la [instalación y guía operativa del puente remoto](14-remote-execution-and-mcp-trust.md) antes de habilitarlo.

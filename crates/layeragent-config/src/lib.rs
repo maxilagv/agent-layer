@@ -289,11 +289,17 @@ pub struct CustomTool {
     pub approval: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct McpServer {
     pub command: Option<Vec<String>>,
     pub url: Option<String>,
     #[serde(default)]
     pub enabled: bool,
+    /// Only adapters with effective service-side restrictions may be enabled.
+    #[serde(default)]
+    pub adapter: Option<String>,
+    #[serde(default)]
+    pub grant: Option<layeragent_policy::McpGrant>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Channel {
@@ -609,6 +615,24 @@ impl Config {
                         || (c.kind == "signal" && url.starts_with("unix:/")),
                     "channel endpoint requires HTTPS, loopback, or a Signal UNIX socket"
                 );
+            }
+        }
+        for (name, server) in &self.mcp {
+            validate_name(name)?;
+            if server.enabled {
+                ensure!(
+                    server.adapter.as_deref() == Some("project-files"),
+                    "MCP {name}: verified adapter required; legacy integrations need review"
+                );
+                ensure!(
+                    server.command.is_none() && server.url.is_none(),
+                    "MCP {name}: project-files cannot override transport"
+                );
+                server
+                    .grant
+                    .as_ref()
+                    .context("MCP project grant required")?
+                    .validate()?;
             }
         }
         for (name, t) in &self.tools {

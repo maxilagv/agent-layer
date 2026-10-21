@@ -81,9 +81,14 @@ token_env = "LAYERAGENT_TOKEN"
 # parameters = { type = "object", properties = { path = { type = "string" } }, required = ["path"], additionalProperties = false }
 # approval = false
 
-# [mcp.project-tools]
-# command = ["node", "tools/mcp-server.js"]
+# MCP integrations need a verified adapter and explicit reviewed grant.
+# Generate grant.json with `layeragent remote grant`, then copy the grant values
+# into [mcp.project_tools.grant] and its nested scope/tools tables.
+# See docs/14-remote-execution-and-mcp-trust.md.
+# [mcp.project_tools]
+# adapter = "project-files"
 # enabled = true
+# Do not set command/url: arbitrary third-party integrations remain disabled.
 
 # [channels.telegram]
 # kind = "telegram"

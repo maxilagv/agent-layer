@@ -1,0 +1,12 @@
+{
+  "bind": "0.0.0.0:9474",
+  "ca": "/etc/layeragent-remote/ca.pem",
+  "certificate": "/etc/layeragent-remote/coordinator.pem",
+  "tls_key": "/etc/layeragent-remote/coordinator.key",
+  "database_env": "LAYERAGENT_REMOTE_DATABASE",
+  "account": "personal",
+  "epoch": "REPLACE_WITH_A_FRESH_UUID_FOR_THIS_AUTHORITY",
+  "owner_signing_key": "REPLACE_WITH_OWNER_PUBLIC_SIGNING_KEY",
+  "owner_certificate_sha256": "REPLACE_WITH_OWNER_PUBLIC_CERTIFICATE_SHA256",
+  "authority_guard": "/var/lib/layeragent-remote/authority/checkpoint.json"
+}

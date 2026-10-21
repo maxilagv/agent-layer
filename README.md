@@ -57,7 +57,7 @@ The same engine powers the CLI, animated TUI, authenticated HTTP API, MCP server
 - **Keep control:** scope filesystem and network access, approve external operations and cancel active work.
 - **Choose your model:** use configured remote providers or a compatible local endpoint.
 - **Continue later:** reopen durable sessions and retrieve scoped historical facts.
-- **Extend deliberately:** add custom tools, confined MCP subprocesses and reusable verified skills.
+- **Extend deliberately:** add custom tools, scoped project-files MCP and reusable verified skills.
 - **Inspect evidence:** retain hashes, artifacts and observed/inferred/unknown analysis records.
 
 ## Capabilities
@@ -72,7 +72,8 @@ The same engine powers the CLI, animated TUI, authenticated HTTP API, MCP server
 | Memory | SQLite WAL/FULL, FTS5/BM25, revisions and optional vector retrieval | Lexical retrieval has no model-download requirement |
 | Skills | Progressive discovery, staged fixtures, promotion, versions and rollback | Promotion requires a working sandbox |
 | Browser | Dedicated Chromium, isolated profile, DOM tools, screenshots and network/console inspection | Linux confinement required; host attach/visible fallback disabled |
-| Integrations | MCP client/server and messaging connectors/webhooks | Credentials and live platform qualification are separate |
+| Integrations | Verified project-files MCP adapter, owner MCP server and messaging connectors | Arbitrary MCP servers require effective restrictions before enablement |
+| Remote bridge | Signed/encrypted jobs, mTLS runners, PostgreSQL leases and local effect receipts | Linux personal/self-hosted; qualify each deployment host |
 | Analysis | Native metadata, entropy, hash-linked evidence and analyzer bridges | External analyzers are optional dependencies |
 | Recovery | Durable effect intent, interrupted-state reconciliation and uncertain deliveries | Unknown effects require reconciliation before retry |
 | Backup | Authenticated encrypted snapshots, manifest verification and new-home restore | Offline workflow; private identity kept separately |
@@ -109,6 +110,8 @@ flowchart TD
 | `layeragent-skills` | Discovery, fixtures, promotion and rollback |
 | `layeragent-gateway` | IPC, HTTP, streams, messaging and MCP server |
 | `layeragent-rea` | Artifact inspection, evidence and analyzer bridges |
+| `layeragent-policy` | MCP grants, catalog pinning and Linux file-effect broker |
+| `layeragent-remote` | Pairing, encrypted jobs, PostgreSQL coordinator and runners |
 
 ## Requirements
 
@@ -275,7 +278,7 @@ The [annotated configuration](examples/config.toml) includes providers, tools, h
 | Execution | Shell and interactive PTY | Native confinement, limits and optional shell approval |
 | Git | Status/diff, brokered stage/commit | Protected metadata; writes require approval |
 | Browser | Open/search, DOM interaction, screenshots | Domain policy; external actions require approval |
-| MCP/custom | Discover/call configured servers; JSON subprocess tools | Concrete approval and configured destination |
+| MCP/custom | Reviewed project-files MCP and JSON subprocess tools | Explicit MCP grants, effective broker checks and concrete approval |
 | Memory/skills | Retrieve/revise facts, load/draft/verify skills | Scope and isolated promotion policy |
 | Delegation | Spawn/wait/cancel/list children | Parent authority, tree budget and worktree isolation |
 | Analysis | Inspect artifacts and invoke installed analyzers | Evidence records and confined external programs |
@@ -320,19 +323,17 @@ Skills are staged, fixture-tested in isolation and versioned before promotion. D
 
 ## MCP and messaging
 
-LayerAgent can **consume MCP tools** and **expose its own runtime**:
-
-```toml
-[mcp.project_tools]
-command = ["node", "tools/mcp-server.js"]
-enabled = true
-```
+LayerAgent exposes its runtime through `layeragent mcp` (stdio) and the owner-only HTTP `/mcp` endpoint (`layeragent_run`, `layeragent_sessions`). Its initial verified client integration is the application-owned **project-files** adapter, with grants per identity, project, tool, operation and destination.
 
 ```bash
-layeragent mcp
+layeragent remote grant --root /srv/projects/demo --project demo \
+  --operations read --destinations docs --out grant.json
+layeragent remote project-files --grant grant.json
 ```
 
-The command exposes MCP over stdio. The HTTP `/mcp` endpoint is owner-only and currently exposes `layeragent_run` and `layeragent_sessions`. Client HTTP connections disable redirects, bound response/discovery size and have cancellation/deadlines. Remote OAuth administration and richer server capabilities remain incomplete.
+To enable that adapter inside the agent, use `adapter = "project-files"` plus the explicit generated grant under `[mcp.NAME]`; do not set `command` or `url`. Legacy arbitrary HTTP/stdio servers are disabled until their effect restrictions can be verified. Tool names and annotations never confer authority. [Permission model and configuration →](docs/14-remote-execution-and-mcp-trust.md)
+
+The encrypted remote bridge has separate mTLS identities, explicit pairing, project-bound grants, PostgreSQL assignments, 60-second maximum leases and local durable receipts. Runners connect outward; model credentials stay on the authorized computer. [Install, pair, operate and recover →](docs/14-remote-execution-and-mcp-trust.md)
 
 Messaging connector code supports Telegram, Discord, Matrix and Signal. Slack/WhatsApp use signed webhooks; WhatsApp subscription verification uses a separate verification secret. Sender/workspace grants are explicit. Matrix encrypted rooms need a decrypting bridge, and Signal needs `signal-cli`.
 
@@ -375,7 +376,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now layeragent.service
 ```
 
-Create the referenced private environment file first. Use TLS termination for remote access and preserve correct host/origin routing. A single self-hosted service is not a certified public multi-tenant SaaS, a desktop app or a distributed cloud runner fleet.
+Create the referenced private environment file first. Use TLS termination for remote access and preserve correct host/origin routing. A single self-hosted service is not a certified public multi-tenant SaaS, a desktop app or a fleet certified for hostile tenants. Use the separate encrypted remote coordinator for project runners; it does not broaden the local owner gateway.
 
 ## Backups and recovery
 
@@ -423,6 +424,7 @@ Global options: `--home PATH`, `--profile NAME`.
 | `rea inspect / ledger / verify / seal` | Inspect artifacts and evidence |
 | `serve` | Start authenticated HTTP plus private runtime transport |
 | `mcp` | Expose runtime tools over stdio |
+| `remote` | Project grants, pairing, encrypted jobs, runners, activity TUI and revocation |
 | `backup keygen / create / verify / restore / retain` | Manage encrypted snapshots |
 | `completions SHELL` | Generate shell completions |
 
@@ -517,6 +519,7 @@ Future maintainers can attach an Ed25519 signature with [`scripts/sign_source.py
 | [01 · Architecture and isolation](docs/01-architecture-and-kernel-isolation.md) | Crate boundaries, Linux confinement and platform limits |
 | [02 · Lifecycle and recovery](docs/02-core-fsm-and-turn-lifecycle.md) | State transitions, effects, cancellation and approvals |
 | [03 · Gateway and integrations](docs/03-omnichannel-gateway-and-event-mesh.md) | API, identity, channels and MCP |
+| [14 · Remote execution and MCP trust](docs/14-remote-execution-and-mcp-trust.md) | Installation, pairing, permissions, queue, revocation and recovery |
 | [04 · Memory and storage](docs/04-episodic-memory-and-knowledge-graph.md) | WAL, retrieval, revisions and embeddings |
 | [05 · Skills](docs/05-self-evolving-skills-and-metacognition.md) | Staging, fixtures, promotion and versions |
 | [06 · Context and budgets](docs/06-context-engineering-and-token-budgeting.md) | Instruction scope, compaction and accounting |
@@ -530,7 +533,7 @@ Future maintainers can attach an Ed25519 signature with [`scripts/sign_source.py
 
 ## Roadmap and license
 
-The immediate goal is a reliable local/self-hosted engineering agent. Upcoming product areas include guided onboarding, richer project/change review, desktop/web clients, authenticated remote runners, durable scheduling and independently qualified team isolation.
+The immediate goal is a reliable local/self-hosted engineering agent. Upcoming product areas include guided onboarding, richer project/change review, desktop/web clients, production qualification of the encrypted remote bridge and independently qualified team isolation.
 
 Stable releases are gated by native confinement, platform qualification, recovery evidence and representative task evaluations. Scope and acceptance criteria live in [`PRODUCT.md`](PRODUCT.md).
 

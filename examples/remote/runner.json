@@ -1,0 +1,19 @@
+{
+  "endpoint": "https://gateway.example.com:9474/",
+  "ca": "/var/lib/layeragent-remote/runners/demo/ca.pem",
+  "certificate": "/var/lib/layeragent-remote/runners/demo/runner.pem",
+  "tls_key": "/var/lib/layeragent-remote/runners/demo/runner.key",
+  "keys": "/var/lib/layeragent-remote/runners/demo/runner.keys.json",
+  "owner_signing_key": "REPLACE_WITH_OWNER_PUBLIC_SIGNING_KEY",
+  "owner_encryption_key": "REPLACE_WITH_OWNER_PUBLIC_AGE_RECIPIENT",
+  "enrollment": "/var/lib/layeragent-remote/runners/demo/enrollment.json",
+  "state": "/var/lib/layeragent-remote/runners/demo/state",
+  "grant": "/var/lib/layeragent-remote/runners/demo/grant.json",
+  "templates": {
+    "check": { "argv": ["/usr/bin/python3", "-m", "unittest"], "timeout_secs": 120 }
+  },
+  "limits": { "memory_bytes": 1073741824, "max_pids": 64, "cpu_percent": 100, "execution_secs": 300, "concurrent_jobs": 1 },
+  "agent_home": null,
+  "allowed_models": [],
+  "agent_profile_revision": null
+}

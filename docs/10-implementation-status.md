@@ -12,14 +12,15 @@
 | Lifecycle | Typed edges, durable intent/results, uncertainty recovery, scoped cancellation | Scripted lifecycle tests plus executable restart/transport smokes; real external-effect fault drills remain required. |
 | Subagents | Shared budgets, concurrency, cascading stop and isolated worktrees | Scripted models; broader real-model effectiveness remains unqualified. |
 | Gateway | Authenticated API/streams, owner-only administration, grants and bounded admission | Authorization/transport fixtures and real executable smoke tests; not hostile multi-tenant SaaS certification. |
-| MCP | Confined stdio and bounded HTTP client; two owner server tools | Authenticated remote ecosystem qualification and richer server capabilities remain incomplete. |
+| MCP | Application-owned project-files service; exact grants, reviewed catalog and descriptor/Landlock enforcement; two owner runtime server tools | Arbitrary HTTP/stdio integrations fail closed pending verified adapters. MCP transport and real rejected file effects have dedicated tests. |
+| Remote execution | mTLS pairing, signed age-encrypted jobs, PostgreSQL assignments, lease/generation fencing, local receipts, CLI/TUI, scratch agent execution and checkpoint recovery | Disposable-PostgreSQL/TLS smoke and delegated Linux native tests are explicit qualification steps. Distinct-UID production deployment, independent-host partitions and sustained load remain deployment gates. |
 | Providers | Five adapters, fallback, OAuth/keyring, privacy policy and credential registration | MiniMax through Vercel AI Gateway has a real opt-in streaming/restart/tool check. Other provider routes and OAuth still need their own live qualification before being advertised as verified. |
 | Plaintext handling | Typed/native copy sanitization, bounded stream redaction, sanitized durable text | Supported patterns and registered values only; binary/OCR/encoded secrets and historical exports are not covered. |
 | Memory | WAL/FULL, scoped BM25/cache, optional embedding worker, HNSW/rank fusion, fact revisions | Optional build and deterministic retrieval tests; actual embedding inference and quality need qualification. |
 | Skills | Drafts, credential rejection, confined fixtures, promotion/version rollback | Working native confinement required for real promotion; general synthesis quality unproven. |
 | Analysis | Metadata, evidence chain/checkpoints and analyzer bridges | External analyzers need installation/qualification; no general reconstruction claim. |
 | Backup | Authenticated encrypted offline snapshots, manifest verification, new-home restore and retention | Local roundtrip, wrong-key, tamper and busy-home tests; recurring operational drills remain necessary. |
-| Source distribution | Standalone docs, allowlisted source bundle, dependency inventory, detached-signature tooling and hygiene tests | Disposable-key signing tests only; no trusted release key, Git repository, upload or publication. |
+| Source distribution | Standalone docs, allowlisted source bundle, dependency inventory, detached-signature tooling and hygiene tests | Disposable-key signing tests only; no trusted stable-release signing key or prebuilt release certification. |
 
 ## Reproducible verification
 
@@ -27,13 +28,16 @@
 python3 tests/verify.py
 sudo -v
 python3 tests/verify.py --native
+# On hosts with an already delegated user manager:
+python3 tests/verify.py --native-user
+python3 tests/remote_smoke.py --native --user-service
 ```
 
 `verification.json` is generated evidence: it records the exact maintained source fingerprint, command outcomes, ignored tests and whether inputs changed during verification. A previous report does not certify edited source. Generated reports are excluded from the fingerprint to avoid self-reference. Tests using fixture models do not make paid requests.
 
 Bounded seeded stress/property tests cover fragmented redaction, atomic signed native blocks and malformed/mixed-delimiter provider frames. They are not a coverage-guided fuzzing campaign. Source-signing tests require OpenSSL 3 and disposable keys; recipients still need an independently authenticated release public key.
 
-Native status is recorded independently. An ignored test is not a pass. This environment initially blocked namespace creation; the operator installed the scoped AppArmor profiles, and qualification uses a transient delegated systemd service. The runner needs administrator authentication in the invoking terminal, systemd 254+ and the documented kernel features. Qualification covers the tested host configuration, not every Linux installation. macOS and Windows are outside the first-release scope.
+Native status is recorded independently. An ignored test is not a pass. This environment initially blocked namespace creation; the operator installed the scoped AppArmor profiles, and qualification uses a transient delegated systemd service. The system-manager variant needs administrator authentication. An explicitly selected, already delegated systemd user manager can run the same assertions without changing host security. Both require systemd 254+ and the documented kernel features. Qualification covers the tested host configuration, not every Linux installation. macOS and Windows are outside the first-release scope.
 
 Browser live tests require the CLI helper path and may download Chromium. Provider live tests are opt-in and consume real usage; they load a private external credential file and can emit a private report containing source/binary fingerprints. Fingerprints alone do not prove binary-to-source linkage. Run the documented build immediately before qualification and inspect change flags. Model reasoning and credential values are suppressed.
 

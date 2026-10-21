@@ -59,6 +59,8 @@ jobs:
       - run: sudo apt-get install -y bubblewrap
       - run: sudo sh deploy/apparmor/install.sh
       - run: python3 scripts/run_native_tests.py
+      - run: cargo build -p layeragent-cli --locked
+      - run: python3 tests/remote_smoke.py --native
   dependencies:
     timeout-minutes: 30
     runs-on: ubuntu-22.04

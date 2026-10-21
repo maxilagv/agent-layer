@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 layeragent-protocol.workspace = true
+layeragent-policy.workspace = true
 layeragent-config.workspace = true
 layeragent-storage.workspace = true
 layeragent-sandbox.workspace = true

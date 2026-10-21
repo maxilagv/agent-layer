@@ -1,0 +1,9 @@
+{
+  "endpoint": "https://gateway.example.com:9474/",
+  "ca": "/home/operator/.config/layeragent-remote/ca.pem",
+  "certificate": "/home/operator/.config/layeragent-remote/owner.pem",
+  "tls_key": "/home/operator/.config/layeragent-remote/owner.key",
+  "keys": "/home/operator/.config/layeragent-remote/owner.keys.json",
+  "account": "personal",
+  "epoch": "REPLACE_WITH_THE_COORDINATOR_EPOCH"
+}

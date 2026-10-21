@@ -1,0 +1,32 @@
+[Unit]
+Description=LayerAgent encrypted remote coordinator
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=layeragent-coordinator
+Group=layeragent-coordinator
+ExecStart=/usr/local/bin/layeragent remote coordinator --config /etc/layeragent-remote/coordinator.json
+EnvironmentFile=/etc/layeragent-remote/coordinator.env
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+KillSignal=SIGINT
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/layeragent-remote/authority
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=2G
+TasksMax=128
+LimitNOFILE=1024
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,6 @@
 mod backup;
 mod client;
+mod remote;
 mod tui;
 use anyhow::{Context, Result, ensure};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -23,6 +24,11 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Manage project permissions and the encrypted self-hosted remote bridge.
+    Remote {
+        #[command(subcommand)]
+        command: remote::RemoteCommand,
+    },
     /// Create, verify or restore an encrypted private backup.
     Backup {
         #[command(subcommand)]
@@ -189,6 +195,7 @@ async fn entry() -> Result<()> {
         None
     };
     match command {
+        Command::Remote { command } => remote::dispatch(command).await?,
         Command::Backup { command } => backup::dispatch(&home, command)?,
         Command::Init {
             model,

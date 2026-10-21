@@ -30,7 +30,8 @@ The first version supports Linux only and targets a trusted operator on that hos
 | Execution | Linux namespace launcher, Landlock, seccomp, proxy, limits, PTY | Positive full native suite on supported hosts; platform certification |
 | Interfaces | CLI/TUI, REST/SSE/WebSockets, MCP and channel adapters | Desktop/web product interfaces, live channel qualification |
 | Data | SQLite WAL, lexical and optional vector memory, encrypted offline backups | Operational drills, retention administration and load evidence |
-| Integrations | Five wire adapters, custom tools, MCP client/server | Provider qualification, richer MCP administration and authentication |
+| Integrations | Five wire adapters, custom tools, restricted project-files MCP and owner runtime MCP | Provider qualification and service-specific MCP adapters |
+| Remote work | Encrypted personal/self-hosted bridge, mTLS runners, PostgreSQL leases and local effect receipts | Independent deployment qualification, load/retention operations and broader failure drills |
 | Learning | Drafts, isolated fixtures, promotion, versions and rollback | Independent effectiveness measurements |
 | Artifact analysis | Native metadata, evidence chain and external analyzer bridges | Installed-analyzer qualification and broader reconstruction |
 
@@ -43,7 +44,7 @@ A release is stable only when required tests pass against its recorded source fi
 1. Complete local onboarding, project management and action review.
 2. Qualify deployment on an operator-owned server with TLS and backup drills.
 3. Add web and desktop clients on the existing protocol.
-4. Introduce authenticated remote runners and durable distributed scheduling.
+4. Qualify the encrypted remote bridge across independently deployed hosts and expand its operational tooling.
 5. Consider team accounts and SaaS after independently validating tenant isolation.
 
 No calendar date substitutes for a passed acceptance criterion.

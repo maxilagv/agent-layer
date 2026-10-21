@@ -1,0 +1,28 @@
+[Unit]
+Description=LayerAgent local engineering runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/layeragent serve
+EnvironmentFile=%h/.config/layeragent/service.env
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=15
+NoNewPrivileges=true
+UMask=0077
+# These limits cover the daemon and all of its tools. Override for your workload.
+TasksMax=512
+MemoryMax=8G
+LimitNOFILE=4096
+# Lets policy.limits.cgroup give each tool run its own memory/pids/cpu ceilings. The daemon
+# itself runs in the `supervisor` subgroup (systemd 254+), leaving the service group free to
+# enable controllers for children. LayerAgent creates job siblings there and enables
+# only requested delegated controllers when cgroup limits are explicitly enabled.
+Delegate=memory pids cpu
+DelegateSubgroup=supervisor
+
+[Install]
+WantedBy=default.target

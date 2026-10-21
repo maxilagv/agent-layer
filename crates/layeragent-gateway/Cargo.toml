@@ -1,0 +1,38 @@
+[package]
+name = "layeragent-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+layeragent-protocol.workspace = true
+layeragent-config.workspace = true
+layeragent-storage.workspace = true
+layeragent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+hmac = "0.12"
+subtle = "2"
+async-stream = "0.3"
+tracing.workspace = true
+async-trait.workspace = true
+schemars.workspace = true
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+rmcp = { version = "3.5", features = ["server", "transport-streamable-http-server"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

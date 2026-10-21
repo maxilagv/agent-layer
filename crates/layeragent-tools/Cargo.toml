@@ -1,0 +1,34 @@
+[package]
+name = "layeragent-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+layeragent-protocol.workspace = true
+layeragent-config.workspace = true
+layeragent-storage.workspace = true
+layeragent-sandbox.workspace = true
+layeragent-browser.workspace = true
+layeragent-skills.workspace = true
+layeragent-rea.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+sha2.workspace = true
+hex.workspace = true
+async-trait.workspace = true
+rmcp = { version = "3.5", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+jsonschema = "0.46"
+reqwest.workspace = true
+futures-util.workspace = true
+sse-stream = "0.2.4"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

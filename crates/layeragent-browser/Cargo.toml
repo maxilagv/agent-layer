@@ -1,0 +1,31 @@
+[package]
+name = "layeragent-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+layeragent-protocol.workspace = true
+layeragent-config.workspace = true
+layeragent-sandbox.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tracing.workspace = true
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+base64 = "0.22"
+libc = "0.2"
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

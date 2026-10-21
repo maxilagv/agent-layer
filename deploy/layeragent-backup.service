@@ -1,0 +1,9 @@
+# Optional USER service. Customize paths before copying to ~/.config/systemd/user/.
+[Unit]
+Description=LayerAgent offline encrypted backup
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/layeragent/scripts/backup_home.py --binary %h/.local/bin/layeragent --home %h/.config/layeragent --directory %h/.local/share/layeragent-backups --recipient-file %h/.config/layeragent/backup-recipient.txt --keep 14 --service layeragent.service
+TimeoutStartSec=15min

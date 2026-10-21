@@ -1,0 +1,34 @@
+[package]
+name = "layeragent-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+layeragent-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+hex.workspace = true
+age = { version = "0.12", default-features = false }
+fs2 = "0.4"
+tempfile.workspace = true
+uuid.workspace = true
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+hnsw_rs = "0.3"
+fastembed = { version = "7.1", optional = true, default-features = false, features = ["ort-load-dynamic", "hf-hub-rustls-tls"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[features]
+embeddings = ["dep:fastembed"]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

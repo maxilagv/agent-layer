@@ -1,0 +1,30 @@
+[package]
+name = "layeragent-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+layeragent-protocol.workspace = true
+layeragent-config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64 = "0.22"
+keyring = { version = "3", features = ["linux-native", "apple-native", "windows-native"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+axum = "0.8"
+
+[lints]
+workspace = true

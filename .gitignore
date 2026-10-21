@@ -1,0 +1,22 @@
+/target/
+# Generated verification and benchmark reports stay local.
+/docs/*.json
+/.layeragent/
+*.db
+*.db-shm
+*.db-wal
+.env
+__pycache__/
+*.py[cod]
+
+# Private research and operational material never belongs to a source release.
+/internal-layeragent-design/
+/internal/
+/private/
+/backups/
+*.age
+*.identity
+*.pem
+*.key
+.env.*
+service.env

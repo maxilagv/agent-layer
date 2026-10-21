@@ -1,0 +1,30 @@
+[package]
+name = "layeragent-skills"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+layeragent-protocol.workspace = true
+layeragent-config.workspace = true
+layeragent-storage.workspace = true
+layeragent-sandbox.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }
+walkdir = "2"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true
+async-trait.workspace = true
+
+[lints]
+workspace = true

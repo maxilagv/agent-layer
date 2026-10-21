@@ -1,0 +1,134 @@
+schema_version = 1
+primary = "local"
+fallbacks = []
+max_rounds = 32
+max_input_tokens = 200000
+max_output_tokens = 16384
+auto_skills = true
+# max_cost_usd = 0.50  # requires explicit prices for every eligible model
+instructions = "Preserve existing changes and verify work with project checks."
+
+[providers.local]
+wire = "ollama"
+base_url = "http://127.0.0.1:11434"
+
+[models.local]
+provider = "local"
+id = "YOUR_INSTALLED_MODEL"
+context_window = 32768
+tools = true
+input_per_million = 0.0
+output_per_million = 0.0
+
+[models.local.parameters.options]
+temperature = 0.2
+
+[providers.openai]
+wire = "openai_responses"
+base_url = "https://api.openai.com/v1"
+key_env = "OPENAI_API_KEY"
+
+[models.openai]
+provider = "openai"
+id = "YOUR_OPENAI_MODEL"
+context_window = 32768
+tools = true
+
+[providers.anthropic]
+wire = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+key_env = "ANTHROPIC_API_KEY"
+
+[models.anthropic]
+provider = "anthropic"
+id = "YOUR_ANTHROPIC_MODEL"
+context_window = 32768
+tools = true
+
+[providers.gemini]
+wire = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+key_env = "GEMINI_API_KEY"
+
+[models.gemini]
+provider = "gemini"
+id = "YOUR_GEMINI_MODEL"
+context_window = 32768
+tools = true
+
+[policy]
+shell = true
+write = true
+network = false
+timeout_secs = 300
+max_output_bytes = 1048576
+approval_tools = ["shell"]
+allowed_tools = []
+
+[memory]
+embeddings = false
+model = "multilingual-e5-small"
+idle_seconds = 120
+
+[gateway]
+bind = "127.0.0.1:9473"
+token_env = "LAYERAGENT_TOKEN"
+
+# Custom tools receive JSON on stdin and run inside the sandbox.
+# [tools.count-lines]
+# description = "Count lines in a workspace file"
+# command = ["python3", "scripts/count_lines.py"]
+# parameters = { type = "object", properties = { path = { type = "string" } }, required = ["path"], additionalProperties = false }
+# approval = false
+
+# [mcp.project-tools]
+# command = ["node", "tools/mcp-server.js"]
+# enabled = true
+
+# [channels.telegram]
+# kind = "telegram"
+# mode = "native"
+# token_env = "TELEGRAM_BOT_TOKEN"
+# workspace = "/absolute/path/to/project"
+# [[access]]
+# token_env = "TELEGRAM_USER_HTTP_TOKEN"
+# tenant = "default"
+# principal = "operator"
+# platform = "telegram"
+# sender_id = "YOUR_TELEGRAM_USER_ID"
+# workspaces = ["/absolute/path/to/project"]
+
+# Standard Entra device flow requires a registered public client.
+# [providers.azure]
+# wire = "openai_responses"
+# base_url = "https://YOUR_RESOURCE.openai.azure.com/openai/v1"
+# [providers.azure.oauth]
+# client_id = "YOUR_REGISTERED_PUBLIC_CLIENT_ID"
+# device_url = "https://login.microsoftonline.com/YOUR_TENANT/oauth2/v2.0/devicecode"
+# token_url = "https://login.microsoftonline.com/YOUR_TENANT/oauth2/v2.0/token"
+# scopes = ["https://ai.azure.com/.default"]
+
+# [channels.whatsapp]
+# kind = "whatsapp"
+# mode = "webhook"
+# token_env = "WHATSAPP_ACCESS_TOKEN"
+# secret_env = "META_APP_SECRET"
+# verify_token_env = "WHATSAPP_VERIFY_TOKEN"
+# endpoint = "https://graph.facebook.com/YOUR_API_VERSION/YOUR_PHONE_ID/messages"
+# workspace = "/absolute/path/to/project"
+
+# Outbound model policy. Explicit local-only mode also restricts fallback models.
+[privacy]
+local_models_only = false
+allowed_providers = []
+
+[policy.limits]
+cpu_secs = 120
+file_size_bytes = 268435456
+open_files = 256
+cgroup = false
+
+[browser]
+enabled = true
+allow_domains = ["*"]
+# Narrow this list before browsing sensitive projects.

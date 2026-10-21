@@ -1,0 +1,11 @@
+# Optional USER timer. Enable only after a successful manual backup + restore drill.
+[Unit]
+Description=Daily maintenance window for LayerAgent encrypted backups
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

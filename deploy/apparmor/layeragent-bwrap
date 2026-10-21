@@ -1,0 +1,13 @@
+# AppArmor profile letting Bubblewrap create the user namespaces LayerAgent needs
+# on hosts that set kernel.apparmor_restrict_unprivileged_userns=1 (Ubuntu 24.04+).
+# It only grants `userns` to /usr/bin/bwrap; the host-wide restriction stays enabled
+# Tool workloads retain Landlock/seccomp. Browsers retain outer namespaces plus
+# their mandatory Chromium sandbox; no host-wide protection is disabled.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile layeragent-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/layeragent-bwrap>
+}

@@ -1,0 +1,40 @@
+# Run with the pinned CLI in .github/workflows/ci.yml. New advisories fail;
+# exceptions require an affected path, rationale and expiration review.
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+maximum-db-staleness = "P7D"
+# Scope and expiry additionally enforced by scripts/check_dependencies.py.
+ignore = [
+  { id = "RUSTSEC-2026-0374", reason = "Unmaintained build-time parser of bundled i18n.toml from age's localization macros; no LayerAgent workspace, web, MCP or archive input reaches this parser. Latest i18n-config 0.4.8 still requires it. This waiver covers maintenance status only; it does not waive a vulnerability advisory. Review by 2027-01-20." },
+  { id = "RUSTSEC-2024-0436", reason = "Unmaintained compile-time token-pasting proc macro used by tokenizers under the optional embeddings feature. It does not parse user data at runtime. Latest stable fastembed 7.1.4 still selects tokenizers 0.23.2. This waiver covers maintenance status only; it does not waive a vulnerability advisory. Review by 2027-01-20." },
+]
+
+[licenses]
+include-dev = true
+confidence-threshold = 0.95
+allow = [
+  "MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0",
+  "Unicode-DFS-2016", "Unlicense", "CC0-1.0", "CDLA-Permissive-2.0",
+]
+
+[[licenses.exceptions]]
+name = "option-ext"
+version = "0.2.0"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "terminfo"
+version = "0.9.0"
+allow = ["WTFPL"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

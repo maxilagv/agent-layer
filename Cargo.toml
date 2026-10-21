@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = { version = "1", features = ["uuid1"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal", "fs", "io-util", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "http2", "form", "query"] }
+futures-util = "0.3"
+tracing = "0.1"
+tempfile = "3"
+layeragent-protocol = { version = "0.1.0", path = "crates/layeragent-protocol" }
+layeragent-config = { version = "0.1.0", path = "crates/layeragent-config" }
+layeragent-storage = { version = "0.1.0", path = "crates/layeragent-storage" }
+layeragent-sandbox = { version = "0.1.0", path = "crates/layeragent-sandbox" }
+layeragent-providers = { version = "0.1.0", path = "crates/layeragent-providers" }
+layeragent-tools = { version = "0.1.0", path = "crates/layeragent-tools" }
+layeragent-skills = { version = "0.1.0", path = "crates/layeragent-skills" }
+layeragent-rea = { version = "0.1.0", path = "crates/layeragent-rea" }
+layeragent-core = { version = "0.1.0", path = "crates/layeragent-core" }
+layeragent-gateway = { version = "0.1.0", path = "crates/layeragent-gateway" }
+layeragent-browser = { version = "0.1.0", path = "crates/layeragent-browser" }
+layeragent-ui = { version = "0.1.0", path = "crates/layeragent-ui" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"

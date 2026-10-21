@@ -1,0 +1,35 @@
+[package]
+name = "layeragent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+layeragent-protocol.workspace = true
+layeragent-config.workspace = true
+layeragent-storage.workspace = true
+layeragent-sandbox.workspace = true
+layeragent-providers.workspace = true
+layeragent-tools.workspace = true
+layeragent-skills.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+walkdir = "2"
+similar = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = { version = "0.11", default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

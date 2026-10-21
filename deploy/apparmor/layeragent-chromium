@@ -1,0 +1,12 @@
+# Lets the Chromium that LayerAgent downloads (managed browser) create the user namespaces
+# its own sandbox needs on hosts with kernel.apparmor_restrict_unprivileged_userns=1.
+# Only the managed copy under the default LayerAgent home is covered; a system Chrome keeps
+# whatever profile your distribution ships.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile layeragent-chromium /home/*/.config/layeragent/browser/*/chrome-linux64/chrome flags=(unconfined) {
+  userns,
+
+  include if exists <local/layeragent-chromium>
+}

@@ -78,7 +78,12 @@ pub enum Action {
     None,
     Send(String),
     Cancel,
-    Approve { id: String, allow: bool },
+    Approve {
+        id: String,
+        allow: bool,
+        expected_revision: i64,
+        arguments_hash: String,
+    },
     NewSession,
 }
 
@@ -125,6 +130,9 @@ pub struct Approval {
     pub layout_width: usize,
     pub review_available: bool,
     pub review_error: Option<String>,
+    /// Revision and argument fingerprint the daemon requires in the decision.
+    pub expected_revision: i64,
+    pub arguments_hash: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -313,6 +321,8 @@ impl App {
         }
         if let Some(approval) = &mut self.approval {
             let id = approval.id.clone();
+            let expected_revision = approval.expected_revision;
+            let arguments_hash = approval.arguments_hash.clone();
             return match key {
                 Key::Char('y' | 'Y' | 's' | 'S') | Key::Enter
                     if approval.review_available
@@ -320,7 +330,12 @@ impl App {
                         && approval.reviewed_through >= approval.total_rows =>
                 {
                     self.approval = None;
-                    Action::Approve { id, allow: true }
+                    Action::Approve {
+                        id,
+                        allow: true,
+                        expected_revision,
+                        arguments_hash,
+                    }
                 }
                 Key::Down => {
                     approval.scroll = approval
@@ -354,7 +369,12 @@ impl App {
                 }
                 Key::Char('n' | 'N') | Key::Esc => {
                     self.approval = None;
-                    Action::Approve { id, allow: false }
+                    Action::Approve {
+                        id,
+                        allow: false,
+                        expected_revision,
+                        arguments_hash,
+                    }
                 }
                 Key::Ctrl('c') => {
                     self.approval = None;
@@ -599,6 +619,11 @@ impl App {
                     reviewed_through: 0,
                     layout_width: 0,
                     review_available: false,
+                    expected_revision: data["expected_revision"].as_i64().unwrap_or(0),
+                    arguments_hash: data["arguments_hash"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
                     tool,
                     agent: data["agent_name"].as_str().map(str::to_string),
                 });
@@ -835,7 +860,9 @@ mod tests {
             a.on_key(Key::Char('n')),
             Action::Approve {
                 id: "ap1".into(),
-                allow: false
+                allow: false,
+                expected_revision: 0,
+                arguments_hash: String::new(),
             }
         );
         a.on_event(

@@ -127,7 +127,7 @@ async fn interface(
                 if let Some(id) = event["job_id"].as_str() {
                     job = Some(id.to_string());
                     if cancel_on_start {
-                        let _ = client.post(&format!("/v1/jobs/{id}/cancel"), json!({})).await;
+                        let _ = client.post(&format!("/v1/tasks/{id}/cancel"), json!({})).await;
                     }
                 }
                 app.on_event(&event);
@@ -151,14 +151,26 @@ async fn interface(
             Action::Cancel => match &job {
                 Some(id) => {
                     let _ = client
-                        .post(&format!("/v1/jobs/{id}/cancel"), json!({}))
+                        .post(&format!("/v1/tasks/{id}/cancel"), json!({}))
                         .await;
                 }
                 None => cancel_on_start = true,
             },
-            Action::Approve { id, allow } => {
+            Action::Approve {
+                id,
+                allow,
+                expected_revision,
+                arguments_hash,
+            } => {
                 if let Err(e) = client
-                    .post(&format!("/v1/approvals/{id}"), json!({"allow": allow}))
+                    .post(
+                        &format!("/v1/approvals/{id}"),
+                        json!({
+                            "allow": allow,
+                            "expected_revision": expected_revision,
+                            "arguments_hash": arguments_hash,
+                        }),
+                    )
                     .await
                 {
                     app.note(&format!("No se pudo responder a la aprobación: {e}"));

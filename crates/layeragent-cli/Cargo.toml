@@ -19,6 +19,7 @@ layeragent-skills.workspace = true
 layeragent-rea.workspace = true
 layeragent-core.workspace = true
 layeragent-gateway.workspace = true
+layeragent-web.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

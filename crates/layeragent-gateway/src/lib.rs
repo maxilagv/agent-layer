@@ -14,7 +14,7 @@ use axum::{
 use hmac::{Hmac, Mac};
 use layeragent_core::Engine;
 use layeragent_protocol::redact::redact_text;
-use layeragent_protocol::{PlatformEvent, RunRequest, Scope, new_id};
+use layeragent_protocol::{ApprovalDecision, PlatformEvent, RunRequest, Scope, new_id};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
@@ -27,7 +27,10 @@ use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 mod admission;
 mod channels;
+mod connections;
 pub mod mcp;
+mod remote_view;
+mod tasks;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -103,17 +106,52 @@ impl Identity {
         Ok(())
     }
 }
-pub struct ApiError(anyhow::Error);
+pub struct ApiError {
+    status: StatusCode,
+    error: anyhow::Error,
+}
+impl ApiError {
+    pub fn conflict(error: anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            error,
+        }
+    }
+    pub fn not_found(error: anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            error,
+        }
+    }
+    pub fn unauthorized(error: anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            error,
+        }
+    }
+    pub fn forbidden(error: anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            error,
+        }
+    }
+    pub fn with_status(status: StatusCode, error: anyhow::Error) -> Self {
+        Self { status, error }
+    }
+}
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
-        Self(e.into())
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error: e.into(),
+        }
     }
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":redact_text(&self.0.to_string())})),
+            self.status,
+            Json(json!({"error":redact_text(&self.error.to_string())})),
         )
             .into_response()
     }
@@ -154,7 +192,27 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/sessions", get(sessions).post(create_session))
         .route("/v1/sessions/{id}/turns", post(run))
         .route("/v1/sessions/{id}/events", get(events))
+        .route(
+            "/v1/sessions/{id}/artifacts/{hash}",
+            get(tasks::session_artifact),
+        )
         .route("/v1/sessions/{id}/ws", get(websocket))
+        .route("/v1/tasks", get(tasks::list).post(tasks::create))
+        .route("/v1/tasks/{id}", get(tasks::get))
+        .route("/v1/tasks/{id}/events", get(tasks::events))
+        .route("/v1/tasks/{id}/events/stream", get(tasks::stream))
+        .route("/v1/tasks/{id}/cancel", post(tasks::cancel))
+        .route("/v1/tasks/{id}/correct", post(tasks::correct))
+        .route("/v1/tasks/{id}/corrections", post(tasks::correct))
+        .route("/v1/tasks/{id}/approvals/{approval}", post(tasks::approve))
+        .route("/v1/tasks/{id}/artifacts/{hash}", get(tasks::task_artifact))
+        .route("/v1/tasks/{id}/metrics", get(tasks::metrics))
+        .route("/v1/artifacts/{hash}", get(tasks::artifact))
+        .route("/v1/connections", get(connections::connections))
+        .route("/v1/remote/jobs", get(remote_view::remote_jobs))
+        .route("/v1/connections/{id}/{action}", post(connections::action))
+        .route("/v1/usage", get(tasks::usage))
+        .route("/v1/mcp/capabilities", get(capabilities))
         .route("/v1/jobs/{id}/cancel", post(cancel))
         .route("/v1/approvals/{id}", post(approve))
         .route(
@@ -534,6 +592,10 @@ async fn cancel(
 #[derive(Deserialize)]
 struct Approval {
     allow: bool,
+    #[serde(default)]
+    expected_revision: Option<i64>,
+    #[serde(default)]
+    arguments_hash: Option<String>,
 }
 async fn approve(
     State(s): State<ApiState>,
@@ -541,8 +603,40 @@ async fn approve(
     Path(id): Path<String>,
     Json(r): Json<Approval>,
 ) -> ApiResult<Json<Value>> {
-    s.engine.approve(&i.scope, &id, r.allow).await?;
+    let (Some(expected_revision), Some(arguments_hash)) = (r.expected_revision, r.arguments_hash)
+    else {
+        return Err(ApiError::conflict(anyhow::anyhow!(
+            "approval decision requires expected_revision and arguments_hash; read the task again"
+        )));
+    };
+    let decision = ApprovalDecision {
+        expected_revision,
+        arguments_hash,
+        allow: r.allow,
+    };
+    s.engine
+        .approve(&i.scope, None, &id, &decision)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("inaccessible") {
+                ApiError::forbidden(error)
+            } else {
+                ApiError::conflict(error)
+            }
+        })?;
     Ok(Json(json!({"recorded":true})))
+}
+async fn capabilities(State(s): State<ApiState>) -> Json<Value> {
+    // The project-file MCP adapter exposes tools and paginated resources. It
+    // never exposes prompts, templates or notifications.
+    let _ = &s;
+    Json(json!({
+        "resources": true,
+        "tools": true,
+        "prompts": false,
+        "templates": false,
+        "notifications": false,
+    }))
 }
 async fn config(State(s): State<ApiState>) -> Json<Value> {
     Json(

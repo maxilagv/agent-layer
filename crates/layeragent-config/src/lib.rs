@@ -34,6 +34,20 @@ pub struct Config {
     pub agents: AgentsConfig,
     pub browser: BrowserConfig,
     pub privacy: Privacy,
+    /// The encrypted remote bridge of this profile, when it is configured.
+    #[serde(default)]
+    pub remote: Option<RemoteBridge>,
+}
+
+/// Location of the encrypted remote bridge.
+///
+/// Only the owner client configuration is referenced. The daemon reads the
+/// public job metadata from it and never receives a pairing key.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct RemoteBridge {
+    /// Path of the owner client configuration of the bridge.
+    pub client: PathBuf,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -61,6 +75,7 @@ impl Default for Config {
             agents: AgentsConfig::default(),
             browser: BrowserConfig::default(),
             privacy: Privacy::default(),
+            remote: None,
         }
     }
 }

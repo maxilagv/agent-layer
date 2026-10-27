@@ -1,0 +1,33 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Authority of the LayerAgent main window: window and event basics plus the bounded commands of the shell. The shell installs no plugin, so there is no filesystem, shell, process or HTTP permission to grant. Every command is a thin, bounded bridge to the local daemon, which enforces the real rules.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-bootstrap",
+    "allow-list-projects",
+    "allow-list-sessions",
+    "allow-session-events",
+    "allow-list-tasks",
+    "allow-create-task",
+    "allow-task",
+    "allow-get-task",
+    "allow-task-events",
+    "allow-cancel-task",
+    "allow-correct-task",
+    "allow-approve",
+    "allow-artifact",
+    "allow-list-connections",
+    "allow-connection-action",
+    "allow-usage",
+    "allow-config",
+    "allow-models",
+    "allow-list-models",
+    "allow-mcp-capabilities",
+    "allow-daemon-status",
+    "allow-stop-daemon",
+    "allow-subscribe",
+    "allow-unsubscribe"
+  ]
+}

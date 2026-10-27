@@ -28,6 +28,40 @@ fn entry(name: &str, provider: &Provider) -> Result<keyring::Entry> {
         &credential_identity(name, provider)?,
     )?)
 }
+
+/// The credential store entry that holds a plain API key.
+fn api_key_entry(name: &str, provider: &Provider) -> Result<keyring::Entry> {
+    Ok(keyring::Entry::new(
+        "layeragent",
+        &format!("{}:api-key", credential_identity(name, provider)?),
+    )?)
+}
+
+/// Stores an API key in the operating system credential store.
+///
+/// The key never enters the configuration file or any assistant state; only
+/// the store holds it.
+pub fn store_api_key(name: &str, provider: &Provider, value: &str) -> Result<()> {
+    ensure!(!value.trim().is_empty(), "the credential is empty");
+    ensure!(
+        !value.contains('\n') && !value.contains('\r'),
+        "the credential must be a single line"
+    );
+    api_key_entry(name, provider)?
+        .set_password(value.trim())
+        .context("the system credential store rejected the credential")?;
+    layeragent_protocol::redact::register_secret(value.trim());
+    Ok(())
+}
+
+/// Removes a stored API key.
+pub fn forget_api_key(name: &str, provider: &Provider) -> Result<()> {
+    match api_key_entry(name, provider)?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("No matching entry") => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
 pub async fn credential(
     client: &reqwest::Client,
     name: &str,
@@ -36,6 +70,14 @@ pub async fn credential(
     if let Some(key) = &p.key_env {
         let value = std::env::var(key)
             .with_context(|| format!("missing credential environment variable {key}"))?;
+        layeragent_protocol::redact::register_secret(&value);
+        return Ok(Some(value));
+    }
+    // A key stored by the guided setup is read from the system credential
+    // store. The environment variable still wins when both exist.
+    if let Ok(value) = api_key_entry(name, p)?.get_password()
+        && !value.is_empty()
+    {
         layeragent_protocol::redact::register_secret(&value);
         return Ok(Some(value));
     }

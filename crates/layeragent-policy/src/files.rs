@@ -16,6 +16,11 @@ use std::{
 };
 
 const MAX_FILE: u64 = 16 * 1024 * 1024;
+/// Maximum bytes returned by one MCP resource read.
+pub const RESOURCE_READ_LIMIT: usize = 64 * 1024;
+/// Maximum depth and breadth of a resource catalog.
+const RESOURCE_DEPTH: usize = 6;
+const RESOURCE_ENTRIES: usize = 2000;
 #[repr(C)]
 struct OpenHow {
     flags: u64,
@@ -153,6 +158,169 @@ impl FileBroker {
                 0,
             )?)
         })
+    }
+    /// Bounded catalog of readable project files for MCP `resources/list`.
+    ///
+    /// The catalog is derived from the same read destinations as the file
+    /// tools. It exposes names and sizes only; content requires an explicit
+    /// read.
+    pub fn resource_catalog(
+        &self,
+        scope: &Scope,
+        check: impl Fn() -> Result<()> + Sync,
+    ) -> Result<Vec<Value>> {
+        ensure!(&self.grant.scope == scope, "MCP identity outside grant");
+        let destinations = self.grant.read_destinations()?;
+        self.check_source()?;
+        let current = std::fs::symlink_metadata(&self.grant.root)?;
+        ensure!(
+            !current.file_type().is_symlink()
+                && (current.dev(), current.ino()) == self.root_identity,
+            "project root changed"
+        );
+        let _local = self
+            .local_lock
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("project broker busy"))?;
+        self.root
+            .try_lock_exclusive()
+            .context("project broker busy")?;
+        let verify = || {
+            self.check_source()?;
+            check()
+        };
+        let result = self.confined(false, || {
+            verify()?;
+            let mut out: Vec<Value> = Vec::new();
+            for destination in &destinations {
+                let directory = open_at(
+                    self.root.as_raw_fd(),
+                    destination,
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )?;
+                self.walk_resources(&directory, destination, 0, &mut out)?;
+            }
+            out.sort_by(|a, b| {
+                a["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(b["path"].as_str().unwrap_or_default())
+            });
+            out.truncate(RESOURCE_ENTRIES);
+            Ok(out)
+        });
+        FileExt::unlock(&self.root)?;
+        result
+    }
+    fn walk_resources(
+        &self,
+        directory: &File,
+        prefix: &str,
+        depth: usize,
+        out: &mut Vec<Value>,
+    ) -> Result<()> {
+        if depth > RESOURCE_DEPTH || out.len() >= RESOURCE_ENTRIES {
+            return Ok(());
+        }
+        let mut names = Vec::new();
+        for (visited, entry) in
+            std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))?.enumerate()
+        {
+            ensure!(visited < 1000, "directory listing exceeds limit");
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if crate::validate_path(&name, false).is_err() {
+                continue;
+            }
+            names.push(name);
+        }
+        names.sort();
+        for name in names {
+            if out.len() >= RESOURCE_ENTRIES {
+                break;
+            }
+            let Ok(file) = open_at(directory.as_raw_fd(), &name, libc::O_PATH, 0) else {
+                continue;
+            };
+            let metadata = file.metadata()?;
+            let relative = if prefix == "." {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if metadata.is_dir() {
+                self.walk_resources(&file, &relative, depth + 1, out)?;
+            } else if metadata.is_file() && metadata.nlink() == 1 {
+                out.push(json!({"path": relative, "bytes": metadata.size()}));
+            }
+        }
+        Ok(())
+    }
+    /// Reads one resource as bounded UTF-8.
+    ///
+    /// A file larger than the limit is truncated and reported as truncated;
+    /// the complete content is available through the existing paginated read.
+    pub fn read_resource(
+        &self,
+        scope: &Scope,
+        path: &str,
+        check: impl Fn() -> Result<()> + Sync,
+    ) -> Result<Value> {
+        self.grant.authorize_read_path(scope, path)?;
+        self.check_source()?;
+        let current = std::fs::symlink_metadata(&self.grant.root)?;
+        ensure!(
+            !current.file_type().is_symlink()
+                && (current.dev(), current.ino()) == self.root_identity,
+            "project root changed"
+        );
+        let _local = self
+            .local_lock
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("project broker busy"))?;
+        self.root
+            .try_lock_exclusive()
+            .context("project broker busy")?;
+        let verify = || {
+            self.check_source()?;
+            check()
+        };
+        let result = self.confined(false, || {
+            verify()?;
+            let file = open_at(
+                self.root.as_raw_fd(),
+                path,
+                libc::O_RDONLY | libc::O_NONBLOCK,
+                0,
+            )?;
+            regular(&file)?;
+            let mut data = Vec::new();
+            file.take(RESOURCE_READ_LIMIT as u64 + 1)
+                .read_to_end(&mut data)?;
+            let mut truncated = data.len() > RESOURCE_READ_LIMIT;
+            if truncated {
+                data.truncate(RESOURCE_READ_LIMIT);
+            }
+            let text = match std::str::from_utf8(&data) {
+                Ok(text) => text.to_string(),
+                Err(error) if error.error_len().is_none() => {
+                    // A character straddles the limit: keep the complete prefix.
+                    truncated = true;
+                    String::from_utf8_lossy(&data[..error.valid_up_to()]).into_owned()
+                }
+                Err(_) => anyhow::bail!("resource is not UTF-8 text"),
+            };
+            Ok(json!({
+                "path": path,
+                "text": text,
+                "bytes": data.len(),
+                "truncated": truncated,
+                "content_sha256": digest(&data),
+            }))
+        });
+        FileExt::unlock(&self.root)?;
+        result
     }
     pub fn invoke(&self, scope: &Scope, tool: &str, args: &Value) -> Result<Value> {
         self.invoke_checked(scope, tool, args, || Ok(()))

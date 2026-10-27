@@ -4,6 +4,8 @@ use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod redact;
+pub mod task;
+pub use task::*;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub fn now_ms() -> i64 {
@@ -168,6 +170,14 @@ pub struct RunResult {
     pub turn_id: String,
     pub text: String,
     pub usage: Usage,
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// Milliseconds spent waiting for the provider across all attempts.
+    #[serde(default)]
+    pub provider_ms: u64,
+    /// Milliseconds spent inside tool execution.
+    #[serde(default)]
+    pub tool_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

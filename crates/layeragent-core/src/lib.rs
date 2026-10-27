@@ -18,6 +18,7 @@ type SharedTracker = Option<Arc<Mutex<workspace::Tracker>>>;
 mod agents;
 pub mod fsm;
 mod learning;
+mod metrics;
 mod workspace;
 
 mod instructions;
@@ -105,7 +106,17 @@ struct Pending {
     scope: Scope,
     turn: String,
     revision: String,
+    arguments_hash: String,
+    expected_revision: i64,
+    expires_at: i64,
     tx: oneshot::Sender<bool>,
+}
+#[derive(Default)]
+struct Timing {
+    provider_ms: u64,
+    tool_ms: u64,
+    usage: Usage,
+    cost_usd: f64,
 }
 use fsm::{ContextPhase, DonePhase, FinalPhase, InferencePhase, PreflightPhase, ToolsPhase, Turn};
 impl Engine {
@@ -210,31 +221,44 @@ impl Engine {
             ]);
             let mut snapshot = self.config.write().await;
             *snapshot = Arc::new(config);
-            if authority_changed {
-                let mut epoch = self
-                    .authority_cancel
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("authority lock poisoned"))?;
-                epoch.cancel();
-                *epoch = CancellationToken::new();
-            }
             drop(snapshot);
-            if authority_changed && let Ok(active) = self.active.lock() {
-                for (_, _, cancel) in active.values() {
-                    cancel.cancel();
-                }
-            }
-            let pending = std::mem::take(
-                &mut *self
-                    .approvals
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("approval lock poisoned"))?,
-            );
-            for (_, p) in pending {
-                let _ = p.tx.send(false);
+            if authority_changed {
+                self.invalidate_authority()?;
             }
         }
         Ok(changed)
+    }
+
+    /// Rotates the authority epoch and stops work that observed the old one.
+    ///
+    /// Revoking a connection does not change the configuration text, so it
+    /// must invalidate authority explicitly. Every in-flight task is stopped:
+    /// an effect authorized by the previous generation can no longer be
+    /// assumed to be safe.
+    pub fn invalidate_authority(&self) -> Result<()> {
+        {
+            let mut epoch = self
+                .authority_cancel
+                .lock()
+                .map_err(|_| anyhow::anyhow!("authority lock poisoned"))?;
+            epoch.cancel();
+            *epoch = CancellationToken::new();
+        }
+        if let Ok(active) = self.active.lock() {
+            for (_, _, cancel) in active.values() {
+                cancel.cancel();
+            }
+        }
+        let pending = std::mem::take(
+            &mut *self
+                .approvals
+                .lock()
+                .map_err(|_| anyhow::anyhow!("approval lock poisoned"))?,
+        );
+        for (_, approval) in pending {
+            let _ = approval.tx.send(false);
+        }
+        Ok(())
     }
     pub async fn store(&self, scope: &Scope) -> Result<Storage> {
         validate_name(&scope.tenant)?;
@@ -289,6 +313,8 @@ impl Engine {
                 .entry(delta.attempt.clone())
                 .or_default()
                 .push(&delta.text)
+        } else if delta.kind == "network_ms" {
+            String::new()
         } else {
             if delta.kind == "attempt_discarded" {
                 // Never publish the unfinished tail of a failed attempt.
@@ -299,15 +325,13 @@ impl Engine {
         if delta.kind == "text_delta" && text.is_empty() {
             return Ok(());
         }
-        self.emit(
-            scope,
-            store,
-            session,
-            Some(turn),
-            &delta.kind,
-            json!({"attempt":delta.attempt,"model":delta.model,"text":text}),
-        )
-        .await
+        let data = if delta.kind == "network_ms" {
+            json!({"ms":delta.text.parse::<u64>().unwrap_or(0)})
+        } else {
+            json!({"attempt":delta.attempt,"model":delta.model,"text":text})
+        };
+        self.emit(scope, store, session, Some(turn), &delta.kind, data)
+            .await
     }
     pub fn cancel(&self, scope: &Scope, id: &str) -> Result<bool> {
         let active = self
@@ -321,7 +345,13 @@ impl Engine {
         }
         Ok(false)
     }
-    pub async fn approve(&self, scope: &Scope, id: &str, allow: bool) -> Result<()> {
+    pub async fn approve(
+        &self,
+        scope: &Scope,
+        turn: Option<&str>,
+        id: &str,
+        decision: &ApprovalDecision,
+    ) -> Result<()> {
         let revision = self.config().await.revision();
         let mut approvals = self
             .approvals
@@ -329,9 +359,25 @@ impl Engine {
             .map_err(|_| anyhow::anyhow!("approval lock poisoned"))?;
         let p = approvals.get(id).context("approval expired or missing")?;
         ensure!(&p.scope == scope, "approval inaccessible");
+        ensure!(
+            turn.is_none_or(|turn| p.turn == turn),
+            "approval is not part of this task"
+        );
         ensure!(p.revision == revision, "policy changed; approval expired");
+        ensure!(
+            p.expires_at > now_ms(),
+            "approval expired; read the task again"
+        );
+        ensure!(
+            p.expected_revision == decision.expected_revision,
+            "stale approval revision; read the task again"
+        );
+        ensure!(
+            p.arguments_hash == decision.arguments_hash,
+            "tool arguments changed; read the task again"
+        );
         let pending = approvals.remove(id).context("approval disappeared")?;
-        let _ = pending.tx.send(allow);
+        let _ = pending.tx.send(decision.allow);
         Ok(())
     }
     async fn approval(
@@ -347,6 +393,11 @@ impl Engine {
         let (tx, rx) = oneshot::channel();
         let config = self.config().await;
         let action_context = self.tools.approval_context(scope, turn, call).await?;
+        let arguments_hash = hex::encode(Sha256::digest(serde_json::to_vec(&call.arguments)?));
+        let (task_revision, _) = store.task_binding(turn).await?.unwrap_or((0, 0));
+        // Emitting `approval_required` increments the persisted task revision.
+        let expected_revision = task_revision.saturating_add(1);
+        let expires_at = now_ms() + 300_000;
         self.approvals
             .lock()
             .map_err(|_| anyhow::anyhow!("approval lock poisoned"))?
@@ -356,6 +407,9 @@ impl Engine {
                     scope: scope.clone(),
                     turn: turn.into(),
                     revision: config.revision(),
+                    arguments_hash: arguments_hash.clone(),
+                    expected_revision,
+                    expires_at,
                     tx,
                 },
             );
@@ -372,12 +426,21 @@ impl Engine {
                 .get(&call.name)
                 .map(|tool| json!({"command":tool.command})),
         };
-        self.emit(scope,store,session,Some(turn),"approval_required",json!({"approval_id":id,"call":call,"destination":destination,"action_context":action_context,"arguments_hash":hex::encode(Sha256::digest(serde_json::to_vec(&call.arguments)?)),"expires_at":now_ms()+300_000})).await?;
+        self.emit(scope,store,session,Some(turn),"approval_required",json!({"approval_id":id,"call":call,"destination":destination,"action_context":action_context,"arguments_hash":arguments_hash,"expected_revision":expected_revision,"expires_at":expires_at})).await?;
         let allow = tokio::select! {_=cancel.cancelled()=>false,result=tokio::time::timeout(std::time::Duration::from_secs(300),rx)=>result.ok().and_then(Result::ok).unwrap_or(false)};
         self.approvals
             .lock()
             .map_err(|_| anyhow::anyhow!("approval lock poisoned"))?
             .remove(&id);
+        self.emit(
+            scope,
+            store,
+            session,
+            Some(turn),
+            "approval_resolved",
+            json!({"approval_id":id,"allow":allow}),
+        )
+        .await?;
         if allow {
             ensure!(
                 self.config().await.revision() == config.revision(),
@@ -406,6 +469,28 @@ impl Engine {
         request: RunRequest,
         cancel: CancellationToken,
     ) -> Result<RunResult> {
+        self.run_with_turn(scope, request, cancel, None).await
+    }
+    /// Execute a durable task using its id as the turn id, so every engine event
+    /// is mirrored into the connection-independent task log.
+    pub async fn run_bound(
+        &self,
+        scope: Scope,
+        request: RunRequest,
+        cancel: CancellationToken,
+        task_id: String,
+    ) -> Result<RunResult> {
+        validate_name(&task_id)?;
+        self.run_with_turn(scope, request, cancel, Some(task_id))
+            .await
+    }
+    async fn run_with_turn(
+        &self,
+        scope: Scope,
+        request: RunRequest,
+        cancel: CancellationToken,
+        turn: Option<String>,
+    ) -> Result<RunResult> {
         let cancel = cancel.child_token();
         let authority = self
             .authority_cancel
@@ -413,7 +498,7 @@ impl Engine {
             .map_err(|_| anyhow::anyhow!("authority lock poisoned"))?
             .clone();
         let _cancel_on_drop = cancel.clone().drop_guard();
-        let execution = self.run_inner(scope, request, cancel.clone(), None);
+        let execution = self.run_inner(scope, request, cancel.clone(), None, turn);
         tokio::pin!(execution);
         tokio::select! {
             _ = self.shutdown.cancelled() => { cancel.cancel(); execution.await },
@@ -451,6 +536,7 @@ impl Engine {
         request: RunRequest,
         cancel: CancellationToken,
         agent: Option<Arc<agents::AgentCtl>>,
+        turn: Option<String>,
     ) -> Result<RunResult> {
         ensure!(!self.shutdown.is_cancelled(), "runtime is shutting down");
         ensure!(
@@ -502,7 +588,12 @@ impl Engine {
             config.models.contains_key(&selected),
             "no model configured; run layeragent init and configure a model"
         );
-        let turn_id = new_id();
+        let turn_id = turn.unwrap_or_else(new_id);
+        // A durable task is bound to the session the engine resolved, so its
+        // event log never depends on the connection that submitted it.
+        store
+            .bind_task_turn(&turn_id, &session.id, &turn_id)
+            .await?;
         store
             .start_turn(&session.id, &turn_id, &config.revision())
             .await?;
@@ -514,8 +605,9 @@ impl Engine {
                 (scope.clone(), session.id.clone(), cancel.clone()),
             );
         ctl.bind(&session.id, &turn_id, &cancel);
-        let result = match self.workspace_start(&ctl, &workspace, &cancel).await {
+        let (result, timing) = match self.workspace_start(&ctl, &workspace, &cancel).await {
             Ok(tracker) => {
+                let mut timing = Timing::default();
                 let result = self
                     .run_turn(
                         &scope,
@@ -528,6 +620,7 @@ impl Engine {
                         cancel.clone(),
                         &ctl,
                         &tracker,
+                        &mut timing,
                     )
                     .await;
                 if let Err(error) = &result {
@@ -535,9 +628,9 @@ impl Engine {
                     self.workspace_partial(&scope, &store, &session.id, &turn_id, &tracker, error)
                         .await;
                 }
-                result
+                (result, timing)
             }
-            Err(error) => Err(error),
+            Err(error) => (Err(error), Timing::default()),
         };
         // Children never outlive the turn that spawned them.
         ctl.reap(&turn_id).await;
@@ -554,16 +647,83 @@ impl Engine {
             } else {
                 "failed"
             };
+            let message = error.to_string();
+            // Persist the cancellation request before the terminal event: the
+            // task-state trigger must observe `requested` to reach `cancelled`
+            // rather than `blocked`, even when cancellation did not come from
+            // the HTTP route.
+            if cancel.is_cancelled() {
+                let _ = store.request_cancel(&scope, &turn_id).await;
+            }
+            let cancellation = if cancel.is_cancelled() {
+                if message.contains("reconcil") || message.contains("tool cancelled") {
+                    CancellationState::Uncertain
+                } else {
+                    CancellationState::Confirmed
+                }
+            } else {
+                CancellationState::None
+            };
             store.turn_state(&turn_id, state).await?;
+            // Same ordering rule as completion: persist usage and error before
+            // the terminal event exposes the final state.
+            store
+                .finish_task(
+                    &turn_id,
+                    &json!({"input_tokens":timing.usage.input_tokens,"output_tokens":timing.usage.output_tokens,"cost_usd":timing.cost_usd}),
+                    cancellation,
+                    Some(&message),
+                )
+                .await?;
             self.emit(
                 &scope,
                 &store,
                 &session.id,
                 Some(&turn_id),
                 state,
-                json!({"error":error.to_string()}),
+                json!({"error":message}),
             )
             .await?;
+            if let Err(error) = metrics::record(
+                &store,
+                &turn_id,
+                &selected,
+                &timing.usage,
+                timing.cost_usd,
+                timing.provider_ms,
+                timing.tool_ms,
+            )
+            .await
+            {
+                tracing::warn!(error=%error, "task metrics unavailable");
+            }
+        } else if let Ok(result) = &result {
+            let cancellation = if cancel.is_cancelled() {
+                CancellationState::Confirmed
+            } else {
+                CancellationState::None
+            };
+            store
+                .finish_task(
+                    &turn_id,
+                    &json!({"input_tokens":result.usage.input_tokens,"output_tokens":result.usage.output_tokens,"cost_usd":result.cost_usd}),
+                    cancellation,
+                    None,
+                )
+                .await?;
+            if let Err(error) = metrics::record(
+                &store,
+                &turn_id,
+                &selected,
+                &result.usage,
+                result.cost_usd,
+                timing.provider_ms,
+                timing.tool_ms,
+            )
+            .await
+            {
+                tracing::warn!(error=%error, "task metrics unavailable");
+            }
         }
         self.active
             .lock()
@@ -584,6 +744,7 @@ impl Engine {
         cancel: CancellationToken,
         ctl: &Arc<agents::AgentCtl>,
         tracker: &SharedTracker,
+        timing: &mut Timing,
     ) -> Result<RunResult> {
         let safe_prompt = layeragent_protocol::redact::redact_text(prompt);
         let prompt = safe_prompt.as_str();
@@ -608,6 +769,22 @@ impl Engine {
         let mut cost_usd = 0.0;
         loop {
             ensure!(!cancel.is_cancelled(), "turn cancelled");
+            // A correction persisted by any client is applied only here: no tool
+            // is active and no inference request is in flight.
+            if let Some(correction) = store.next_correction(turn_id).await? {
+                store
+                    .message(
+                        &session.id,
+                        &Message::text(
+                            "user",
+                            format!(
+                                "Operator correction (authoritative for this task, cannot expand permissions): {}",
+                                correction.instruction
+                            ),
+                        ),
+                    )
+                    .await?;
+            }
             ensure!(!ctl.tree.budget.exhausted(), "agent tree budget exhausted");
             let config = agents::effective_config(self.config().await, ctl);
             config.require_model_egress(selected)?;
@@ -676,6 +853,7 @@ impl Engine {
                 .saturating_sub(usage.output_tokens);
             effective.max_cost_usd = effective.max_cost_usd.map(|cap| (cap - cost_usd).max(0.0));
             let (tx, mut rx) = mpsc::channel(64);
+            let inference_started = std::time::Instant::now();
             let future = self.model.infer(
                 &effective,
                 selected,
@@ -694,6 +872,12 @@ impl Engine {
                 self.emit_delta(scope, store, &session.id, turn_id, delta, &mut text_streams)
                     .await?;
             }
+            timing.provider_ms = timing.provider_ms.saturating_add(
+                inference_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
             for (attempt, stream) in &mut text_streams {
                 let text = stream.finish();
                 if !text.is_empty() {
@@ -727,6 +911,8 @@ impl Engine {
             }
             usage.input_tokens += completion.usage.input_tokens;
             usage.output_tokens += completion.usage.output_tokens;
+            timing.usage = usage.clone();
+            timing.cost_usd = cost_usd;
             let ids = completion
                 .calls
                 .iter()
@@ -744,8 +930,14 @@ impl Engine {
                 let finalizing: Turn<FinalPhase> = inference.advance(store).await?;
                 let changes = self.workspace_finish(tracker, &cancel).await?;
                 let diff = changes["diff"].as_str().unwrap_or_default();
-                let artifact = store
-                    .put_artifact(&scope.principal, serde_json::to_vec(&changes)?)
+                let artifact = self
+                    .scoped_artifact(
+                        store,
+                        scope,
+                        &session.id,
+                        turn_id,
+                        serde_json::to_vec(&changes)?,
+                    )
                     .await?;
                 self.emit(
                     scope,
@@ -775,8 +967,22 @@ impl Engine {
                     session_id: session.id.clone(),
                     turn_id: turn_id.into(),
                     text: completion.text,
-                    usage,
+                    usage: usage.clone(),
+                    cost_usd,
+                    provider_ms: timing.provider_ms,
+                    tool_ms: timing.tool_ms,
                 };
+                // Persist usage before the terminal event: the task state
+                // becomes `completed` when the event is inserted, so a reader
+                // must never observe a completed task with empty usage.
+                store
+                    .finish_task(
+                        turn_id,
+                        &json!({"input_tokens":result.usage.input_tokens,"output_tokens":result.usage.output_tokens,"cost_usd":result.cost_usd}),
+                        CancellationState::None,
+                        None,
+                    )
+                    .await?;
                 self.emit(
                     scope,
                     store,
@@ -851,6 +1057,7 @@ impl Engine {
                 let (chunks_tx, mut chunks_rx) = mpsc::channel::<String>(256);
                 let ctx = ToolContext {
                     scope,
+                    session_id: &session.id,
                     turn_id,
                     workspace,
                     store,
@@ -869,6 +1076,7 @@ impl Engine {
                     },
                 };
                 let result = {
+                    let tool_started = std::time::Instant::now();
                     let exec = self.tools.execute(&call, &ctx);
                     tokio::pin!(exec);
                     let mut out = OutputForwarder::new(&call.id);
@@ -884,6 +1092,9 @@ impl Engine {
                             _ = tick.tick() => out.flush(self, scope, store, &session.id, turn_id).await?,
                         }
                     };
+                    timing.tool_ms = timing.tool_ms.saturating_add(
+                        tool_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    );
                     while let Ok(chunk) = chunks_rx.try_recv() {
                         out.push(&chunk);
                     }
@@ -907,7 +1118,9 @@ impl Engine {
                     successful_tools += 1;
                 }
                 let raw = serde_json::to_vec(&result)?;
-                let artifact = store.put_artifact(&scope.principal, raw.clone()).await?;
+                let artifact = self
+                    .scoped_artifact(store, scope, &session.id, turn_id, raw.clone())
+                    .await?;
                 let context = if raw.len() > 16_384 {
                     json!({"artifact":artifact,"preview":clip(&String::from_utf8_lossy(&raw),4096),"note":"Use artifact_read for complete output"})
                 } else {
@@ -1064,6 +1277,22 @@ impl Engine {
         store
             .search_hybrid(principal, workspace, query, model, vector, 5)
             .await
+    }
+    async fn scoped_artifact(
+        &self,
+        store: &Storage,
+        scope: &Scope,
+        session: &str,
+        turn: &str,
+        bytes: Vec<u8>,
+    ) -> Result<Value> {
+        let artifact = store.put_artifact(&scope.principal, bytes).await?;
+        if let Some(hash) = artifact["artifact"].as_str() {
+            store
+                .link_artifact(scope, Some(session), Some(turn), hash)
+                .await?;
+        }
+        Ok(artifact)
     }
     pub fn principal_home(&self, scope: &Scope) -> Result<PathBuf> {
         validate_name(&scope.tenant)?;

@@ -155,6 +155,58 @@ impl McpGrant {
         }
         Ok(())
     }
+    /// Relative prefixes this grant may read. Resources are served from the
+    /// same read authority as the file tools; there is no second grant.
+    pub fn read_destinations(&self) -> Result<BTreeSet<String>> {
+        let mut destinations = BTreeSet::new();
+        for (tool, grant) in &self.tools {
+            if operation(tool).is_ok_and(|op| op == Operation::Read) {
+                destinations.extend(grant.destinations.iter().cloned());
+            }
+        }
+        ensure!(!destinations.is_empty(), "no read grant for resources");
+        Ok(destinations)
+    }
+    /// Authorizes a relative project path against the read destinations.
+    pub fn authorize_read_path(&self, scope: &Scope, path: &str) -> Result<()> {
+        self.validate()?;
+        ensure!(&self.scope == scope, "MCP identity outside grant");
+        validate_path(path, false)?;
+        let destinations = self.read_destinations()?;
+        ensure!(
+            destinations.iter().any(|p| {
+                p == "."
+                    || path == p
+                    || path
+                        .strip_prefix(p)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }),
+            "destination outside grant"
+        );
+        Ok(())
+    }
+    /// Resolves an MCP resource URI to a project-relative path.
+    ///
+    /// Only `file://<project>/<path>` is served, and only for the granted
+    /// project and read destinations. The URI never carries authority: it
+    /// selects content, it does not widen the grant.
+    pub fn authorize_resource(&self, scope: &Scope, uri: &str) -> Result<String> {
+        ensure!(uri.len() <= 4096, "invalid resource uri");
+        let rest = uri
+            .strip_prefix("file://")
+            .context("unsupported resource scheme")?;
+        let (project, path) = rest.split_once('/').context("malformed resource uri")?;
+        ensure!(project == self.project_id, "resource outside project");
+        ensure!(
+            !path.is_empty()
+                && path
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/')),
+            "invalid resource path"
+        );
+        self.authorize_read_path(scope, path)?;
+        Ok(path.to_string())
+    }
     pub fn authorize(&self, scope: &Scope, tool: &str, arguments: &Value) -> Result<()> {
         self.validate()?;
         ensure!(&self.scope == scope, "MCP identity outside grant");

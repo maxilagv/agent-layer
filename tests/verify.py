@@ -46,6 +46,7 @@ def main():
         ('backup_smoke', [sys.executable, 'tests/backup_smoke.py']),
         ('release_hygiene', [sys.executable, 'tests/release_hygiene.py']),
         ('source_signing', [sys.executable, 'tests/source_signing.py']),
+        ('frontend', [sys.executable, 'tests/frontend_smoke.py']),
         ('live_provider_parser', [sys.executable, 'tests/live_provider.py', '--self-test']),
     ]
     if args.remote:

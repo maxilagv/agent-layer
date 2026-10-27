@@ -10,7 +10,9 @@ use std::{
 use tokio::sync::{Semaphore, mpsc, oneshot};
 pub mod backup;
 mod memory;
+mod tasks;
 pub use memory::{EmbeddingWorker, embedding_worker_main};
+pub use tasks::{TaskConflict, TaskCreate};
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 /// A delegated child agent as recorded for audit and recovery.
@@ -51,6 +53,8 @@ struct SearchCache {
 const MIGRATIONS: &[&str] = &[
     include_str!("schema.sql"),
     include_str!("migrations/002_agents.sql"),
+    include_str!("migrations/003_tasks.sql"),
+    include_str!("migrations/004_task_cancellation_trigger.sql"),
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -250,8 +254,15 @@ impl Storage {
                 "INSERT INTO events(session_id,turn_id,at,kind,data) VALUES(?1,?2,?3,?4,?5)",
                 params![session, turn, at, kind, data.to_string()],
             )?;
+            let seq = c.last_insert_rowid();
+            if let Some(turn) = &turn {
+                c.execute(
+                    "INSERT INTO task_events(task_id,at,kind,data) SELECT id,?2,?3,?4 FROM tasks WHERE turn_id=?1",
+                    params![turn, at, kind, data.to_string()],
+                )?;
+            }
             Ok(Event {
-                seq: c.last_insert_rowid(),
+                seq,
                 at,
                 session_id: session,
                 turn_id: turn,
@@ -582,7 +593,9 @@ impl Storage {
         &self.path
     }
     pub async fn recover(&self) -> Result<()> {
-        self.write(|c|{c.execute("UPDATE learned_trajectories SET status='interrupted' WHERE status='pending'",[])?;c.execute("UPDATE agents SET status='interrupted',finished_at=?1 WHERE status IN ('queued','running')",[now_ms()])?;c.execute("UPDATE tool_runs SET status='unknown' WHERE status='running'",[])?;c.execute("UPDATE turns SET state='interrupted' WHERE state NOT IN ('completed','failed','interrupted')",[])?;c.execute("UPDATE inbox SET status='unknown',error='Runtime stopped during processing; reconcile the session before retrying' WHERE status='processing'",[])?;c.execute("UPDATE outbox SET status='unknown',error='Delivery may have completed before the runtime stopped' WHERE status='sending'",[])?;Ok(())}).await
+        self.write(|c|{c.execute("UPDATE learned_trajectories SET status='interrupted' WHERE status='pending'",[])?;c.execute("UPDATE agents SET status='interrupted',finished_at=?1 WHERE status IN ('queued','running')",[now_ms()])?;c.execute("UPDATE tool_runs SET status='unknown' WHERE status='running'",[])?;c.execute("UPDATE turns SET state='interrupted' WHERE state NOT IN ('completed','failed','interrupted')",[])?;c.execute("UPDATE inbox SET status='unknown',error='Runtime stopped during processing; reconcile the session before retrying' WHERE status='processing'",[])?;c.execute("UPDATE outbox SET status='unknown',error='Delivery may have completed before the runtime stopped' WHERE status='sending'",[])?;Ok(())}).await?;
+        self.recover_tasks().await?;
+        Ok(())
     }
     pub async fn enqueue_inbox(
         &self,

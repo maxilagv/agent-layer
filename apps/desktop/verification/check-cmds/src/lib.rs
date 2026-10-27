@@ -1,0 +1,12 @@
+#[path = "../../../src-tauri/src/daemon.rs"]
+pub mod daemon;
+#[path = "../../../src-tauri/src/error.rs"]
+pub mod error;
+#[path = "../../../src-tauri/src/state.rs"]
+pub mod state;
+#[path = "../../../src-tauri/src/commands.rs"]
+pub mod commands;
+#[path = "../../../src-tauri/src/handlers.rs"]
+pub mod handlers;
+#[path = "../../../src-tauri/src/tray.rs"]
+pub mod tray;

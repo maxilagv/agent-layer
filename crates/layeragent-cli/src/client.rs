@@ -155,6 +155,8 @@ impl Client {
             .await?;
         Ok(value["id"].as_str().context("missing session id")?.into())
     }
+    /// Submits the prompt as a durable task and follows its persisted event
+    /// log. Reconnecting with the last sequence never repeats execution.
     pub async fn turn(
         &self,
         session: &str,
@@ -162,28 +164,109 @@ impl Client {
         model: Option<String>,
         tx: mpsc::Sender<Value>,
     ) -> Result<()> {
-        let response = self
+        let key = layeragent_protocol::new_id();
+        let created = self
             .http
-            .post(format!("{}/v1/sessions/{session}/turns", self.base))
-            .json(&json!({"prompt":prompt,"model":model}))
+            .post(format!("{}/v1/tasks", self.base))
+            .header("idempotency-key", &key)
+            .json(&json!({
+                "session_id": session,
+                "objective": prompt,
+                "model": model,
+            }))
             .send()
             .await?;
+        let status = created.status();
+        let body: Value = created.json().await?;
         ensure!(
-            response.status().is_success(),
-            "turn request rejected: {}",
-            response.status()
+            status.is_success(),
+            "{}",
+            body["error"].as_str().unwrap_or("task rejected")
         );
-        let mut bytes = response.bytes_stream();
-        let mut decoder = layeragent_providers::FrameDecoder::default();
-        while let Some(chunk) = bytes.next().await {
-            for frame in decoder.push(&chunk?, false)? {
-                let value: Value = serde_json::from_str(&frame)?;
-                if tx.send(value).await.is_err() {
-                    return Ok(());
+        let task = body["id"]
+            .as_str()
+            .context("task response has no id")?
+            .to_string();
+        if tx
+            .send(json!({"job_id": task, "task_id": task, "session_id": session}))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        let mut after = 0i64;
+        let mut reconnects = 0;
+        loop {
+            let response = self
+                .http
+                .get(format!(
+                    "{}/v1/tasks/{task}/events/stream?after={after}",
+                    self.base
+                ))
+                .send()
+                .await?;
+            ensure!(
+                response.status().is_success(),
+                "task stream rejected: {}",
+                response.status()
+            );
+            let mut bytes = response.bytes_stream();
+            let mut decoder = layeragent_providers::FrameDecoder::default();
+            while let Some(chunk) = bytes.next().await {
+                for frame in decoder.push(&chunk?, false)? {
+                    if frame.trim().is_empty() {
+                        continue;
+                    }
+                    let event: Value = serde_json::from_str(&frame)?;
+                    if let Some(seq) = event["seq"].as_i64() {
+                        after = seq;
+                    }
+                    let kind = event["kind"].as_str().unwrap_or_default().to_string();
+                    let terminal = matches!(
+                        kind.as_str(),
+                        "turn_completed" | "turn_failed" | "failed" | "interrupted"
+                    );
+                    // Notifications are best effort: a closed receiver means the
+                    // caller stopped listening, not that the task is cancelled.
+                    if tx.send(event.clone()).await.is_err() {
+                        return Ok(());
+                    }
+                    if kind == "turn_completed" {
+                        let _ = tx
+                            .send(json!({
+                                "text": event["data"]["text"].clone(),
+                                "session_id": session,
+                                "task_id": task,
+                            }))
+                            .await;
+                        return Ok(());
+                    }
+                    if matches!(kind.as_str(), "failed" | "interrupted") {
+                        let error = event["data"]["error"]
+                            .as_str()
+                            .unwrap_or("task failed")
+                            .to_string();
+                        let _ = tx.send(json!({"error": error})).await;
+                        return Ok(());
+                    }
+                    if terminal {
+                        return Ok(());
+                    }
                 }
             }
+            // The stream ended before a terminal event (daemon restart or a
+            // dropped connection). Only reattach when the task is still live.
+            let task_state = self.get(&format!("/v1/tasks/{task}")).await?;
+            match task_state["state"].as_str() {
+                Some("completed") | Some("failed") | Some("cancelled") | Some("blocked") => {
+                    return Ok(());
+                }
+                _ => {}
+            }
+            reconnects += 1;
+            ensure!(reconnects <= 240, "task stream did not resume");
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-        Ok(())
     }
     pub async fn print_turn(
         &self,
@@ -208,12 +291,12 @@ impl Client {
             tokio::select! {
                 _=tokio::signal::ctrl_c()=>{
                     cancelled=true;
-                    if let Some(id)=&job{let _=self.post(&format!("/v1/jobs/{id}/cancel"),json!({})).await;}
+                    if let Some(id)=&job{let _=self.post(&format!("/v1/tasks/{id}/cancel"),json!({})).await;}
                 },
                 event=rx.recv()=>{
                     let Some(event)=event else{break};
                     if json_output{println!("{event}");}
-                    if let Some(id)=event["job_id"].as_str(){job=Some(id.to_string());if cancelled{let _=self.post(&format!("/v1/jobs/{id}/cancel"),json!({})).await;}}
+                    if let Some(id)=event["job_id"].as_str(){job=Some(id.to_string());if cancelled{let _=self.post(&format!("/v1/tasks/{id}/cancel"),json!({})).await;}}
                     if event["kind"]=="approval_required"{
                         let id=event["data"]["approval_id"].as_str().unwrap_or("");
                         let allow=if !json_output && std::io::stdin().is_terminal() && std::io::stderr().is_terminal(){
@@ -224,7 +307,11 @@ impl Client {
                                 Err(error) => { eprintln!("{error}"); false }
                             }
                         }else{false};
-                        self.post(&format!("/v1/approvals/{id}"),json!({"allow":allow})).await?;
+                        self.post(&format!("/v1/approvals/{id}"),json!({
+                            "allow": allow,
+                            "expected_revision": event["data"]["expected_revision"].as_i64().unwrap_or(0),
+                            "arguments_hash": event["data"]["arguments_hash"].as_str().unwrap_or_default(),
+                        })).await?;
                     }
                     if !json_output && event["kind"]=="text_delta"{
                         print!("{}",event["data"]["text"].as_str().unwrap_or(""));std::io::stdout().flush()?;rendered=true;
@@ -275,7 +362,7 @@ impl layeragent_gateway::mcp::McpBackend for Client {
                 let mut job = None;
                 let mut result = None;
                 loop {
-                    tokio::select! {_=cancel.cancelled()=>{if let Some(id)=&job{let _=self.post(&format!("/v1/jobs/{id}/cancel"),json!({})).await;}anyhow::bail!("MCP operation cancelled");},event=rx.recv()=>{let Some(event)=event else{break};if let Some(id)=event["job_id"].as_str(){job=Some(id.to_string());}
+                    tokio::select! {_=cancel.cancelled()=>{if let Some(id)=&job{let _=self.post(&format!("/v1/tasks/{id}/cancel"),json!({})).await;}anyhow::bail!("MCP operation cancelled");},event=rx.recv()=>{let Some(event)=event else{break};if let Some(id)=event["job_id"].as_str(){job=Some(id.to_string());}
                     if event.get("text").is_some(){result=Some(event);}else if let Some(error)=event["error"].as_str(){anyhow::bail!("{error}");}}}
                 }
                 task.await??;

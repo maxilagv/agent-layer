@@ -485,8 +485,13 @@ impl ChildJob {
                     .agent_update(&handle.id, "running", None, None, None)
                     .await;
                 request.workspace = Some(workspace.to_string_lossy().into_owned());
-                let run =
-                    engine.run_inner(scope.clone(), request, cancel.clone(), Some(ctl.clone()));
+                let run = engine.run_inner(
+                    scope.clone(),
+                    request,
+                    cancel.clone(),
+                    Some(ctl.clone()),
+                    None,
+                );
                 let outcome = tokio::select! {
                     r = run => r,
                     _ = tokio::time::sleep(timeout) => { cancel.cancel(); Err(anyhow::anyhow!("child agent timed out")) }

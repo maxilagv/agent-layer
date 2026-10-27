@@ -1,6 +1,7 @@
 mod backup;
 mod client;
 mod remote;
+mod setup;
 mod tui;
 use anyhow::{Context, Result, ensure};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -77,6 +78,39 @@ enum Command {
     Serve {
         #[arg(long)]
         ipc_only: bool,
+    },
+    /// Serve the shared web interface on the loopback interface.
+    Web {
+        /// Loopback address to bind. Non-loopback addresses are refused.
+        #[arg(long, default_value = "127.0.0.1:9474")]
+        bind: String,
+        /// Directory with the built frontend. Defaults to the local build.
+        #[arg(long)]
+        assets: Option<PathBuf>,
+    },
+    /// Guided, resumable first-run setup.
+    Setup {
+        /// `run` continues the wizard, `status` prints the saved progress.
+        #[arg(default_value = "run")]
+        action: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider protocol, for example `openai_chat` or `anthropic`.
+        #[arg(long)]
+        protocol: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Environment variable that already holds the credential.
+        #[arg(long)]
+        key_env: Option<String>,
+        /// Read the credential from standard input into the system credential store.
+        #[arg(long)]
+        key_stdin: bool,
+        /// Workspace used by the isolation test.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
     },
     /// Stop the local runtime and cancel its active work.
     Stop,
@@ -334,6 +368,48 @@ async fn entry() -> Result<()> {
             println!("Runtime stopping");
         }
         Command::Serve { ipc_only } => serve(home, profile, ipc_only).await?,
+        Command::Web { bind, assets } => web(home, profile, bind, assets).await?,
+        Command::Setup {
+            action,
+            provider,
+            model,
+            protocol,
+            base_url,
+            key_env,
+            key_stdin,
+            workspace,
+        } => {
+            let options = setup::SetupOptions {
+                provider,
+                model,
+                protocol,
+                base_url,
+                key_env,
+                key_stdin,
+                workspace,
+            };
+            match action.as_str() {
+                "run" => {
+                    let state = setup::run(&home, &profile, &options).await?;
+                    let blocked = state.blocked_capabilities();
+                    if !blocked.is_empty() {
+                        println!("Blocked capabilities: {}", blocked.join(", "));
+                    }
+                }
+                "status" => {
+                    let state = setup::SetupState::load(&home)?;
+                    setup::print_state(&state);
+                    if let Some(next) = setup::next_step(&state) {
+                        println!("next step: {next}");
+                    }
+                    let blocked = state.blocked_capabilities();
+                    if !blocked.is_empty() {
+                        println!("Blocked capabilities: {}", blocked.join(", "));
+                    }
+                }
+                other => anyhow::bail!("unknown setup action {other}"),
+            }
+        }
         Command::Run {
             prompt,
             workspace,
@@ -538,6 +614,47 @@ fn doctor_label(check: &DoctorCheck) -> &'static str {
 fn toml_string(c: &Config) -> Result<String> {
     Ok(toml::to_string_pretty(c)?)
 }
+/// Serves the shared web interface on loopback.
+///
+/// The daemon keeps working when this process stops; only the browser
+/// surface is bound here.
+async fn web(home: PathBuf, profile: String, bind: String, assets: Option<PathBuf>) -> Result<()> {
+    let address: std::net::SocketAddr = bind.parse().context("invalid bind address")?;
+    ensure!(
+        address.ip().is_loopback(),
+        "the web interface only binds to loopback addresses"
+    );
+    // The daemon is started on demand and keeps running afterwards.
+    let client = client::Client::connect(&home, &profile).await?;
+    drop(client);
+    let assets = assets.unwrap_or_else(|| default_web_assets(&home));
+    let config = layeragent_web::WebConfig::new(address, home, profile, assets);
+    let (app, code) = layeragent_web::build(&config)?;
+    println!("LayerAgent web interface: http://{address}");
+    println!("Access code (single use): {code}");
+    println!("The code is shown once. It cannot be recovered later.");
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let token = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        token.cancel();
+    });
+    layeragent_web::serve_app(app, address, shutdown).await?;
+    Ok(())
+}
+
+/// Locates the built frontend.
+fn default_web_assets(home: &std::path::Path) -> PathBuf {
+    let installed = home.join("web");
+    if installed.join("index.html").is_file() {
+        return installed;
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| home.to_path_buf())
+        .join("frontend")
+        .join("dist")
+}
+
 async fn serve(home: PathBuf, profile: String, ipc_only: bool) -> Result<()> {
     use fs2::FileExt;
     private_dir(&home)?;

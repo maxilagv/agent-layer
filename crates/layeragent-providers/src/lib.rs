@@ -1,7 +1,7 @@
 mod auth;
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-pub use auth::{login, logout};
+pub use auth::{forget_api_key, login, logout, store_api_key};
 use futures_util::StreamExt;
 use layeragent_config::{Config, Model, Provider, Wire};
 use layeragent_protocol::{Completion, Message, ToolCall, ToolDefinition, Usage, new_id};
@@ -280,10 +280,19 @@ impl Router {
         for (key, value) in &p.headers {
             request = request.header(key, value);
         }
+        let network_started = std::time::Instant::now();
         let response = request.send().await.map_err(|_| ProviderFailure {
             message: "provider connection failed".into(),
             transient: true,
         })?;
+        let _ = stream
+            .send(Delta {
+                attempt: attempt.0.into(),
+                model: attempt.1.into(),
+                kind: "network_ms".into(),
+                text: network_started.elapsed().as_millis().to_string(),
+            })
+            .await;
         let status = response.status();
         if !status.is_success() {
             return Err(ProviderFailure {

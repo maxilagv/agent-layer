@@ -16,6 +16,14 @@
       "parents": ["tokenizers@0.23.2"],
       "review_by": "2027-01-20",
       "reason": "Unmaintained compile-time token-pasting proc macro used by tokenizers under the optional embeddings feature. It does not parse user data at runtime. Latest stable fastembed 7.1.4 still selects tokenizers 0.23.2. This waiver covers maintenance status only; it does not waive a vulnerability advisory. Review by 2027-01-20."
+    },
+    {
+      "id": "RUSTSEC-2026-0387",
+      "crate": "crypto-bigint",
+      "version": "0.5.5",
+      "parents": ["elliptic-curve@0.13.8"],
+      "review_by": "2027-01-20",
+      "reason": "Constant-time branch variability in crypto-bigint 0.5.5 required by elliptic-curve 0.13.8 under age 0.12.1 for offline backup and remote bridge encryption. Latest stable age 0.12.1 still pins elliptic-curve 0.13.8. Review by 2027-01-20."
     }
   ]
 }

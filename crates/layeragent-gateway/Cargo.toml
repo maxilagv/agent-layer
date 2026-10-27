@@ -10,6 +10,7 @@ layeragent-protocol.workspace = true
 layeragent-config.workspace = true
 layeragent-storage.workspace = true
 layeragent-core.workspace = true
+layeragent-remote.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
@@ -33,6 +34,10 @@ rmcp = { version = "3.5", features = ["server", "transport-streamable-http-serve
 
 [dev-dependencies]
 tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }
+layeragent-sandbox.workspace = true
+layeragent-providers.workspace = true
+async-trait.workspace = true
 
 [lints]
 workspace = true

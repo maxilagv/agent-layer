@@ -1,0 +1,42 @@
+[package]
+name = "layeragent-desktop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "LayerAgent desktop shell: a Tauri v2 window that talks to the local LayerAgent daemon over its UNIX socket."
+license = "MIT"
+publish = false
+
+# The desktop app is a standalone workspace on purpose. The shared LayerAgent
+# workspace must keep building while the frontend bundle and the webkit
+# toolchain are still missing, so the desktop crate never joins it and never
+# shares its lock file.
+[workspace]
+
+[lib]
+name = "layeragent_desktop_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
+anyhow = "1"
+thiserror = "2"
+
+[features]
+default = []
+# Enabled by the Tauri CLI for production bundles. With the feature off the
+# crate compiles without the frontend bundle, because the assets are only
+# embedded for a production build.
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

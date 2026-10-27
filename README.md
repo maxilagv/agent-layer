@@ -120,6 +120,8 @@ flowchart TD
 | Rust **1.99.0** | Building | Pinned by `rust-toolchain.toml` |
 | C compiler/linker | Building native dependencies | Bundled SQLite and TLS-related build dependencies |
 | Python **3.11+** | Confined file tools, verification and source packaging | Uses isolated interpreter mode for file tooling |
+| Node **22** | Building the shared frontend | The current Vite release requires Node 22; Node 18 fails the engine check |
+| Tauri system packages | Building the desktop application | `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `libxdo-dev` |
 | Linux + Bubblewrap | Shell/browser execution | User/network/PID namespaces must actually work |
 | Landlock ABI 3 | Linux execution policy | Diagnose with `layeragent doctor` |
 | Model endpoint | Inference | Configured remote service or running local server |
@@ -339,6 +341,29 @@ Messaging connector code supports Telegram, Discord, Matrix and Signal. Slack/Wh
 
 Live platform tests need credentials. Uncertain outgoing deliveries are retained as `unknown` for reconciliation rather than blindly repeated.
 
+## Web and desktop interfaces
+
+The same runtime is reachable from a browser and from a desktop window. Both
+read the same persisted state, so a task started in one place is visible in
+the others.
+
+```bash
+# Guided installation (resumable; saves progress atomically)
+layeragent setup
+
+# Loopback web interface; prints a single-use access code
+layeragent web --bind 127.0.0.1:9474
+
+# Shared frontend (Node 22 is required)
+export PATH="$HOME/.local/node22/bin:$PATH"
+cd frontend && npm install && npm run build && npm test
+```
+
+The browser never holds a bearer token: it uses a single-use code, an
+`HttpOnly` session cookie and a CSRF token. The desktop shell talks to the
+daemon over its UNIX socket with bounded commands and no shell or general
+file access. See [Web, frontend and desktop →](docs/15-web-and-desktop-interfaces.md).
+
 ## HTTP API and self-hosting
 
 Supply `LAYERAGENT_TOKEN` securely in the process environment, then:
@@ -409,9 +434,11 @@ Global options: `--home PATH`, `--profile NAME`.
 | Command | Purpose |
 | --- | --- |
 | `init` | Create configuration without overwriting an existing file |
+| `setup` | Guided, resumable installation: host, provider, credential, connection, isolation, browser |
 | `run PROMPT --workspace PATH` | Execute through the shared runtime |
 | `resume ID PROMPT` | Continue a stored session |
 | `tui --workspace PATH` | Open the terminal interface |
+| `web --bind ADDRESS` | Serve the shared web interface on a loopback address |
 | `sessions` | List operator sessions |
 | `stop` | Stop local runtime work |
 | `doctor [--json]` | Diagnose execution prerequisites |
@@ -476,6 +503,19 @@ The native runner uses an explicitly delegated transient systemd service (system
 
 Ignored checks and host failures are recorded separately. Fixtures make no paid-provider requests; live provider/platform qualification is separate. Dependency checks use `cargo deny` and [`deny.toml`](deny.toml); any advisory exceptions must identify an exact scope and rationale.
 
+Measure tasks against a running daemon with the conditions of the run
+recorded alongside the numbers:
+
+```bash
+python3 tests/benchmark_tasks.py --home ~/.layeragent --samples 5 \
+  --output docs/task-benchmark.json
+```
+
+A live measurement requires configured provider prices, caps the tokens of
+every request and stops before the budget would be exceeded. A p95 that
+cannot be qualified is published as `not qualified` instead of a number. See
+[Task measurement →](docs/16-task-measurement.md).
+
 An opt-in real-model check exercises MiniMax through Vercel AI Gateway, including streaming, daemon restart and an optional confined tool call. Create a private `.env` **outside** this source directory with `AI_GATEWAY_API_KEY`, then:
 
 ```bash
@@ -530,6 +570,8 @@ Future maintainers can attach an Ed25519 signature with [`scripts/sign_source.py
 | [11 · Configuration and operations](docs/11-configuration-and-operations.md) | Policy, HTTP deployment and troubleshooting |
 | [12 · Guía en español](docs/12-guia-rapida-es.md) | Instalación y uso inicial en español |
 | [13 · Backup and recovery](docs/13-backup-and-recovery.md) | Encrypted snapshots, retention and restoration |
+| [15 · Web, frontend and desktop](docs/15-web-and-desktop-interfaces.md) | Loopback web surface, shared frontend, desktop shell and their authority limits |
+| [16 · Task measurement](docs/16-task-measurement.md) | Measured times, cost rules, budget guard and qualified percentiles |
 
 ## Roadmap and license
 

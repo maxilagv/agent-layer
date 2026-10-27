@@ -22,6 +22,7 @@ tokio-util.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 hex.workspace = true
+tracing.workspace = true
 walkdir = "2"
 similar = "2"
 

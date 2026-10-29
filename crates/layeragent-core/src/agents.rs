@@ -54,6 +54,10 @@ impl Budget {
 
 pub(crate) struct AgentTree {
     pub(crate) budget: Budget,
+    pub(crate) bridge_enabled: bool,
+    pub(crate) effort: EffortLevel,
+    pub(crate) mode: RunMode,
+    pub(crate) execution: ExecutionMode,
     permits: Arc<Semaphore>,
     /// Cancelled when the tree runs out of budget; every descendant observes it.
     pub(crate) stop: CancellationToken,
@@ -61,9 +65,19 @@ pub(crate) struct AgentTree {
     spawned: AtomicUsize,
 }
 impl AgentTree {
-    pub(crate) fn new(cfg: &AgentsConfig) -> Arc<Self> {
+    pub(crate) fn new(
+        cfg: &AgentsConfig,
+        bridge_enabled: bool,
+        effort: EffortLevel,
+        mode: RunMode,
+        execution: ExecutionMode,
+    ) -> Arc<Self> {
         Arc::new(Self {
             budget: Budget::new(cfg.tree_max_tokens, cfg.tree_max_cost_usd),
+            bridge_enabled,
+            effort,
+            mode,
+            execution,
             permits: Arc::new(Semaphore::new(cfg.max_concurrent)),
             stop: CancellationToken::new(),
             agents: Mutex::new(HashMap::new()),
@@ -124,18 +138,26 @@ pub(crate) struct AgentCtl {
     pub(crate) agent_id: Option<String>,
     pub(crate) writable: bool,
     pub(crate) shares_workspace: bool,
+    pub(crate) inherited_effort: Option<EffortLevel>,
     ancestors: Vec<String>,
     bound: OnceLock<(String, String, CancellationToken)>,
     permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
 impl AgentCtl {
-    pub(crate) fn root(cfg: &AgentsConfig) -> Arc<Self> {
+    pub(crate) fn root(
+        cfg: &AgentsConfig,
+        bridge: bool,
+        effort: EffortLevel,
+        mode: RunMode,
+        execution: ExecutionMode,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            tree: AgentTree::new(cfg),
+            tree: AgentTree::new(cfg, bridge, effort, mode, execution),
             depth: 0,
             agent_id: None,
             writable: true,
             shares_workspace: false,
+            inherited_effort: None,
             ancestors: vec![],
             bound: OnceLock::new(),
             permit: Mutex::new(None),
@@ -274,6 +296,7 @@ impl AgentControl for EngineAgents {
             agent_id: Some(id.clone()),
             writable,
             shares_workspace: isolation == "shared",
+            inherited_effort: Some(ctx.config.default_effort),
             ancestors,
             bound: OnceLock::new(),
             permit: Mutex::new(None),
@@ -316,6 +339,11 @@ impl AgentControl for EngineAgents {
                 workspace: None,
                 prompt: task,
                 model,
+                effort: ctx.config.default_effort,
+                bridge: self.ctl.tree.bridge_enabled,
+                mode: self.ctl.tree.mode,
+                execution: ExecutionMode::Delegated,
+                cooperative: None,
             },
             timeout: std::time::Duration::from_secs(cfg.child_timeout_secs),
         };
@@ -642,7 +670,13 @@ mod tests {
         base.policy.network = true;
         base.agents.max_depth = 2;
         let base = Arc::new(base);
-        let root = AgentCtl::root(&base.agents);
+        let root = AgentCtl::root(
+            &base.agents,
+            false,
+            EffortLevel::Auto,
+            RunMode::Normal,
+            ExecutionMode::Delegated,
+        );
         assert!(Arc::ptr_eq(&effective_config(base.clone(), &root), &base));
         let child = AgentCtl {
             tree: root.tree.clone(),
@@ -650,6 +684,7 @@ mod tests {
             agent_id: Some("a".into()),
             writable: false,
             shares_workspace: true,
+            inherited_effort: Some(EffortLevel::Medium),
             ancestors: vec!["t".into()],
             bound: OnceLock::new(),
             permit: Mutex::new(None),

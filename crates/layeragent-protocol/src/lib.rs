@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod redact;
 pub mod task;
+pub mod team;
 pub use task::*;
+pub use team::*;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub fn now_ms() -> i64 {
@@ -156,6 +158,84 @@ pub struct Session {
     pub workspace: String,
     pub created_at: i64,
 }
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortLevel {
+    #[default]
+    Auto,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+impl EffortLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
+    pub fn concrete(self) -> Self {
+        if self == Self::Auto {
+            Self::Medium
+        } else {
+            self
+        }
+    }
+}
+impl std::fmt::Display for EffortLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl std::str::FromStr for EffortLevel {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value.to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "low" => Self::Low,
+            "medium" | "med" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" => Self::Xhigh,
+            _ => anyhow::bail!("effort must be auto, low, medium, high or xhigh"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    #[default]
+    Normal,
+    Illustration,
+}
+impl RunMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Illustration => "illustration",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionPreferences {
+    pub effort: EffortLevel,
+    pub bridge: bool,
+}
+impl Default for SessionPreferences {
+    fn default() -> Self {
+        Self {
+            effort: EffortLevel::Auto,
+            bridge: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunRequest {
     pub session_id: Option<String>,
@@ -163,6 +243,16 @@ pub struct RunRequest {
     pub prompt: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub effort: EffortLevel,
+    #[serde(default)]
+    pub bridge: bool,
+    #[serde(default)]
+    pub mode: RunMode,
+    #[serde(default)]
+    pub execution: ExecutionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooperative: Option<CooperativeOptions>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunResult {

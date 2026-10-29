@@ -31,6 +31,11 @@ pub struct Config {
     pub memory: MemoryConfig,
     pub max_cost_usd: Option<f64>,
     pub auto_skills: bool,
+    pub default_effort: layeragent_protocol::EffortLevel,
+    /// Models and native effort levels explicitly qualified by the operator.
+    pub effort_models: BTreeMap<String, Vec<layeragent_protocol::EffortLevel>>,
+    pub memory_recall_limit: usize,
+    pub memory_max_bytes: usize,
     pub agents: AgentsConfig,
     pub browser: BrowserConfig,
     pub privacy: Privacy,
@@ -72,6 +77,10 @@ impl Default for Config {
             memory: MemoryConfig::default(),
             max_cost_usd: None,
             auto_skills: true,
+            default_effort: layeragent_protocol::EffortLevel::Auto,
+            effort_models: BTreeMap::new(),
+            memory_recall_limit: 5,
+            memory_max_bytes: 16_384,
             agents: AgentsConfig::default(),
             browser: BrowserConfig::default(),
             privacy: Privacy::default(),
@@ -468,6 +477,66 @@ impl Config {
             self.max_rounds > 0 && self.max_rounds <= 1024,
             "max_rounds must be 1..1024"
         );
+        ensure!(
+            self.max_input_tokens > 0 && self.max_output_tokens > 0,
+            "token budgets must be positive"
+        );
+        ensure!(
+            self.memory_recall_limit > 0 && self.memory_recall_limit <= 50,
+            "memory_recall_limit must be 1..50"
+        );
+        ensure!(
+            (1024..=262_144).contains(&self.memory_max_bytes),
+            "memory_max_bytes must be 1024..262144"
+        );
+        let agents = &self.agents;
+        ensure!(
+            agents.max_depth <= 16,
+            "agents.max_depth must not exceed 16"
+        );
+        ensure!(
+            agents.max_concurrent > 0 && agents.max_concurrent <= 64,
+            "agents.max_concurrent must be 1..64"
+        );
+        ensure!(
+            agents.max_children_per_turn > 0 && agents.max_children_per_turn <= 256,
+            "agents.max_children_per_turn must be 1..256"
+        );
+        ensure!(
+            agents.child_max_rounds > 0 && agents.child_max_rounds <= 1024,
+            "agents.child_max_rounds must be 1..1024"
+        );
+        ensure!(
+            agents.child_timeout_secs > 0 && agents.child_timeout_secs <= 86_400,
+            "agents.child_timeout_secs must be 1..86400"
+        );
+        ensure!(
+            agents.child_max_output_tokens > 0,
+            "agents.child_max_output_tokens must be positive"
+        );
+        ensure!(
+            agents.tree_max_tokens.is_none_or(|v| v > 0),
+            "agents.tree_max_tokens must be positive"
+        );
+        ensure!(
+            agents
+                .tree_max_cost_usd
+                .is_none_or(|v| v.is_finite() && v > 0.0),
+            "agents.tree_max_cost_usd must be finite and positive"
+        );
+        for (model, levels) in &self.effort_models {
+            ensure!(
+                self.models.contains_key(model),
+                "effort model {model} is not configured"
+            );
+            ensure!(
+                !levels.is_empty()
+                    && levels
+                        .iter()
+                        .all(|level| *level != layeragent_protocol::EffortLevel::Auto),
+                "effort_models must declare concrete levels"
+            );
+        }
         ensure!(
             self.policy.timeout_secs > 0 && self.policy.max_output_bytes >= 1024,
             "invalid execution limits"

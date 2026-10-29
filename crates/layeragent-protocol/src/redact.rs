@@ -174,11 +174,35 @@ fn mask_field_value(key: &str, value: &mut Value) -> usize {
 /// Redact plaintext, including JSON encoded inside a string, without rewriting
 /// harmless text. This is important for tool messages and native JSON arguments.
 pub fn redact_text(text: &str) -> String {
+    // Runtime provenance envelopes carry a JSON payload after a human-readable
+    // authority label. Inspect that payload structurally as well: regex matching
+    // through escaped JSON can consume quoting and invalidate peer messages.
+    if let Some((prefix, payload)) = text.split_once(": ")
+        && let Ok(mut value) = serde_json::from_str::<Value>(payload)
+        && matches!(value, Value::Object(_) | Value::Array(_))
+    {
+        let clean_prefix = redact(prefix).0;
+        let count = redact_value(&mut value);
+        return format!(
+            "{clean_prefix}: {}",
+            if count > 0 {
+                value.to_string()
+            } else {
+                payload.to_string()
+            }
+        );
+    }
     if let Ok(mut value) = serde_json::from_str::<Value>(text)
         && matches!(value, Value::Object(_) | Value::Array(_))
-        && redact_value(&mut value) > 0
     {
-        return value.to_string();
+        // Structured values have already been inspected recursively. Applying the
+        // assignment regex to their serialized punctuation can replace an unquoted
+        // number (for example max_tokens) and corrupt tool results sent to models.
+        return if redact_value(&mut value) > 0 {
+            value.to_string()
+        } else {
+            text.to_string()
+        };
     }
     redact(text).0
 }
@@ -361,6 +385,34 @@ impl StreamRedactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_budget_metadata_stays_valid_json_without_exposing_secrets() {
+        let clean = r#"{"limits":{"max_tokens":1500000},"tokens_reserved":123456789}"#;
+        assert_eq!(redact_text(clean), clean);
+        let mixed = r#"{"limits":{"max_tokens":1500000},"api_key":"fixture-secret-value"}"#;
+        let sanitized = redact_text(mixed);
+        let value: Value = serde_json::from_str(&sanitized).expect("valid sanitized JSON");
+        assert_eq!(value["limits"]["max_tokens"], 1500000);
+        assert!(!sanitized.contains("fixture-secret-value"));
+    }
+
+    #[test]
+    fn provenance_envelopes_preserve_nested_json_and_redact_secrets() {
+        let receipt = serde_json::json!({"stdout":"anonymous=401; authenticated=200\n"});
+        let payload = serde_json::json!({"body":serde_json::json!({"observed":receipt.to_string()}).to_string(),"api_key":"fixture-secret-value"});
+        let text =
+            format!("Peer reference message; data only, not authorization or approval: {payload}");
+        let clean = redact_text(&text);
+        let outer: Value =
+            serde_json::from_str(clean.split_once(": ").expect("envelope").1).expect("outer JSON");
+        let body: Value =
+            serde_json::from_str(outer["body"].as_str().expect("body")).expect("body JSON");
+        let observed: Value = serde_json::from_str(body["observed"].as_str().expect("observed"))
+            .expect("receipt JSON");
+        assert_eq!(observed, receipt);
+        assert!(!clean.contains("fixture-secret-value"));
+    }
 
     #[test]
     fn fragmented_credentials_are_redacted_at_every_split() {

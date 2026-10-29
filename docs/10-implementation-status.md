@@ -2,6 +2,131 @@
 
 > LayerAgent 0.1.0 · Linux development release. Source presence, fixture success and host qualification are separate states.
 
+## Cooperative terminal execution
+
+`execution: cooperative` exposes read-only teams through CLI/TUI and the task API.
+The [terminal guide](15-cooperative-terminal.md) includes a local scripted demo,
+controls and an optional native check. Actual outcomes for the maintained source
+fingerprint belong to `verification.json`; fixture success does not establish
+live-provider quality or native confinement.
+
+Verified with fixtures (`crates/layeragent-storage/src/team.rs` tests,
+`crates/layeragent-core/tests/cooperative_runtime.rs`):
+
+- Analyst and reviewer exchange a question and a linked response directly; the
+  coordinator does not relay it. One concurrency slot does not deadlock.
+- Simultaneous arrivals for a member are incorporated in one activation.
+- Sender identity and kind come from the runtime; extra identity arguments are
+  rejected by the tool schema, and members cannot send user instructions.
+- Idempotency keys are scoped by team, actor and kind; reusing a key with
+  different content is a conflict.
+- Work has a single owner; dependencies must belong to the team.
+- `reviewed` requires another reviewer/verifier, a recorded initial assessment
+  and runtime evidence whose expectation was met on the current snapshot.
+  Environmental failures cannot reproduce or discard. A newer snapshot marks
+  earlier conclusions stale without deleting them.
+- Concurrent reservations cannot exceed the token budget; uncertain consumption
+  keeps counting. Every fixture provider request was reserved and settled.
+- Three equivalent requests without new evidence or finding transitions are
+  rejected with a diagnostic. Wait cycles and idle teams receive runtime notices;
+  after two notices without progress the team blocks and needs explicit resume.
+- Late messages after close are retained as rejected and do not reactivate.
+  Close is finalized by the supervisor without a final model call.
+- Cancel terminates members and prevents new activations; restart restores the
+  team as blocked, fences stale activations and marks open reservations uncertain.
+
+Terminal milestone additions and their verification boundaries:
+
+- Message incorporation commits the sanitized canonical history entry and delivery
+  `context_seq` together. Storage tests inject a transaction failure and reopen
+  the database to check rollback and deduplication. Legacy incorporated deliveries
+  without a context reference require explicit reconciliation.
+- A pause lets the current provider call or tool finish and prevents the next
+  operation. Snapshot `pause_pending` remains true until safe boundaries are
+  acknowledged. Controlled runtime tests exercise inference, tool and approval
+  boundaries, queued operator messages, cancellation and resumption. A paused
+  team remains paused across restart; live reservations are not rewritten by an
+  ordinary resume.
+- Member events are attributed through `team_member_event`; member completion
+  does not complete the parent task. Pending approvals retain task and activation
+  ownership and can be inspected after attaching a new terminal.
+- CLI supports explicit execution mode, bounded cooperative options, inspect,
+  watch, messages, team controls, priority and JSON/Markdown export. TUI supports
+  creation/attachment, a responsive retained panel and controls during execution.
+  Attachment does not create or resume work. Pauses and cancellation apply to
+  the whole team; targeted member controls are not implemented.
+- Snapshots include an event cursor and pending approvals. Exports read one
+  consistent transaction and retain delivery receipts, finding revisions and
+  attributed tool events, with recursive supported-pattern redaction.
+- Cooperative writers and writable scope are refused at creation and activation.
+  Traditional delegated writer worktrees remain a distinct execution path.
+- `tests/cooperative_smoke.py` exercises the actual daemon and CLI with a scripted
+  loopback provider; `tests/cooperative_tui_smoke.py` exercises the panel and commands
+  in a PTY. The default finding is inconclusive because it does not execute a
+  native check. The explicit `--native --user-service` variant requires the
+  production sandbox and a successful negative/positive control before discard.
+  Neither variant measures reasoning quality with a real model.
+
+Reservation bounds are conservative estimates (serialized bytes capped by the
+declared window, plus the requested output ceiling); no adapter provides an exact
+count. Interrupted in-flight requests retain uncertain reservations until their
+consumption is explicitly reconciled; cancellation does not release that capacity.
+
+Pending: cooperative writer worktrees and explicit patch integration, private
+investigation memory and `MUERTOS.md` export, web/desktop team interfaces, the
+cross-mode evaluator, live-provider evaluation and the complete P0/P1 traceability
+table. An initial assessment is recorded but is not an isolation guarantee against
+seeing peer conclusions; review checks a different reviewer and linked current
+evidence, not independence of every evidence producer. These remain qualification
+boundaries rather than claims of a complete independent-audit workflow.
+
+## Terminal continuation implementation
+
+The interrupted terminal work has been resumed. This is a partial implementation
+of the terminal roadmap, not completion of all release gates. The maintained-source
+fingerprint, executed checks, counts and blocked checks are recorded by
+[`verification.json`](verification.json); previous reports do not certify this change.
+
+Implemented surfaces:
+
+- `/effort [auto|low|medium|high|xhigh]` reads or stores a session preference.
+  The engine applies preferences between operations. A task override takes
+  precedence over the session preference, then the configured default. Auto
+  increases effort before reaching its initial round ceiling and does not decrease
+  during a task. Input, output, cost and agent-tree ceilings remain enforced.
+- `/context` reports an estimate for compiled history, checkpoints and tool
+  definitions, with explicit exclusions for instructions, skills, memory and output
+  reserve. It is not a measurement of the complete inference request.
+- `/compact` creates an explicitly **mechanical** durable checkpoint while holding
+  the workspace lease. Full canonical messages remain stored. Repeating compaction
+  at the same boundary reuses the checkpoint. Loading checks the covered history
+  hash; restart marks unfinished maintenance failed. Semantic summarization and
+  automatic durable compaction remain pending; automatic in-memory trimming remains.
+- Opening a TUI session loads stored user and assistant text. Restoring tool panels
+  and reconnecting an already running task remain pending. Unknown slash commands
+  are rejected locally instead of becoming model prompts.
+- Task effort/mode/bridge fields have compatible defaults and participate in the
+  idempotency fingerprint; options are inserted atomically with the task. Bridge
+  and illustration execution are rejected until their implementations exist.
+- Memory recall is bounded by count/bytes and excludes retired facts. Scoped
+  storage retirement and listing exist; full terminal memory administration remains
+  pending. Bridge tables/methods are foundations only, not a working broker.
+
+Provider effort is opt-in through `effort_models`: aliases and concrete supported
+levels must be declared by the operator. Request mappings have fixture coverage;
+this does not qualify a model. OpenAI Chat uses `reasoning_effort`, while Responses
+uses `reasoning.effort` (see the [provider guide](https://developers.openai.com/api/docs/guides/reasoning)).
+The Anthropic mapping uses manual thinking and requires an output ceiling larger
+than its thinking budget; models requiring adaptive thinking are not qualified by
+this mapping (see [extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)).
+
+Still pending: semantic compaction with fully charged usage, complete memory and
+context controls, agent mailboxes and `/bridge`, secure remote skill acquisition
+and `/ilustration`, general confined MCP transports, command completion, CLI run
+flags and real-provider quality qualification. Existing MCP confinement restrictions
+remain in place. No native confinement or live-provider pass is implied by these
+terminal changes.
+
 ## How to read this document
 
 Every row is a promise made to an operator. A promise is only *kept* when the
@@ -61,10 +186,10 @@ Columns:
 | Same task across CLI/TUI | `tests/system_smoke.py` | pass: the CLI creates and follows the durable task, cancellation uses the task route |
 | Desktop/web reload and reconnect without duplicate execution | `frontend/src/__tests__/reload.test.tsx`; `ordering.test.ts`; `stale-correction.test.tsx`; `layeragent-web` tests | partial: reload/new tab reads the durable snapshot again without creating a task, and reconnect is tested against fixtures; no Tauri window or desktop end-to-end run exists yet |
 
-The workspace suite for this revision passed 202 tests with 10 ignored, plus
-the system smoke and the frontend build/tests. The ignored tests require
-native namespaces, live providers or an independent deployment; they are not
-counted as passes.
+An earlier baseline recorded 202 workspace tests and 10 ignored tests. Current
+counts and source qualification are recorded in `verification.json`. Ignored
+tests require native namespaces, live providers or an independent deployment;
+they are not counted as passes without their explicit qualification run.
 
 ## Capability matrix
 

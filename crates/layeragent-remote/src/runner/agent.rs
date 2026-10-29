@@ -110,6 +110,11 @@ pub(super) async fn execute_agent(
                 workspace: Some(workspace.to_string_lossy().into_owned()),
                 prompt: prompt.clone(),
                 model: Some(model.clone()),
+                effort: Default::default(),
+                bridge: false,
+                mode: Default::default(),
+                execution: Default::default(),
+                cooperative: None,
             },
             permit.cancel.clone(),
         )

@@ -26,6 +26,7 @@ confined tools, a terminal workspace and an extensible integration layer.
 
 ## Contents
 
+- [Cooperative investigation](#cooperative-investigation)
 - [What LayerAgent does](#what-layeragent-does)
 - [Capabilities](#capabilities)
 - [Architecture](#architecture)
@@ -60,6 +61,25 @@ The same engine powers the CLI, animated TUI, authenticated HTTP API, MCP server
 - **Extend deliberately:** add custom tools, scoped project-files MCP and reusable verified skills.
 - **Inspect evidence:** retain hashes, artifacts and observed/inferred/unknown analysis records.
 
+## Cooperative investigation
+
+Create a temporary team whose analyst, reviewer and verifier consult each other,
+challenge a premise and preserve the evidence behind a changed conclusion. The
+CLI and TUI expose members, questions, delivery states, findings and budget use.
+Cooperative teams currently investigate read-only workspaces.
+
+Try the reproducible local demonstration after building the CLI:
+
+```bash
+python3 tests/cooperative_smoke.py
+python3 tests/cooperative_tui_smoke.py
+```
+
+The demo uses a scripted loopback provider and no API key. Its default result is
+explicitly inconclusive; the optional native variant runs a confined check before
+discarding the hypothesis. See the [terminal team guide](docs/15-cooperative-terminal.md)
+for activation, controls, exports and the limits of this evidence.
+
 ## Capabilities
 
 | Area | Included in the development implementation | Qualification |
@@ -68,6 +88,7 @@ The same engine powers the CLI, animated TUI, authenticated HTTP API, MCP server
 | Runtime | Typed lifecycle, session/workspace serialization and cooperative cancellation | Fixture and executable tests; broader task evaluation remains |
 | Tools | Files, shell/PTY, protected Git operations and custom JSON tools | Execution requires verified native confinement |
 | Subagents | Scoped children, shared budgets, concurrency and writable isolated worktrees | Scripted-model validation |
+| Cooperative teams | Direct durable messaging, read-only roles, terminal panel, pause/resume and evidence export | Scripted provider and explicit native qualification; real-model quality remains unqualified |
 | Models | Five wire adapters, authorized fallback and circuit breakers | Live provider compatibility must be qualified separately |
 | Memory | SQLite WAL/FULL, FTS5/BM25, revisions and optional vector retrieval | Lexical retrieval has no model-download requirement |
 | Skills | Progressive discovery, staged fixtures, promotion, versions and rollback | Promotion requires a working sandbox |

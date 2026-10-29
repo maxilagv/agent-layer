@@ -11,8 +11,11 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 pub mod backup;
 mod memory;
 mod tasks;
+mod team;
+mod terminal;
 pub use memory::{EmbeddingWorker, embedding_worker_main};
 pub use tasks::{TaskConflict, TaskCreate};
+pub use team::{EvidenceRecord, TeamConflict, TeamPaused};
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 /// A delegated child agent as recorded for audit and recovery.
@@ -55,6 +58,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/002_agents.sql"),
     include_str!("migrations/003_tasks.sql"),
     include_str!("migrations/004_task_cancellation_trigger.sql"),
+    include_str!("migrations/005_terminal_foundation.sql"),
+    include_str!("migrations/006_cooperative_teams.sql"),
+    include_str!("migrations/007_cooperative_terminal.sql"),
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -249,18 +255,26 @@ impl Storage {
             kind.to_string(),
         );
         self.write(move |c| {
+            let tx = c.transaction()?;
             let at = now_ms();
-            c.execute(
+            tx.execute(
                 "INSERT INTO events(session_id,turn_id,at,kind,data) VALUES(?1,?2,?3,?4,?5)",
                 params![session, turn, at, kind, data.to_string()],
             )?;
-            let seq = c.last_insert_rowid();
+            let seq = tx.last_insert_rowid();
             if let Some(turn) = &turn {
-                c.execute(
+                tx.execute(
                     "INSERT INTO task_events(task_id,at,kind,data) SELECT id,?2,?3,?4 FROM tasks WHERE turn_id=?1",
                     params![turn, at, kind, data.to_string()],
                 )?;
+                // Activation events are observable without projecting child lifecycle
+                // events (for example turn_completed) onto the parent task.
+                tx.execute(
+                    "INSERT INTO task_events(task_id,at,kind,data) SELECT t.task_id,?2,'team_member_event',json_object('member_id',a.member_id,'activation_id',a.id,'session_id',?5,'kind',?3,'data',json(?4)) FROM team_activations a JOIN teams t ON t.id=a.team_id WHERE a.id=?1",
+                    params![turn, at, kind, data.to_string(), session],
+                )?;
             }
+            tx.commit()?;
             Ok(Event {
                 seq,
                 at,
@@ -356,7 +370,7 @@ impl Storage {
                 }
                 if let Some(rows) = cache.entries.get(&key) { return Ok(rows.clone()); }
             }
-            let mut q = tx.prepare("SELECT m.id,m.content,m.tags,bm25(memories_fts) FROM memories_fts JOIN memories m ON m.id=memories_fts.rowid WHERE memories_fts MATCH ?1 AND m.principal=?2 AND (m.workspace=?3 OR m.workspace='*') AND NOT EXISTS(SELECT 1 FROM memories replacement WHERE replacement.supersedes=m.id) ORDER BY bm25(memories_fts) LIMIT ?4")?;
+            let mut q = tx.prepare("SELECT m.id,m.content,m.tags,bm25(memories_fts) FROM memories_fts JOIN memories m ON m.id=memories_fts.rowid WHERE memories_fts MATCH ?1 AND m.principal=?2 AND (m.workspace=?3 OR m.workspace='*') AND m.retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM memories replacement WHERE replacement.supersedes=m.id) ORDER BY bm25(memories_fts) LIMIT ?4")?;
             let rows = q.query_map(params![query,p,w,limit], |r| Ok(json!({"id":r.get::<_,i64>(0)?,"content":r.get::<_,String>(1)?,"tags":r.get::<_,String>(2)?,"rank":r.get::<_,f64>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
             let bytes = key.len() + serde_json::to_vec(&rows)?.len();
             if bytes <= 131_072 {
@@ -390,7 +404,7 @@ impl Storage {
         );
         self.write(move |db| {
             let tx = db.transaction()?;
-            let allowed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM memories m WHERE id=?1 AND principal=?2 AND workspace=?3 AND NOT EXISTS(SELECT 1 FROM memories replacement WHERE replacement.supersedes=m.id))", params![supersedes,p,w], |r| r.get(0))?;
+            let allowed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM memories m WHERE id=?1 AND principal=?2 AND workspace=?3 AND m.retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM memories replacement WHERE replacement.supersedes=m.id))", params![supersedes,p,w], |r| r.get(0))?;
             ensure!(allowed, "memory is inaccessible or already superseded");
             tx.execute("INSERT INTO memories(principal,workspace,content,tags,created_at,supersedes) VALUES(?1,?2,?3,?4,?5,?6)",params![p,w,c,t,now_ms(),supersedes])?;
             let id = tx.last_insert_rowid(); tx.commit()?; Ok(id)
@@ -594,7 +608,9 @@ impl Storage {
     }
     pub async fn recover(&self) -> Result<()> {
         self.write(|c|{c.execute("UPDATE learned_trajectories SET status='interrupted' WHERE status='pending'",[])?;c.execute("UPDATE agents SET status='interrupted',finished_at=?1 WHERE status IN ('queued','running')",[now_ms()])?;c.execute("UPDATE tool_runs SET status='unknown' WHERE status='running'",[])?;c.execute("UPDATE turns SET state='interrupted' WHERE state NOT IN ('completed','failed','interrupted')",[])?;c.execute("UPDATE inbox SET status='unknown',error='Runtime stopped during processing; reconcile the session before retrying' WHERE status='processing'",[])?;c.execute("UPDATE outbox SET status='unknown',error='Delivery may have completed before the runtime stopped' WHERE status='sending'",[])?;Ok(())}).await?;
+        self.write(|db| { db.execute("UPDATE maintenance_operations SET state='failed',error='Interrupted by runtime restart',updated_at=?1 WHERE state='running'", [now_ms()])?; Ok(()) }).await?;
         self.recover_tasks().await?;
+        self.recover_teams().await?;
         Ok(())
     }
     pub async fn enqueue_inbox(
@@ -730,6 +746,48 @@ mod tests {
         assert!(Storage::open(dir.path(), "m").is_err());
         Ok(())
     }
+    #[test]
+    fn cooperative_terminal_upgrade_preserves_rows_and_updates_projection() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("state.db");
+        let mut connection = Connection::open(&db)?;
+        for sql in MIGRATIONS.iter().take(6) {
+            connection.execute_batch(sql)?;
+        }
+        connection.pragma_update(None, "user_version", 6)?;
+        connection.execute("INSERT INTO tasks(id,tenant,principal,project,objective,executor,state,created_at,updated_at) VALUES('old-task','default','local','fixture','preserve me','local','running',1,1)", [])?;
+        migrate(&mut connection, &db)?;
+        let columns: i64 = connection.query_row("SELECT count(*) FROM pragma_table_info('team_activations') WHERE name='pause_boundary'", [], |r|r.get(0))?;
+        assert_eq!(columns, 1);
+        for (kind, data, expected) in [
+            ("team_paused", "{}", "blocked"),
+            ("team_resumed", "{}", "running"),
+            (
+                "team_member_event",
+                r#"{"kind":"turn_completed"}"#,
+                "running",
+            ),
+            ("team_no_progress", r#"{"explicit_resume":true}"#, "blocked"),
+        ] {
+            connection.execute(
+                "INSERT INTO task_events(task_id,at,kind,data) VALUES('old-task',2,?1,?2)",
+                params![kind, data],
+            )?;
+            let (objective, state): (String, String) = connection.query_row(
+                "SELECT objective,state FROM tasks WHERE id='old-task'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!(objective, "preserve me");
+            assert_eq!(state, expected);
+        }
+        assert!(
+            db.with_file_name(format!("state.db.pre-v{SCHEMA_VERSION}.bak"))
+                .exists()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn cached_recall_invalidates_and_corrections_keep_history_scoped() -> Result<()> {
         let dir = tempfile::tempdir()?;

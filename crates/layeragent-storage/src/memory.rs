@@ -31,7 +31,7 @@ impl Storage {
             workspace.to_string(),
             model.to_string(),
         );
-        self.read(move|c|{let mut q=c.prepare("SELECT id,content FROM memories WHERE principal=?1 AND (workspace=?2 OR workspace='*') AND NOT EXISTS(SELECT 1 FROM memories replacement WHERE replacement.supersedes=memories.id) AND NOT EXISTS(SELECT 1 FROM vectors WHERE memory_id=memories.id AND model=?3) ORDER BY id DESC LIMIT 16")?;Ok(q.query_map(params![p,w,m],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await
+        self.read(move|c|{let mut q=c.prepare("SELECT id,content FROM memories WHERE principal=?1 AND (workspace=?2 OR workspace='*') AND memories.retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM memories replacement WHERE replacement.supersedes=memories.id) AND NOT EXISTS(SELECT 1 FROM vectors WHERE memory_id=memories.id AND model=?3) ORDER BY id DESC LIMIT 16")?;Ok(q.query_map(params![p,w,m],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await
     }
     pub async fn search_hybrid(
         &self,
@@ -73,7 +73,7 @@ impl Storage {
             .get(&key)
             .is_some_and(|i| i.revision == revision);
         if rebuild {
-            let rows=self.read(move|c|{let mut q=c.prepare("SELECT memories.id,memories.content,vectors.embedding FROM memories JOIN vectors ON memories.id=vectors.memory_id WHERE principal=?1 AND (workspace=?2 OR workspace='*') AND model=?3 AND NOT EXISTS(SELECT 1 FROM memories replacement WHERE replacement.supersedes=memories.id)")?;Ok(q.query_map(params![p,w,m],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;
+            let rows=self.read(move|c|{let mut q=c.prepare("SELECT memories.id,memories.content,vectors.embedding FROM memories JOIN vectors ON memories.id=vectors.memory_id WHERE principal=?1 AND (workspace=?2 OR workspace='*') AND model=?3 AND memories.retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM memories replacement WHERE replacement.supersedes=memories.id)")?;Ok(q.query_map(params![p,w,m],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;
             let dimensions = vector.len();
             let index = tokio::task::spawn_blocking(move || {
                 let hnsw = Hnsw::new(16, rows.len().max(1), 16, 100, DistCosine {});
@@ -164,7 +164,7 @@ impl Storage {
         self.read(move |db| {
             let accessible: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM memories WHERE id=?1 AND principal=?2 AND workspace=?3)",params![id,p,w],|r| r.get(0))?;
             ensure!(accessible, "memory inaccessible");
-            let mut query = db.prepare("WITH RECURSIVE neighbors(id,depth) AS (SELECT ?1,0 UNION SELECT CASE WHEN r.source=n.id THEN r.target ELSE r.source END,n.depth+1 FROM neighbors n JOIN relations r ON (r.source=n.id OR r.target=n.id) WHERE n.depth<2 AND r.principal=?2 AND r.workspace=?3 LIMIT 256) SELECT m.id,m.content,MIN(n.depth) FROM neighbors n JOIN memories m ON m.id=n.id WHERE m.id!=?1 AND m.principal=?2 AND m.workspace=?3 AND NOT EXISTS(SELECT 1 FROM memories replacement WHERE replacement.supersedes=m.id) GROUP BY m.id ORDER BY MIN(n.depth),m.id LIMIT 50")?;
+            let mut query = db.prepare("WITH RECURSIVE neighbors(id,depth) AS (SELECT ?1,0 UNION SELECT CASE WHEN r.source=n.id THEN r.target ELSE r.source END,n.depth+1 FROM neighbors n JOIN relations r ON (r.source=n.id OR r.target=n.id) WHERE n.depth<2 AND r.principal=?2 AND r.workspace=?3 LIMIT 256) SELECT m.id,m.content,MIN(n.depth) FROM neighbors n JOIN memories m ON m.id=n.id WHERE m.id!=?1 AND m.principal=?2 AND m.workspace=?3 AND m.retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM memories replacement WHERE replacement.supersedes=m.id) GROUP BY m.id ORDER BY MIN(n.depth),m.id LIMIT 50")?;
             Ok(query.query_map(params![id,p,w],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"content":r.get::<_,String>(1)?,"hops":r.get::<_,i64>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)
         }).await
     }

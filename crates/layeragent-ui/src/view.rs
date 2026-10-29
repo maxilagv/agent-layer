@@ -624,11 +624,18 @@ fn conversation(app: &App, width: usize) -> Vec<Line<'static>> {
             }
             Entry::Tool {
                 name,
+                agent,
                 summary,
                 state,
                 output,
                 ..
             } => {
+                if let Some(agent) = agent {
+                    out.push(Line::styled(
+                        format!("  Agente: {}", safe_text(agent)),
+                        dim(),
+                    ));
+                }
                 let status = match state {
                     ToolState::Running => {
                         Span::styled(SPINNER[(t * 12.0) as usize % 10].to_string(), bold(ACCENT))
@@ -739,6 +746,17 @@ fn status_line(app: &App, f: &mut Frame, area: Rect) {
         spans.push(Span::styled("Listo", fg(GREEN)));
         spans.push(Span::styled(format!("  ·  {}", app.info.model), dim()));
     }
+    if let Some(value) = &app.team {
+        spans.push(Span::styled(
+            format!(
+                " · equipo {}",
+                value["team"]["state"].as_str().unwrap_or("?")
+            ),
+            fg(AMBER),
+        ));
+    } else {
+        spans.push(Span::styled(format!(" · {}", app.execution), dim()));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
     if app.scroll > 0 {
         let hint = "↓ RePág/AvPág para volver al final";
@@ -816,7 +834,20 @@ fn chat(app: &mut App, f: &mut Frame, area: Rect, size: Layout3) {
     ]);
     f.render_widget(Paragraph::new(header), rows[0]);
     // Messages.
-    let body = rows[1];
+    let body = if app.team_visible {
+        if area.width >= 120 && area.height >= 28 {
+            let columns =
+                Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+                    .split(rows[1]);
+            team_panel(app, f, columns[1]);
+            columns[0]
+        } else {
+            team_panel(app, f, rows[1]);
+            Rect::default()
+        }
+    } else {
+        rows[1]
+    };
     let width = body.width.saturating_sub(2) as usize;
     let lines = conversation(app, width);
     let height = body.height as usize;
@@ -861,6 +892,279 @@ fn chat(app: &mut App, f: &mut Frame, area: Rect, size: Layout3) {
         ))),
         parts[2],
     );
+}
+
+fn safe_text(text: &str) -> String {
+    text.chars()
+        .flat_map(|ch| {
+            if (ch.is_control() && ch != '\n' && ch != '\t')
+                || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                ch.escape_unicode().collect::<Vec<_>>()
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
+}
+
+fn team_panel(app: &mut App, f: &mut Frame, area: Rect) {
+    let block = panel("Equipo cooperativo");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let Some(value) = &app.team else {
+        f.render_widget(Paragraph::new("/team start audit -- objetivo\n/team attach <task-id>\n/team toggle cierra el panel").style(dim()), inner);
+        return;
+    };
+    let team = &value["team"];
+    let member_name = |id: &serde_json::Value| -> String {
+        team["members"]
+            .as_array()
+            .and_then(|members| members.iter().find(|member| member["id"] == *id))
+            .and_then(|member| member["name"].as_str())
+            .or_else(|| id.as_str())
+            .unwrap_or("equipo")
+            .into()
+    };
+    let usage = &team["usage"];
+    let limits = &team["options"]["limits"];
+    let consumed = usage["total_tokens"].as_u64().unwrap_or_else(|| {
+        usage["input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_add(usage["output_tokens"].as_u64().unwrap_or(0))
+    });
+    let cost = usage["cost_usd"].as_f64().unwrap_or(0.0);
+    let cost_limit = limits["max_cost_usd"]
+        .as_f64()
+        .map(|value| format!("USD {value:.2}"))
+        .unwrap_or_else(|| "sin tope USD".into());
+    let mut rows = vec![
+        format!(
+            "{} · {} · {}",
+            team["task_id"].as_str().unwrap_or("?"),
+            team["template"].as_str().unwrap_or("?"),
+            team["state"].as_str().unwrap_or("?")
+        ),
+        format!(
+            "Preguntas abiertas: {} · Vista: {}",
+            team["open_questions"], app.team_resource
+        ),
+        format!(
+            "Consumo: {consumed}/{} tokens · USD~{cost:.4}",
+            limits["max_tokens"]
+        ),
+        format!(
+            "Reservas: {} tokens · inciertas: {}",
+            team["reservations"]["reserved_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+            team["reservations"]["uncertain_tokens"]
+                .as_u64()
+                .unwrap_or(0)
+        ),
+        format!("Límites: {}s · {cost_limit}", limits["max_active_seconds"],),
+    ];
+    if let Some(reason) = team["reason"].as_str() {
+        rows.push(format!("Motivo: {reason}"));
+    }
+    if team["pause_pending"] == true {
+        rows.push("Pausa pendiente: terminando operaciones activas".into());
+    }
+    if let Some(notice) = &app.team_notice {
+        // Keep action feedback visible without pushing the selected result below
+        // the fold. The complete notice remains in the conversation timeline.
+        let single_line = safe_text(notice)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        rows.push(truncate(
+            &format!("Aviso: {single_line}"),
+            inner.width as usize,
+        ));
+    }
+    let resource = if app.team_resource == "decisions" {
+        "finding_revisions"
+    } else {
+        &app.team_resource
+    };
+    let items = if resource == "members" {
+        team["members"].as_array()
+    } else {
+        value[resource].as_array()
+    };
+    if let Some(items) = items {
+        if items.is_empty() {
+            rows.push("Sin registros en esta vista.".into());
+        }
+        for item in items {
+            rows.push(String::new());
+            match resource {
+                "members" => {
+                    let waiting_permission =
+                        team["pending_approvals"].as_array().is_some_and(|pending| {
+                            pending
+                                .iter()
+                                .any(|approval| approval["member_id"] == item["id"])
+                        }) && item["state"] == "working";
+                    rows.push(format!(
+                        "{} · {} · {}",
+                        member_name(&item["id"]),
+                        item["role"].as_str().unwrap_or("?"),
+                        if waiting_permission {
+                            "waiting_permission"
+                        } else {
+                            item["state"].as_str().unwrap_or("?")
+                        }
+                    ));
+                    rows.push(format!("id: {}", item["id"].as_str().unwrap_or("?")));
+                    if let Some(reason) = item["reason"].as_str() {
+                        rows.push(format!("Motivo: {reason}"));
+                    }
+                }
+                "messages" => {
+                    let sender = if item["sender_kind"] == "member" {
+                        member_name(&item["sender_member_id"])
+                    } else {
+                        item["sender_kind"].as_str().unwrap_or("?").into()
+                    };
+                    rows.push(format!(
+                        "{sender} → {} · {} · {}",
+                        member_name(&item["recipient_member_id"]),
+                        item["purpose"].as_str().unwrap_or("?"),
+                        item["state"].as_str().unwrap_or("?")
+                    ));
+                    rows.push(item["body"].as_str().unwrap_or("").into());
+                    rows.push(format!(
+                        "id: {} · respuesta a: {} · hallazgo: {}",
+                        item["id"], item["reply_to"], item["finding_id"]
+                    ));
+                    if let Some(deliveries) = value["deliveries"].as_array() {
+                        for delivery in deliveries.iter().filter(|d| d["message_id"] == item["id"])
+                        {
+                            rows.push(format!(
+                                "{}: {} · incorporado={} · respondido={} · resuelto={}",
+                                member_name(&delivery["recipient_member_id"]),
+                                delivery["state"].as_str().unwrap_or("?"),
+                                !delivery["incorporated_at"].is_null(),
+                                !delivery["responded_at"].is_null(),
+                                !delivery["resolved_at"].is_null()
+                            ));
+                        }
+                    }
+                    if let Some(reason) = item["reason"].as_str() {
+                        rows.push(format!("Motivo: {reason}"));
+                    }
+                }
+                "findings" => {
+                    rows.push(format!(
+                        "{} · validez: {}",
+                        item["state"].as_str().unwrap_or("?"),
+                        item["validity"].as_str().unwrap_or("unknown")
+                    ));
+                    team_record_fields(
+                        &mut rows,
+                        item,
+                        &[
+                            "claim",
+                            "reason",
+                            "id",
+                            "author_member_id",
+                            "reviewer_member_id",
+                            "valid_for_snapshot",
+                            "snapshot_sha256",
+                        ],
+                        &["state", "validity"],
+                    );
+                }
+                "evidence" => {
+                    team_record_fields(
+                        &mut rows,
+                        item,
+                        &[
+                            "tool",
+                            "invocation",
+                            "exit_code",
+                            "observed",
+                            "expected",
+                            "error",
+                            "limitations",
+                            "id",
+                            "finding_id",
+                        ],
+                        &[],
+                    );
+                }
+                _ => {
+                    // Preserve full ids and evidence fields; wrapping/scrolling avoids
+                    // losing the commands, results or snapshot behind a conclusion.
+                    team_record_fields(
+                        &mut rows,
+                        item,
+                        &[
+                            "state",
+                            "title",
+                            "claim",
+                            "reason",
+                            "check_required",
+                            "evidence",
+                        ],
+                        &[],
+                    );
+                }
+            }
+        }
+    }
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .flat_map(|row| wrap(&safe_text(&row), inner.width as usize))
+        .map(|row| Line::styled(row, fg(TEXT)))
+        .collect();
+    app.team_scroll = app
+        .team_scroll
+        .min(lines.len().saturating_sub(inner.height as usize));
+    f.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(app.team_scroll)
+                .take(inner.height as usize)
+                .collect::<Vec<_>>(),
+        ),
+        inner,
+    );
+}
+
+fn team_record_fields(
+    rows: &mut Vec<String>,
+    item: &serde_json::Value,
+    first: &[&str],
+    omitted: &[&str],
+) {
+    let Some(object) = item.as_object() else {
+        return;
+    };
+    let keys = first.iter().copied().chain(
+        object
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !first.contains(key)),
+    );
+    for key in keys {
+        if key == "team_id" || omitted.contains(&key) {
+            continue;
+        }
+        let Some(field) = object.get(key).filter(|field| !field.is_null()) else {
+            continue;
+        };
+        rows.push(format!(
+            "{key}: {}",
+            field
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| field.to_string())
+        ));
+    }
 }
 
 fn approval_modal(app: &mut App, f: &mut Frame, area: Rect) {
@@ -977,6 +1281,15 @@ fn help_modal(f: &mut Frame, area: Rect) {
         row("RePág / AvPág", "Desplazar la conversación"),
         row("Ctrl+C", "Cancelar, o salir si no hay trabajo"),
         row("/new", "Empezar una conversación nueva"),
+        row("/effort", "auto|low|medium|high|xhigh"),
+        row("/context", "Consultar contexto estimado"),
+        row("/compact", "Guardar checkpoint mecánico"),
+        row("/execution", "individual|delegated|cooperative"),
+        row("/team start", "audit|debug|review -- objetivo"),
+        row("/team attach", "Consultar un equipo por task-id"),
+        row("/team", "toggle|members|messages|findings|evidence"),
+        row("/team message", "miembro texto (instrucción del usuario)"),
+        row("/team", "pause|resume|close|cancel|priority"),
         row("/clear", "Limpiar la pantalla"),
         row("/exit", "Salir"),
         Line::raw(""),
@@ -1238,5 +1551,75 @@ mod tests {
         assert!(wrap("aaaaaaaaaaaa", 5).iter().all(|l| l.len() <= 5));
         assert!(wrap("日本語日本語", 6).iter().all(|l| width_of(l) <= 6));
         assert_eq!(truncate("abcdefgh", 5), "abcd…");
+    }
+    #[test]
+    fn findings_and_execution_results_are_visible_without_scrolling() {
+        for (width, height) in [(150, 36), (80, 24)] {
+            let mut a = app();
+            a.on_event(&json!({"kind":"team_snapshot","data":{
+                "team":{
+                    "task_id":"01234567-89ab-cdef-0123-456789abcdef","template":"audit","state":"terminated","open_questions":1,
+                    "usage":{"total_tokens":12345,"input_tokens":12000,"output_tokens":345,"cost_usd":0.0123,"investigation":{"input_tokens":6000,"output_tokens":200,"cost_usd":0.006},"coordination":{"input_tokens":3000,"output_tokens":100,"cost_usd":0.004},"review":{"input_tokens":3000,"output_tokens":45,"cost_usd":0.0023}},
+                    "reservations":{"reserved_tokens":2400,"uncertain_tokens":300,"estimate_only":true,"provider_billing":false},
+                    "options":{"limits":{"max_tokens":1500000,"max_active_seconds":1800,"max_cost_usd":null}},"members":[]
+                },
+                "findings":[{"id":"a-very-long-finding-identifier","state":"inconclusive","validity":"current","claim":"A claim needing further proof","reason":"Environmental failure is not a refutation","author_member_id":"analyst-member-id","reviewer_member_id":null,"snapshot_sha256":"a".repeat(64),"created_at":999}],
+                "evidence":[{"id":"evidence-id","artifacts":"[]","configuration":"very long configuration ".repeat(20),"created_at":999,"tool":"shell","invocation":"printf evidence","exit_code":0,"observed":"evidence observed","expected":"expected text","receipt":"signed receipt ".repeat(20),"snapshot_sha256":"b".repeat(64)}]
+            }}));
+            a.team_note("Equipo: {\"revision\":123,\"state\":\"active\",\"team_id\":\"01234567-89ab-cdef-0123-456789abcdef\"}");
+            a.team_resource = "findings".into();
+            let rendered = render(&mut a, width, height);
+            for needle in [
+                "inconclusive",
+                "validez: current",
+                "A claim needing further proof",
+                "12345/1500000",
+                "2400 tokens",
+                "inciertas: 300",
+            ] {
+                assert!(
+                    rendered.contains(needle),
+                    "{width}x{height} missing {needle}: {rendered}"
+                );
+            }
+            assert_eq!(a.team_scroll, 0);
+            a.team_resource = "evidence".into();
+            let rendered = render(&mut a, width, height);
+            for needle in [
+                "invocation: printf evidence",
+                "exit_code: 0",
+                "observed: evidence observed",
+            ] {
+                assert!(
+                    rendered.contains(needle),
+                    "{width}x{height} missing {needle}: {rendered}"
+                );
+            }
+            assert_eq!(a.team_scroll, 0);
+        }
+    }
+
+    #[test]
+    fn cooperative_panel_is_readable_at_three_sizes_and_approval_stays_on_top() {
+        for (width, height) in [(170, 40), (100, 30), (64, 22)] {
+            let mut a = app();
+            a.on_event(&json!({"kind":"team_snapshot","data":{"team":{"task_id":"task-one","template":"audit","state":"paused","pause_pending":true,"open_questions":1,"members":[{"id":"reviewer-id","name":"reviewer","role":"reviewer","state":"waiting_response","reason":"waiting for check"}],"options":{"limits":{"max_tokens":1000,"max_active_seconds":60}},"usage":{"input_tokens":20},"reservations":{"open":10}},"messages":[],"findings":[],"evidence":[]}}));
+            let rendered = render(&mut a, width, height);
+            for needle in [
+                "Equipo cooperativo",
+                "Preguntas abiertas",
+                "Reservas",
+                "Pausa pendiente",
+            ] {
+                assert!(
+                    rendered.contains(needle),
+                    "{width}x{height}: missing {needle}"
+                );
+            }
+            a.on_event(&json!({"kind":"approval_required","data":{"approval_id":"ap","call":{"name":"shell","arguments":{"command":"IMPORTANT_REVIEW"}},"expected_revision":3,"arguments_hash":"hash"}}));
+            let rendered = render(&mut a, width, height);
+            assert!(rendered.contains("IMPORTANT_REVIEW"));
+            assert!(a.approval.is_some());
+        }
     }
 }

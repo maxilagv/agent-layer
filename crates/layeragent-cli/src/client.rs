@@ -10,6 +10,39 @@ pub struct Client {
     base: String,
 }
 
+#[derive(Debug)]
+struct ApiStatus {
+    status: reqwest::StatusCode,
+    retry_after: u64,
+    message: String,
+}
+impl std::fmt::Display for ApiStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "API request failed ({}): {}", self.status, self.message)
+    }
+}
+impl std::error::Error for ApiStatus {}
+
+async fn json_response(response: reqwest::Response) -> Result<Value> {
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    if !status.is_success() {
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        return Err(ApiStatus {
+            status,
+            retry_after,
+            message: body["error"].as_str().unwrap_or("request rejected").into(),
+        }
+        .into());
+    }
+    Ok(response.json().await?)
+}
+
 /// Where the daemon listens when UNIX sockets are unavailable: loopback TCP plus a
 /// secret that only the current user's profile directory discloses.
 #[cfg_attr(unix, allow(dead_code))]
@@ -120,12 +153,7 @@ impl Client {
     }
     pub async fn get(&self, path: &str) -> Result<Value> {
         let response = self.http.get(format!("{}{path}", self.base)).send().await?;
-        ensure!(
-            response.status().is_success(),
-            "API request failed: {}",
-            response.status()
-        );
-        Ok(response.json().await?)
+        json_response(response).await
     }
     pub async fn post(&self, path: &str, body: Value) -> Result<Value> {
         let response = self
@@ -134,14 +162,7 @@ impl Client {
             .json(&body)
             .send()
             .await?;
-        let status = response.status();
-        let value: Value = response.json().await?;
-        ensure!(
-            status.is_success(),
-            "{}",
-            value["error"].as_str().unwrap_or("API request failed")
-        );
-        Ok(value)
+        json_response(response).await
     }
     pub async fn session(&self, id: Option<String>, workspace: PathBuf) -> Result<String> {
         if let Some(id) = id {
@@ -164,36 +185,66 @@ impl Client {
         model: Option<String>,
         tx: mpsc::Sender<Value>,
     ) -> Result<()> {
+        self.turn_options(session, prompt, model, json!({}), tx)
+            .await
+    }
+
+    pub async fn submit_turn(
+        &self,
+        session: &str,
+        prompt: &str,
+        model: Option<String>,
+        mut options: Value,
+    ) -> Result<Value> {
+        let body = options
+            .as_object_mut()
+            .context("task options must be an object")?;
+        body.insert("session_id".into(), json!(session));
+        body.insert("objective".into(), json!(prompt));
+        body.insert("model".into(), json!(model));
         let key = layeragent_protocol::new_id();
-        let created = self
+        let response = self
             .http
             .post(format!("{}/v1/tasks", self.base))
-            .header("idempotency-key", &key)
-            .json(&json!({
-                "session_id": session,
-                "objective": prompt,
-                "model": model,
-            }))
+            .header("idempotency-key", key)
+            .json(&options)
             .send()
             .await?;
-        let status = created.status();
-        let body: Value = created.json().await?;
+        let status = response.status();
+        let value: Value = response.json().await?;
         ensure!(
             status.is_success(),
             "{}",
-            body["error"].as_str().unwrap_or("task rejected")
+            value["error"].as_str().unwrap_or("task rejected")
         );
-        let task = body["id"]
-            .as_str()
-            .context("task response has no id")?
-            .to_string();
-        if tx
-            .send(json!({"job_id": task, "task_id": task, "session_id": session}))
-            .await
-            .is_err()
-        {
-            return Ok(());
+        Ok(value)
+    }
+
+    pub async fn turn_options(
+        &self,
+        session: &str,
+        prompt: &str,
+        model: Option<String>,
+        options: Value,
+        tx: mpsc::Sender<Value>,
+    ) -> Result<()> {
+        let created = self.submit_turn(session, prompt, model, options).await?;
+        let task = created["id"].as_str().context("task response has no id")?;
+        if tx.send(json!({"job_id":task,"task_id":task,"session_id":session,"execution":created["execution"]})).await.is_err() { return Ok(()); }
+        if created["execution"] == "cooperative" {
+            self.follow_team(task, tx, true).await
+        } else {
+            self.follow_task(task, session, tx).await
         }
+    }
+
+    pub async fn follow_task(
+        &self,
+        task: &str,
+        session: &str,
+        tx: mpsc::Sender<Value>,
+    ) -> Result<()> {
+        crate::team::identifier(task)?;
         let mut after = 0i64;
         let mut reconnects = 0;
         loop {
@@ -268,6 +319,199 @@ impl Client {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     }
+    pub async fn team_resource(&self, task: &str, resource: &str) -> Result<Value> {
+        crate::team::identifier(task)?;
+        ensure!(
+            matches!(
+                resource,
+                "messages"
+                    | "deliveries"
+                    | "work"
+                    | "findings"
+                    | "finding_revisions"
+                    | "objections"
+                    | "evidence"
+            ),
+            "unknown team resource"
+        );
+        let mut cursor = 0;
+        let mut items = Vec::new();
+        loop {
+            let page = self
+                .get(&format!(
+                    "/v1/tasks/{task}/team/{resource}?after={cursor}&limit=200"
+                ))
+                .await?;
+            items.extend(
+                page["items"]
+                    .as_array()
+                    .context("resource items missing")?
+                    .iter()
+                    .cloned(),
+            );
+            match page["next"].as_i64() {
+                Some(next) => {
+                    ensure!(next > cursor, "resource cursor did not advance");
+                    cursor = next;
+                }
+                None => return Ok(json!({"items":items,"next":null})),
+            }
+        }
+    }
+
+    async fn team_view(&self, task: &str, mut snapshot: Value) -> Result<Value> {
+        // One request rather than a request per resource. Export retains complete
+        // data; only the terminal projection is limited to the most recent rows.
+        let mut export = self.get(&format!("/v1/tasks/{task}/team/export")).await?;
+        for resource in [
+            "messages",
+            "deliveries",
+            "work",
+            "findings",
+            "objections",
+            "evidence",
+            "finding_revisions",
+        ] {
+            let mut items = export[resource].take();
+            if let Some(rows) = items.as_array_mut() {
+                let excess = rows.len().saturating_sub(200);
+                rows.drain(..excess);
+            }
+            snapshot[resource] = items;
+        }
+        Ok(snapshot)
+    }
+
+    /// Snapshot first, then the durable SSE cursor. Reconnect never writes or resumes.
+    /// View refresh is event driven and throttled independently from the event stream.
+    pub async fn follow_team(
+        &self,
+        task: &str,
+        tx: mpsc::Sender<Value>,
+        stop_when_blocked: bool,
+    ) -> Result<()> {
+        crate::team::identifier(task)?;
+        let mut cursor = None;
+        let mut failures = 0u32;
+        let mut approvals = std::collections::HashSet::new();
+        loop {
+            if tx.is_closed() {
+                return Ok(());
+            }
+            let connection: Result<bool> = async {
+                let snapshot = self.get(&format!("/v1/tasks/{task}/team")).await?;
+                let boundary = snapshot["team"]["last_event_seq"].as_i64().unwrap_or(0);
+                let after = *cursor.get_or_insert(boundary);
+                if self.send_team_view(task, snapshot, &tx, &mut approvals, stop_when_blocked).await? { return Ok(true); }
+                let response = self.http.get(format!("{}/v1/tasks/{task}/events/stream?after={after}",self.base)).send().await?;
+                if !response.status().is_success() { json_response(response).await?; unreachable!(); }
+                let mut stream = response.bytes_stream();
+                let mut decoder = layeragent_providers::FrameDecoder::default();
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut dirty = false;
+                loop {
+                    tokio::select! {
+                        _ = tx.closed() => return Ok(true),
+                        _ = tick.tick(), if dirty => {
+                            let snapshot = self.get(&format!("/v1/tasks/{task}/team")).await?;
+                            if self.send_team_view(task,snapshot,&tx,&mut approvals,stop_when_blocked).await? { return Ok(true); }
+                            dirty = false;
+                        }
+                        chunk = stream.next() => {
+                            let Some(chunk) = chunk else { return Ok(false); };
+                            for frame in decoder.push(&chunk?,false)? {
+                                if frame.trim().is_empty() { continue; }
+                                let event:Value = serde_json::from_str(&frame)?;
+                                let seq = event["seq"].as_i64().context("event sequence missing")?;
+                                if seq <= cursor.unwrap_or(0) { continue; }
+                                cursor = Some(seq);
+                                dirty = true;
+                                if tx.send(event).await.is_err() { return Ok(true); }
+                            }
+                            failures = 0;
+                        }
+                    }
+                }
+            }.await;
+            match connection {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    failures += 1;
+                }
+                Err(error) => {
+                    failures += 1;
+                    let status = error.downcast_ref::<ApiStatus>();
+                    if status.is_some_and(|e| {
+                        e.status.is_client_error()
+                            && e.status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                    }) || failures >= 20
+                    {
+                        return Err(error);
+                    }
+                    if failures == 1 {
+                        let _ = tx.send(json!({"kind":"team_connection","data":{"state":"reconnecting","reason":"Conservando el cursor; no se reanuda ni repite trabajo."}})).await;
+                    }
+                    if let Some(status) = status {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            status.retry_after.clamp(1, 30),
+                        ))
+                        .await;
+                    }
+                }
+            }
+            ensure!(failures < 20, "team stream did not reconnect");
+            tokio::time::sleep(std::time::Duration::from_millis(
+                500 * u64::from(failures.min(10)),
+            ))
+            .await;
+        }
+    }
+
+    async fn send_team_view(
+        &self,
+        task: &str,
+        snapshot: Value,
+        tx: &mpsc::Sender<Value>,
+        approvals: &mut std::collections::HashSet<String>,
+        stop_when_blocked: bool,
+    ) -> Result<bool> {
+        let view = self.team_view(task, snapshot.clone()).await?;
+        if tx
+            .send(json!({"kind":"team_snapshot","task_id":task,"data":view}))
+            .await
+            .is_err()
+        {
+            return Ok(true);
+        }
+        if let Some(pending) = snapshot["team"]["pending_approvals"].as_array() {
+            for approval in pending {
+                if let Some(id) = approval["approval_id"].as_str()
+                    && approvals.insert(id.to_owned())
+                    && tx
+                        .send(json!({"kind":"approval_required","task_id":task,"data":approval}))
+                        .await
+                        .is_err()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        let state = snapshot["team"]["state"].as_str().unwrap_or_default();
+        if matches!(state, "terminated" | "cancelled" | "failed")
+            || (stop_when_blocked && state == "blocked")
+        {
+            let state = if state == "terminated" {
+                "completed"
+            } else {
+                state
+            };
+            let _ = tx.send(json!({"kind":"task_outcome","task_id":task,"data":{"state":state,"reason":snapshot["team"]["reason"]}})).await;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub async fn print_turn(
         &self,
         session: &str,
@@ -275,17 +519,32 @@ impl Client {
         model: Option<String>,
         json_output: bool,
     ) -> Result<()> {
+        self.print_turn_options(session, prompt, model, json_output, json!({}))
+            .await
+    }
+    pub async fn print_turn_options(
+        &self,
+        session: &str,
+        prompt: &str,
+        model: Option<String>,
+        json_output: bool,
+        options: Value,
+    ) -> Result<()> {
         use std::io::{IsTerminal, Write};
         let (tx, mut rx) = mpsc::channel(64);
         let client = self.clone();
         let id = session.to_string();
         let prompt = prompt.to_string();
-        let task = tokio::spawn(async move { client.turn(&id, &prompt, model, tx).await });
+        let task =
+            tokio::spawn(
+                async move { client.turn_options(&id, &prompt, model, options, tx).await },
+            );
         let mut job: Option<String> = None;
         let mut failure = None;
         let mut completed = false;
         let mut rendered = false;
         let mut cancelled = false;
+        let mut seen_approvals = std::collections::HashSet::new();
         eprintln!("Session: {session}");
         loop {
             tokio::select! {
@@ -294,11 +553,15 @@ impl Client {
                     if let Some(id)=&job{let _=self.post(&format!("/v1/tasks/{id}/cancel"),json!({})).await;}
                 },
                 event=rx.recv()=>{
-                    let Some(event)=event else{break};
+                    let Some(mut event)=event else{break};
                     if json_output{println!("{event}");}
+                    if event["kind"] == "team_member_event" && event["data"]["kind"] == "approval_required" {
+                        event = json!({"kind":"approval_required","data":event["data"]["data"]});
+                    }
                     if let Some(id)=event["job_id"].as_str(){job=Some(id.to_string());if cancelled{let _=self.post(&format!("/v1/tasks/{id}/cancel"),json!({})).await;}}
                     if event["kind"]=="approval_required"{
                         let id=event["data"]["approval_id"].as_str().unwrap_or("");
+                        if !seen_approvals.insert(id.to_owned()) { continue; }
                         let allow=if !json_output && std::io::stdin().is_terminal() && std::io::stderr().is_terminal(){
                             match layeragent_ui::app::approval_review(&event["data"]) {
                                 Ok(review) => {
@@ -320,6 +583,13 @@ impl Client {
                         eprint!("{}",event["data"]["text"].as_str().unwrap_or(""));
                     }
                     if !json_output && event["kind"]=="attempt_discarded"{eprintln!("\n[Generation discarded; switching provider]");rendered=false;}
+                    if event["kind"] == "team_snapshot" && !json_output { eprint!("{}", crate::team::summary(&event["data"])); }
+                    if event["kind"] == "team_completed" { completed = true; }
+                    if event["kind"] == "task_outcome" {
+                        completed = event["data"]["state"] == "completed";
+                        if !completed { failure = Some(format!("Equipo {}: {}", event["data"]["state"].as_str().unwrap_or("detenido"), event["data"]["reason"].as_str().unwrap_or("consulta team show para continuar"))); }
+                        if !json_output { println!("Equipo: {}", event["data"]["state"]); }
+                    }
                     if let Some(text)=event["text"].as_str(){completed=true;if !json_output{if rendered{println!();}else{println!("{text}");}}}
                     if let Some(error)=event["error"].as_str(){failure=Some(error.to_string());}
                 }
@@ -472,5 +742,173 @@ async fn approval_key(review: &str) -> Result<bool> {
             // Re-review with current dimensions rather than confirming hidden content.
             return Ok(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod team_tests {
+    use super::*;
+    use axum::{
+        Json,
+        extract::State,
+        http::{Method, StatusCode},
+        response::IntoResponse,
+    };
+    use std::sync::{Arc, Mutex};
+
+    type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
+    async fn fixture(
+        State(calls): State<Calls>,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        let method = request.method().clone();
+        let uri = request.uri().to_string();
+        let bytes = match axum::body::to_bytes(request.into_body(), 65536).await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        if let Ok(mut calls) = calls.lock() {
+            calls.push((method.to_string(), uri.clone(), body));
+        }
+        if method == Method::POST {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error":"team revision conflict"})),
+            )
+                .into_response();
+        }
+        if uri.ends_with("/team") {
+            let first_live = uri.contains("task-live")
+                && calls
+                    .lock()
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .filter(|call| call.1.ends_with("/team"))
+                            .count()
+                            == 1
+                    })
+                    .unwrap_or(false);
+            return Json(json!({"team":{"task_id":"task-one","state":if first_live {"active"} else {"terminated"},"revision":17,"last_event_seq":5,"members":[]},"task_revision":999})).into_response();
+        }
+        if uri.ends_with("/team/export") {
+            return Json(json!({"messages":[{"id":"first"},{"id":"second"}],"work":[],"findings":[],"evidence":[],"objections":[],"deliveries":[],"finding_revisions":[]})).into_response();
+        }
+        if uri.contains("/events/stream?") {
+            let data = json!({"seq":6,"kind":"team_message","data":{}});
+            return (
+                [("content-type", "text/event-stream")],
+                format!("data: {data}\n\ndata: {data}\n\n"),
+            )
+                .into_response();
+        }
+        if uri.contains("/events?") {
+            return Json(json!({"events":[{"seq":6,"kind":"team_completed","data":{}}],"next":6}))
+                .into_response();
+        }
+        if uri.contains("/messages?after=0") {
+            return Json(json!({"items":[{"id":"first"}],"next":7})).into_response();
+        }
+        if uri.contains("/messages?after=7") {
+            return Json(json!({"items":[{"id":"second"}],"next":null})).into_response();
+        }
+        Json(json!({"items":[],"next":null})).into_response()
+    }
+    async fn server() -> Result<(Client, Calls, tokio::task::JoinHandle<()>)> {
+        let calls = Calls::default();
+        let app = axum::Router::new()
+            .fallback(fixture)
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((
+            Client {
+                http: reqwest::Client::new(),
+                base,
+            },
+            calls,
+            handle,
+        ))
+    }
+    #[tokio::test]
+    async fn attaching_a_completed_team_only_reads_and_returns_an_outcome() -> Result<()> {
+        let (client, calls, server) = server().await?;
+        let (tx, mut rx) = mpsc::channel(16);
+        client.follow_team("task-one", tx, false).await?;
+        let first = rx.recv().await.context("snapshot missing")?;
+        assert_eq!(first["kind"], "team_snapshot");
+        assert_eq!(first["data"]["messages"].as_array().map(Vec::len), Some(2));
+        let mut last = Value::Null;
+        while let Some(event) = rx.recv().await {
+            last = event;
+        }
+        assert_eq!(last["kind"], "task_outcome");
+        assert_eq!(last["data"]["state"], "completed");
+        let calls = calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls poisoned"))?;
+        assert!(calls.iter().all(|call| call.0 == "GET"));
+        assert!(
+            !calls.iter().any(|call| call.1.contains("events")),
+            "terminal snapshot needs no live stream"
+        );
+        server.abort();
+        Ok(())
+    }
+    #[tokio::test]
+    async fn conflicting_commands_use_team_revision_and_are_not_replayed() -> Result<()> {
+        let (client, calls, server) = server().await?;
+        assert!(
+            crate::team::command(&client, "task-one", "pause", None, None, None)
+                .await
+                .is_err()
+        );
+        let calls = calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls poisoned"))?;
+        let writes: Vec<_> = calls.iter().filter(|call| call.0 == "POST").collect();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].2["expected_revision"], 17);
+        assert!(
+            !writes[0].2["idempotency_key"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_starts_at_snapshot_cursor_and_deduplicates_replayed_events() -> Result<()> {
+        let (client, calls, server) = server().await?;
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.follow_team("task-live", tx, false),
+        )
+        .await??;
+        let mut messages = 0;
+        while let Some(event) = rx.recv().await {
+            if event["kind"] == "team_message" {
+                messages += 1;
+            }
+        }
+        assert_eq!(messages, 1);
+        assert!(
+            calls
+                .lock()
+                .map_err(|_| anyhow::anyhow!("calls poisoned"))?
+                .iter()
+                .any(|call| call.1.contains("events/stream?after=5"))
+        );
+        let page = client.team_resource("task-one", "messages").await?;
+        assert_eq!(page["items"].as_array().map(Vec::len), Some(2));
+        server.abort();
+        Ok(())
     }
 }

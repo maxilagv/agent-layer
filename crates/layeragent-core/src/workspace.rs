@@ -383,6 +383,28 @@ impl Tracker {
         )
     }
 
+    pub(super) fn receipt(&mut self, cancel: &CancellationToken) -> Result<Value> {
+        self.walk(cancel)?;
+        let mut digest = Sha256::new();
+        let files = self
+            .current
+            .files
+            .iter()
+            .map(|(path, state)| {
+                digest.update(path.to_string_lossy().as_bytes());
+                digest.update([0]);
+                digest.update(state.hash.as_bytes());
+                digest.update([0]);
+                json!({"path":path.to_string_lossy(),"sha256":state.hash,"bytes":state.bytes})
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "snapshot_sha256":hex::encode(digest.finalize()),
+            "files":files,
+            "coverage":{"skipped":self.current.skipped,"scan_limited":self.current.scan_limited,"excludes":"secrets, protected metadata, dependency/build directories and symlinks","limits":{"files":MAX_ENTRIES,"file_bytes":MAX_FILE,"hashed_bytes":MAX_HASHED}}
+        }))
+    }
+
     /// Everything that differs from the turn's baseline, from a fresh authoritative walk.
     pub(super) fn finish(&mut self, cancel: &CancellationToken) -> Result<Value> {
         self.walk(cancel)?;

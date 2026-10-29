@@ -41,6 +41,8 @@ def main():
         ('system_smoke', [sys.executable, 'tests/system_smoke.py']),
         ('auth_smoke', [sys.executable, 'tests/auth_smoke.py']),
         ('tui_smoke', [sys.executable, 'tests/tui_smoke.py']),
+        ('cooperative_smoke', [sys.executable, 'tests/cooperative_smoke.py']),
+        ('cooperative_tui_smoke', [sys.executable, 'tests/cooperative_tui_smoke.py']),
         ('secrets_smoke', [sys.executable, 'tests/secrets_smoke.py']),
         ('recovery_smoke', [sys.executable, 'tests/recovery_smoke.py']),
         ('backup_smoke', [sys.executable, 'tests/backup_smoke.py']),
@@ -61,6 +63,8 @@ def main():
         if args.native_user:
             native.append('--user-service')
         checks.append(('native_confinement', native))
+    if args.native_user:
+        checks.append(('native_cooperative', [sys.executable, 'tests/cooperative_smoke.py', '--native', '--user-service']))
     report = {'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(), **source, 'checks': []}
     for name, command in checks:
         start = time.monotonic()
@@ -72,15 +76,16 @@ def main():
             entry.update({'passed_tests': sum(int(row[0]) for row in totals), 'ignored_tests': sum(int(row[2]) for row in totals)})
         report['checks'].append(entry)
         print(json.dumps(entry), flush=True)
-        if result.returncode and name != 'native_confinement':
+        if result.returncode and not name.startswith('native_'):
             print(result.stdout[-4000:], flush=True)
             break
     report['source_changed_during_verification'] = fingerprint(root)['source_sha256'] != source['source_sha256']
-    required_count = len([name for name, _ in checks if name != 'native_confinement'])
-    required = [entry for entry in report['checks'] if entry['name'] != 'native_confinement']
+    required_count = len([name for name, _ in checks if not name.startswith('native_')])
+    required = [entry for entry in report['checks'] if not entry['name'].startswith('native_')]
     report['development_checks_passed'] = len(required) == required_count and all(entry['passed'] for entry in required) and not report['source_changed_during_verification']
     report['remote_bridge_verified'] = any(entry['name'] == 'remote_bridge' and entry['passed'] for entry in report['checks'])
     report['native_confinement_verified'] = any(entry['name'] == 'native_confinement' and entry['passed'] for entry in report['checks'])
+    report['native_cooperative_verified'] = any(entry['name'] == 'native_cooperative' and entry['passed'] for entry in report['checks'])
     (root / 'docs/verification.json').write_text(json.dumps(report, indent=2) + '\n')
     return 0 if report['development_checks_passed'] and all(entry['passed'] for entry in report['checks']) else 1
 

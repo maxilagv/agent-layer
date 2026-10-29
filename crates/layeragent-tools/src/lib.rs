@@ -34,6 +34,27 @@ pub trait AgentControl: Send + Sync {
 }
 pub const AGENT_TOOLS: [&str; 4] = ["spawn_agent", "wait_agent", "cancel_agent", "list_agents"];
 
+#[async_trait::async_trait]
+pub trait TeamControl: Send + Sync {
+    async fn execute(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value>;
+}
+pub const TEAM_TOOLS: [&str; 14] = [
+    "team_members",
+    "team_message",
+    "team_wait",
+    "team_add_member",
+    "team_work_create",
+    "team_work_claim",
+    "team_work_update",
+    "team_finding",
+    "team_finding_transition",
+    "team_initial_assessment",
+    "team_objection",
+    "team_verify",
+    "team_close",
+    "team_resolve",
+];
+
 /// Negotiated MCP catalog kept per server.
 ///
 /// The cache is discarded when the negotiated capabilities change, so a
@@ -75,6 +96,7 @@ pub struct ToolContext<'a> {
     /// Receives raw output chunks of long-running commands while they run.
     pub stream: Option<mpsc::Sender<String>>,
     pub agents: Option<Arc<dyn AgentControl>>,
+    pub team: Option<Arc<dyn TeamControl>>,
 }
 fn def(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolDefinition {
     ToolDefinition {
@@ -404,8 +426,56 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
     });
     tools
 }
+
+pub fn definitions_with_team(config: &Config, cooperative: bool) -> Vec<ToolDefinition> {
+    let mut tools = definitions(config);
+    if !cooperative {
+        return tools;
+    }
+    let text = json!({"type":"string","maxLength":8192});
+    let id = json!({"type":"string","maxLength":96});
+    let key = json!({"type":"string","minLength":1,"maxLength":200});
+    let revision = json!({"type":"integer","minimum":1});
+    let mutation = json!({"idempotency_key":key,"expected_revision":revision});
+    let purpose = json!({"type":"string","enum":["question","observation","objection","verification_request","response"]});
+    let role = json!({"type":"string","enum":["analyst","reviewer","verifier","specialist"]});
+    let finding_state = json!({"type":"string","enum":["hypothesis","investigating","reproduced","reviewed","discarded","inconclusive"]});
+    let fields = |extra: Value| {
+        let mut base = mutation.as_object().cloned().unwrap_or_default();
+        base.extend(extra.as_object().cloned().unwrap_or_default());
+        Value::Object(base)
+    };
+    // idempotency_key and the team expected_revision are optional for appends: the
+    // runtime derives a deterministic key per activation and call, and uses the
+    // current revision. Supplying a stale revision still yields a conflict.
+    tools.extend([
+        def("team_members", "List team identities, roles, states, the current team revision and your own member id; identities come from the runtime", json!({}), &[]),
+        def("team_message", "Persist a direct peer message; accepted is not incorporated, understood or resolved", fields(json!({"recipient":id,"purpose":purpose,"body":text,"work_id":id,"finding_id":id,"evidence_id":id,"reply_to":id,"provenance":{"type":"array","items":text,"maxItems":32}})), &["purpose","body"]),
+        def("team_wait", "Mark this response as waiting; finish the response to release the concurrency slot", json!({"reason":text}), &["reason"]),
+        def("team_add_member", "Coordinator only: add a specialist for distinct justified work", fields(json!({"name":text,"role":role,"justification":text,"model":id})), &["name","role","justification"]),
+        def("team_work_create", "Create shared work with an explicit deliverable and close conditions", fields(json!({"title":text,"deliverable":text,"assignee":id,"dependencies":{"type":"array","items":id,"maxItems":64},"priority":{"type":"integer"},"close_conditions":text})), &["title","deliverable","close_conditions"]),
+        def("team_work_claim", "Atomically claim available shared work", json!({"work_id":id,"expected_revision":revision}), &["work_id","expected_revision"]),
+        def("team_work_update", "Finish, cancel or reopen owned work with a reason", json!({"work_id":id,"state":{"type":"string","enum":["completed","cancelled","inconclusive","pending"]},"expected_revision":revision,"reason":text}), &["work_id","state","expected_revision","reason"]),
+        def("team_finding", "Record a hypothesis, investigation or inconclusive finding", fields(json!({"claim":text,"state":finding_state,"reason":text,"evidence_ids":{"type":"array","items":id},"snapshot_sha256":id})), &["claim","state","reason"]),
+        def("team_finding_transition", "Transition a finding with runtime evidence; expected_revision is the finding revision; review requires another member", fields(json!({"finding_id":id,"state":finding_state,"reason":text,"evidence_ids":{"type":"array","items":id},"snapshot_sha256":id,"environmental_failure":{"type":"boolean"}})), &["finding_id","expected_revision","state","reason"]),
+        def("team_initial_assessment", "Record this member's initial assessment before inspecting peer conclusions", json!({"text":json!({"type":"string","maxLength":65536})}), &["text"]),
+        def("team_objection", "Challenge a finding claim and identify a check capable of resolving it", fields(json!({"finding_id":id,"claim":text,"check_required":text,"new_evidence":{"type":"boolean"}})), &["finding_id","claim","check_required"]),
+        def("team_verify", "Run a confined check and persist a runtime-generated execution receipt", json!({"finding_id":id,"command":text,"expected":text,"expected_exit_code":{"type":"integer"},"negative_control":text,"limitations":{"type":"array","items":text}}), &["command","expected"]),
+        def("team_close", "Coordinator only: propose closure after disposing of all unfinished work", json!({"expected_revision":revision,"reason":text}), &["reason"]),
+        def("team_resolve", "Record the disposition and reason for a question or verification request", json!({"message_id":id,"reason":text}), &["message_id","reason"]),
+    ]);
+    tools.retain(|tool| {
+        config.policy.allowed_tools.is_empty() || config.policy.allowed_tools.contains(&tool.name)
+    });
+    tools
+}
+
 pub fn requires_approval(config: &Config, name: &str) -> bool {
-    config.policy.approval_tools.iter().any(|s| s == name)
+    config
+        .policy
+        .approval_tools
+        .iter()
+        .any(|s| s == name || (name == "team_verify" && s == "shell"))
         || config.tools.contains_key(name)
         || [
             "mcp_call",
@@ -516,7 +586,8 @@ impl Tools {
             serde_json::to_vec(&call.arguments)?.len() <= 1_048_576,
             "tool arguments exceed limit"
         );
-        let available = definitions(ctx.config);
+        // Team tools are declared only when the runtime attached cooperative control.
+        let available = definitions_with_team(ctx.config, ctx.team.is_some());
         let definition = available
             .iter()
             .find(|t| t.name == call.name)
@@ -605,6 +676,14 @@ impl Tools {
             .await?;
         }
         match call.name.as_str() {
+            name if TEAM_TOOLS.contains(&name) => {
+                return ctx
+                    .team
+                    .as_ref()
+                    .context("cooperative control is unavailable here")?
+                    .execute(ctx, name, a)
+                    .await;
+            }
             "memory_search" => {
                 return Ok(json!(
                     ctx.store
@@ -1215,6 +1294,23 @@ mod tests {
         ] {
             assert!(!requires_approval(&config, name), "{name}");
         }
+    }
+    #[test]
+    fn cooperative_verification_inherits_shell_approval_and_does_not_offer_writers() {
+        let mut config = Config::default();
+        config.policy.approval_tools = vec!["shell".into()];
+        assert!(requires_approval(&config, "team_verify"));
+        let tools = definitions_with_team(&config, true);
+        let add = tools
+            .iter()
+            .find(|tool| tool.name == "team_add_member")
+            .unwrap();
+        assert!(
+            !add.parameters["properties"]["role"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("writer"))
+        );
     }
     #[test]
     fn browser_tools_follow_configuration_and_risky_ones_need_approval() {

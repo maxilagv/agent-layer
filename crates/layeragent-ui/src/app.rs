@@ -85,6 +85,10 @@ pub enum Action {
         arguments_hash: String,
     },
     NewSession,
+    Context,
+    Compact,
+    Effort(Option<String>),
+    Team(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -100,6 +104,7 @@ pub enum Entry {
     Tool {
         id: String,
         name: String,
+        agent: Option<String>,
         summary: String,
         state: ToolState,
         started: f32,
@@ -158,6 +163,13 @@ pub struct App {
     pub(crate) scroll: usize,
     pub(crate) card: usize,
     pub(crate) help: bool,
+    pub execution: String,
+    pub team: Option<Value>,
+    pub team_visible: bool,
+    pub team_resource: String,
+    pub(crate) team_notice: Option<String>,
+    pub(crate) team_scroll: usize,
+    team_event_seq: i64,
     intro_at: Option<f32>,
     celebrate_at: Option<f32>,
     farewell_at: Option<f32>,
@@ -182,6 +194,13 @@ impl App {
             scroll: 0,
             card: 0,
             help: false,
+            execution: "delegated".into(),
+            team: None,
+            team_visible: false,
+            team_resource: "members".into(),
+            team_notice: None,
+            team_scroll: 0,
+            team_event_seq: 0,
             intro_at: None,
             celebrate_at: None,
             farewell_at: None,
@@ -280,8 +299,81 @@ impl App {
                 self.scroll = 0;
                 return Action::None;
             }
-            "/new" | "/nuevo" => return Action::NewSession,
+            "/new" | "/nuevo" => {
+                if self.busy {
+                    self.note("Espera a que termine o cancela antes de crear otra sesión.");
+                    return Action::None;
+                }
+                return Action::NewSession;
+            }
             _ => {}
+        }
+        if text == "/context" {
+            return Action::Context;
+        }
+        if text == "/execution" {
+            self.note(&format!("Modo de las próximas tareas: {}", self.execution));
+            return Action::None;
+        }
+        if let Some(mode) = text.strip_prefix("/execution ") {
+            if matches!(mode, "individual" | "delegated" | "cooperative") {
+                self.execution = mode.into();
+                self.note(&format!("Próximas tareas: {mode}"));
+            } else {
+                self.note("Uso: /execution individual|delegated|cooperative");
+            }
+            return Action::None;
+        }
+        if text == "/team" || text == "/team toggle" {
+            self.team_visible = !self.team_visible;
+            self.screen = Screen::Chat;
+            return Action::None;
+        }
+        if let Some(command) = text.strip_prefix("/team ") {
+            if matches!(
+                command,
+                "members"
+                    | "messages"
+                    | "work"
+                    | "findings"
+                    | "objections"
+                    | "evidence"
+                    | "decisions"
+            ) {
+                self.team_resource = command.into();
+                self.team_visible = true;
+                self.team_scroll = 0;
+                self.screen = Screen::Chat;
+                return Action::None;
+            }
+            if command.starts_with("start ") && self.busy {
+                self.note(
+                    "Ya hay una tarea activa; usa /team attach para inspeccionar otro equipo.",
+                );
+                return Action::None;
+            }
+            return Action::Team(command.into());
+        }
+        if text == "/effort" {
+            return Action::Effort(None);
+        }
+        if let Some(level) = text.strip_prefix("/effort ") {
+            if matches!(level.trim(), "auto" | "low" | "medium" | "high" | "xhigh") {
+                return Action::Effort(Some(level.trim().into()));
+            }
+            self.note("Uso: /effort auto|low|medium|high|xhigh");
+            return Action::None;
+        }
+        if text == "/compact" {
+            if self.busy {
+                self.note("Espera a que termine la tarea para compactar.");
+                return Action::None;
+            }
+            return Action::Compact;
+        }
+        if text.starts_with('/') {
+            self.note("Comando desconocido. Usa /help para consultar los comandos disponibles.");
+            return Action::None;
         }
         if self.busy {
             self.note(
@@ -290,6 +382,10 @@ impl App {
             return Action::None;
         }
         self.help = false;
+        self.team = None;
+        self.team_notice = None;
+        self.team_visible = self.execution == "cooperative";
+        self.team_event_seq = 0;
         self.sent.push(text.clone());
         self.screen = Screen::Chat;
         self.entries.push(Entry::User(text.clone()));
@@ -308,11 +404,47 @@ impl App {
         self.scroll = 0;
         self.busy = false;
         self.approval = None;
+        self.team = None;
+        self.team_visible = false;
+        self.team_event_seq = 0;
         self.intro_at = Some(self.clock);
+    }
+
+    pub fn load_history(&mut self, messages: &[Value]) {
+        self.entries.clear();
+        for message in messages {
+            let text = message["content"].as_str().unwrap_or_default();
+            match message["role"].as_str() {
+                Some("user") => self.entries.push(Entry::User(text.into())),
+                Some("assistant") if !text.is_empty() => {
+                    self.entries.push(Entry::Assistant(text.into()))
+                }
+                _ => {}
+            }
+        }
+        if !self.entries.is_empty() {
+            self.screen = Screen::Chat;
+        }
     }
 
     pub fn note(&mut self, text: &str) {
         self.entries.push(Entry::Note(text.to_string()));
+    }
+
+    pub fn begin_team(&mut self, objective: &str) {
+        self.screen = Screen::Chat;
+        self.busy = true;
+        self.busy_since = self.clock;
+        self.team = None;
+        self.team_notice = None;
+        self.team_visible = true;
+        self.team_event_seq = 0;
+        self.entries.push(Entry::User(objective.into()));
+    }
+
+    pub fn team_note(&mut self, text: &str) {
+        self.team_notice = Some(text.into());
+        self.note(text);
     }
 
     pub fn on_key(&mut self, key: Key) -> Action {
@@ -499,10 +631,18 @@ impl App {
                 Action::None
             }
             Key::PageUp => {
+                if self.team_visible {
+                    self.team_scroll = self.team_scroll.saturating_sub(8);
+                    return Action::None;
+                }
                 self.scroll = self.scroll.saturating_add(8);
                 Action::None
             }
             Key::PageDown => {
+                if self.team_visible {
+                    self.team_scroll = self.team_scroll.saturating_add(8);
+                    return Action::None;
+                }
                 self.scroll = self.scroll.saturating_sub(8);
                 Action::None
             }
@@ -551,6 +691,89 @@ impl App {
 
     /// Applies one event from the runtime's stream.
     pub fn on_event(&mut self, event: &Value) {
+        if event["kind"] == "team_snapshot" {
+            let value = event["data"].clone();
+            let changed_task = self
+                .team
+                .as_ref()
+                .is_none_or(|previous| previous["team"]["task_id"] != value["team"]["task_id"]);
+            if changed_task {
+                self.team_event_seq = value["team"]["last_event_seq"].as_i64().unwrap_or(0);
+                self.approval = None;
+            }
+            self.busy = matches!(value["team"]["state"].as_str(), Some("active" | "closing"))
+                || value["team"]["pause_pending"] == true;
+            self.team = Some(value.clone());
+            if changed_task {
+                self.team_visible = true;
+            }
+            self.screen = Screen::Chat;
+            if self.approval.is_none()
+                && let Some(approval) = value["team"]["pending_approvals"]
+                    .as_array()
+                    .and_then(|v| v.first())
+            {
+                self.on_event(&serde_json::json!({"kind":"approval_required","data":approval}));
+            }
+            return;
+        }
+        if event["kind"] == "task_outcome" {
+            self.finish();
+            self.note(&format!(
+                "Equipo {}. {}",
+                event["data"]["state"].as_str().unwrap_or("detenido"),
+                event["data"]["reason"].as_str().unwrap_or("")
+            ));
+            return;
+        }
+        if event["kind"]
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("team_"))
+        {
+            if let Some(seq) = event["seq"].as_i64() {
+                if seq <= self.team_event_seq {
+                    return;
+                }
+                self.team_event_seq = seq;
+            }
+            if event["kind"] == "team_member_event" {
+                let member = event["data"]["member_id"].as_str().unwrap_or("agente");
+                let activation = event["data"]["activation_id"].as_str().unwrap_or("");
+                let mut data = event["data"]["data"].clone();
+                if let Some(object) = data.as_object_mut() {
+                    object.insert("agent_name".into(), Value::String(member.into()));
+                    // Provider call ids may repeat in different member sessions.
+                    let key = if event["data"]["kind"] == "tool_started" {
+                        "id"
+                    } else {
+                        "call_id"
+                    };
+                    if let Some(id) = object.get(key).and_then(Value::as_str) {
+                        object.insert(
+                            key.into(),
+                            Value::String(format!("{activation}:{member}:{id}")),
+                        );
+                    }
+                }
+                // Per-member text remains in its own session. The shared timeline
+                // shows attributable tool events and durable team decisions.
+                if event["data"]["kind"] != "text_delta"
+                    && event["data"]["kind"] != "turn_completed"
+                {
+                    self.on_event(&serde_json::json!({"kind":event["data"]["kind"],"data":data}));
+                }
+                return;
+            }
+            let kind = event["kind"].as_str().unwrap_or("team");
+            self.note(&format!("{kind}: {}", event["data"]));
+            if matches!(
+                kind,
+                "team_completed" | "team_cancelled" | "team_failed" | "team_interrupted"
+            ) {
+                self.finish();
+            }
+            return;
+        }
         let data = &event["data"];
         match event["kind"].as_str().unwrap_or("") {
             "text_delta" => self.streaming.push_str(data["text"].as_str().unwrap_or("")),
@@ -565,6 +788,7 @@ impl App {
                     id: data["id"].as_str().unwrap_or("").to_string(),
                     summary: summarize(&name, &data["arguments"]),
                     name,
+                    agent: data["agent_name"].as_str().map(str::to_owned),
                     state: ToolState::Running,
                     started: self.clock,
                     output: Vec::new(),
@@ -627,6 +851,15 @@ impl App {
                     tool,
                     agent: data["agent_name"].as_str().map(str::to_string),
                 });
+            }
+            "approval_resolved" => {
+                if self
+                    .approval
+                    .as_ref()
+                    .is_some_and(|approval| data["approval_id"] == approval.id)
+                {
+                    self.approval = None;
+                }
             }
             "workspace_diff" => {
                 let files = changed_files(&data["changes"]);
@@ -777,6 +1010,26 @@ mod tests {
         for c in text.chars() {
             app.on_key(Key::Char(c));
         }
+    }
+
+    #[test]
+    fn terminal_commands_never_become_model_prompts() {
+        let mut app = App::new(Info::default());
+        assert_eq!(
+            app.submit("/effort high".into()),
+            Action::Effort(Some("high".into()))
+        );
+        assert_eq!(app.submit("/context".into()), Action::Context);
+        assert_eq!(app.submit("/compact".into()), Action::Compact);
+        assert_eq!(app.submit("/effort invalid".into()), Action::None);
+        assert_eq!(app.submit("/bridge on".into()), Action::None);
+        app.busy = true;
+        assert_eq!(app.submit("/compact".into()), Action::None);
+        assert_eq!(app.submit("/new".into()), Action::None);
+        assert_eq!(
+            app.submit("/effort low".into()),
+            Action::Effort(Some("low".into()))
+        );
     }
 
     #[test]
@@ -938,5 +1191,78 @@ mod tests {
         let mut a = app();
         a.on_paste("línea uno\nlínea dos\t fin");
         assert_eq!(a.input_text(), "línea uno línea dos  fin");
+    }
+    #[test]
+    fn team_controls_work_while_busy_and_never_become_prompts() {
+        let mut a = app();
+        a.begin_team("investigate");
+        type_str(&mut a, "/team message reviewer check this claim");
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Action::Team("message reviewer check this claim".into())
+        );
+        type_str(&mut a, "/team pause");
+        assert_eq!(a.on_key(Key::Enter), Action::Team("pause".into()));
+        type_str(&mut a, "/execution individual");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+        assert_eq!(a.execution, "individual");
+        type_str(&mut a, "/team start audit -- another task");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+    }
+
+    #[test]
+    fn team_snapshots_preserve_toggle_and_events_are_deduplicated() {
+        let mut a = app();
+        let snapshot = json!({"kind":"team_snapshot","data":{"team":{"task_id":"one","state":"active","last_event_seq":12,"members":[]}}});
+        a.on_event(&snapshot);
+        assert!(a.busy && a.team_visible);
+        type_str(&mut a, "/team toggle");
+        a.on_key(Key::Enter);
+        a.on_event(&snapshot);
+        assert!(!a.team_visible);
+        let event =
+            json!({"seq":13,"kind":"team_message","data":{"sender":"reviewer","body":"challenge"}});
+        a.on_event(&event);
+        let count = a.entries.len();
+        a.on_event(&event);
+        assert_eq!(a.entries.len(), count);
+        a.on_event(&json!({"kind":"task_outcome","data":{"state":"completed"}}));
+        assert!(!a.busy);
+        assert!(a.team.is_some(), "completed team remains inspectable");
+    }
+
+    #[test]
+    fn attach_restores_an_outstanding_approval_with_its_revision() {
+        let mut a = app();
+        a.on_event(&json!({"kind":"team_snapshot","data":{"team":{"task_id":"one","state":"active","last_event_seq":8,"pending_approvals":[{"approval_id":"approval-one","member_id":"verifier","expected_revision":7,"arguments_hash":"abc","call":{"name":"shell","arguments":{"command":"printf check"}}}]}}}));
+        let approval = a.approval.as_ref().expect("snapshot approval");
+        assert_eq!(approval.expected_revision, 7);
+        assert_eq!(approval.arguments_hash, "abc");
+        assert!(matches!(
+            a.on_key(Key::Char('n')),
+            Action::Approve {
+                allow: false,
+                expected_revision: 7,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn delegated_prompt_after_team_completion_clears_cooperative_selection() {
+        let mut a = app();
+        a.on_event(&json!({"kind":"team_snapshot","data":{"team":{"task_id":"old-team-task","state":"terminated","last_event_seq":8,"members":[]}}}));
+        a.team_note("Old team notice");
+        type_str(&mut a, "/execution delegated");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+        type_str(&mut a, "new independent task");
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Action::Send("new independent task".into())
+        );
+        assert!(a.team.is_none());
+        assert!(!a.team_visible);
+        assert!(a.team_notice.is_none());
+        assert!(a.is_busy());
     }
 }

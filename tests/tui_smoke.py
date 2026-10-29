@@ -63,6 +63,17 @@ def main():
                 return committed and idle
 
             until(completed)
+            os.write(master, b'/effort high\r')
+            until(lambda: b'Esfuerzo de sesi' in captured)
+            os.write(master, b'/context\r')
+            until(lambda: b'Contexto estimado' in captured)
+            os.write(master, b'/compact\r')
+            until(lambda: b'Checkpoint' in captured and b'mechanical' in captured)
+            with sqlite3.connect(database) as connection:
+                assert connection.execute('SELECT effort FROM sessions').fetchone()[0] == 'high'
+                assert connection.execute('SELECT count(*) FROM context_checkpoints').fetchone()[0] == 1
+                assert connection.execute('SELECT count(*) FROM messages').fetchone()[0] >= 2
+                assert connection.execute('SELECT count(*) FROM turns').fetchone()[0] == 1
             os.write(master, b'\x03')
             # Keep consuming the farewell animation. A PTY has a small output
             # buffer; waiting without reading can block the terminal writer and

@@ -22,6 +22,24 @@ pub struct Delta {
     pub text: String,
 }
 #[async_trait]
+pub trait ProviderAdmission: Send + Sync {
+    async fn reserve(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        estimated_cost: f64,
+    ) -> Result<String>;
+    async fn settle(
+        &self,
+        reservation: &str,
+        usage: Option<&Usage>,
+        cost: f64,
+        uncertain: bool,
+    ) -> Result<()>;
+}
+
+#[async_trait]
 pub trait LanguageModel: Send + Sync {
     async fn infer(
         &self,
@@ -32,6 +50,21 @@ pub trait LanguageModel: Send + Sync {
         cancel: CancellationToken,
         stream: mpsc::Sender<Delta>,
     ) -> Result<Completion>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn infer_admitted(
+        &self,
+        config: &Config,
+        selected: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        cancel: CancellationToken,
+        stream: mpsc::Sender<Delta>,
+        _admission: Option<&dyn ProviderAdmission>,
+    ) -> Result<Completion> {
+        self.infer(config, selected, messages, tools, cancel, stream)
+            .await
+    }
 }
 pub struct Router {
     client: reqwest::Client,
@@ -50,9 +83,9 @@ impl Router {
         })
     }
 }
-#[async_trait]
-impl LanguageModel for Router {
-    async fn infer(
+impl Router {
+    #[allow(clippy::too_many_arguments)]
+    async fn infer_inner(
         &self,
         config: &Config,
         selected: &str,
@@ -60,6 +93,7 @@ impl LanguageModel for Router {
         tools: &[ToolDefinition],
         cancel: CancellationToken,
         stream: mpsc::Sender<Delta>,
+        admission: Option<&dyn ProviderAdmission>,
     ) -> Result<Completion> {
         let mut errors = vec![];
         let estimated = estimate_tokens(messages, tools);
@@ -121,7 +155,12 @@ impl LanguageModel for Router {
                     text: String::new(),
                 })
                 .await;
-            let result = tokio::select! {_=cancel.cancelled()=>bail!("inference cancelled"),r=self.request(p,m,messages,tools,config.max_output_tokens,(&attempt,alias),&stream)=>r};
+            let native_effort = config
+                .effort_models
+                .get(alias)
+                .filter(|levels| levels.contains(&config.default_effort))
+                .map(|_| config.default_effort);
+            let result = tokio::select! {_=cancel.cancelled()=>bail!("inference cancelled"),r=self.request_admitted(p,m,alias,messages,tools,config.max_output_tokens,native_effort,(&attempt,alias),&stream,admission)=>r};
             match result {
                 Ok(mut completion) => {
                     if !m.tools && m.emulate_tools && !tools.is_empty() {
@@ -131,14 +170,17 @@ impl LanguageModel for Router {
                             repair.push(Message::text("assistant", &completion.text));
                             repair.push(Message::text("user","Return only the valid JSON action envelope specified in the system instructions. Do not execute anything or repeat earlier actions."));
                             let repaired = self
-                                .request(
+                                .request_admitted(
                                     p,
                                     m,
+                                    alias,
                                     &repair,
                                     tools,
                                     config.max_output_tokens,
+                                    native_effort,
                                     (&attempt, alias),
                                     &stream,
+                                    admission,
                                 )
                                 .await?;
                             completion.usage.input_tokens += repaired.usage.input_tokens;
@@ -245,7 +287,86 @@ impl std::fmt::Display for ProviderFailure {
     }
 }
 impl std::error::Error for ProviderFailure {}
+
+#[async_trait]
+impl LanguageModel for Router {
+    async fn infer(
+        &self,
+        config: &Config,
+        selected: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        cancel: CancellationToken,
+        stream: mpsc::Sender<Delta>,
+    ) -> Result<Completion> {
+        self.infer_inner(config, selected, messages, tools, cancel, stream, None)
+            .await
+    }
+
+    async fn infer_admitted(
+        &self,
+        config: &Config,
+        selected: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        cancel: CancellationToken,
+        stream: mpsc::Sender<Delta>,
+        admission: Option<&dyn ProviderAdmission>,
+    ) -> Result<Completion> {
+        self.infer_inner(config, selected, messages, tools, cancel, stream, admission)
+            .await
+    }
+}
+
 impl Router {
+    #[allow(clippy::too_many_arguments)]
+    async fn request_admitted(
+        &self,
+        p: &Provider,
+        m: &Model,
+        alias: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        max: u64,
+        native_effort: Option<layeragent_protocol::EffortLevel>,
+        attempt: (&str, &str),
+        stream: &mpsc::Sender<Delta>,
+        admission: Option<&dyn ProviderAdmission>,
+    ) -> Result<Completion> {
+        let Some(admission) = admission else {
+            return self
+                .request(p, m, messages, tools, max, native_effort, attempt, stream)
+                .await;
+        };
+        // No adapter exposes an exact count, so reserve conservative bounds: the
+        // requested output ceiling and serialized bytes (byte-level tokenizers emit at
+        // most one token per byte), capped by the declared model window.
+        let output = max;
+        let input = (serde_json::to_vec(&(messages, tools))?.len() as u64).min(m.context_window);
+        let reserve_cost = (input as f64 * m.input_per_million.unwrap_or(0.0)
+            + output as f64 * m.output_per_million.unwrap_or(0.0))
+            / 1_000_000.0;
+        let reservation = admission
+            .reserve(alias, input, output, reserve_cost)
+            .await?;
+        let result = self
+            .request(p, m, messages, tools, max, native_effort, attempt, stream)
+            .await;
+        match &result {
+            Ok(completion) => {
+                let cost = (completion.usage.input_tokens as f64
+                    * m.input_per_million.unwrap_or(0.0)
+                    + completion.usage.output_tokens as f64 * m.output_per_million.unwrap_or(0.0))
+                    / 1_000_000.0;
+                admission
+                    .settle(&reservation, Some(&completion.usage), cost, false)
+                    .await?;
+            }
+            Err(_) => admission.settle(&reservation, None, 0.0, true).await?,
+        }
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn request(
         &self,
@@ -254,6 +375,7 @@ impl Router {
         messages: &[Message],
         tools: &[ToolDefinition],
         max: u64,
+        native_effort: Option<layeragent_protocol::EffortLevel>,
         attempt: (&str, &str),
         stream: &mpsc::Sender<Delta>,
     ) -> Result<Completion> {
@@ -263,7 +385,10 @@ impl Router {
             .map(layeragent_protocol::redact::sanitize_message)
             .collect::<Result<Vec<_>>>()?;
         let tools = layeragent_protocol::redact::sanitize_tools(tools)?;
-        let (url, body) = format_request(p, m, &messages, &tools, max)?;
+        let (url, mut body) = format_request(p, m, &messages, &tools, max)?;
+        if let Some(effort) = native_effort {
+            apply_native_effort(p, &mut body, effort)?;
+        }
         let mut request = self.client.post(url).json(&body);
         if let Some(key) = credential {
             request = match p.wire {
@@ -648,6 +773,79 @@ pub fn format_request(
     Ok((url, body))
 }
 
+fn apply_native_effort(
+    p: &Provider,
+    body: &mut Value,
+    effort: layeragent_protocol::EffortLevel,
+) -> Result<()> {
+    use layeragent_protocol::EffortLevel;
+    ensure!(
+        effort != EffortLevel::Auto,
+        "auto effort is resolved before provider mapping"
+    );
+    match p.wire {
+        Wire::OpenaiChat => {
+            ensure!(
+                !body
+                    .get("reasoning_effort")
+                    .is_some_and(|value| value.as_str() != Some(effort.as_str())),
+                "model parameters conflict with resolved effort"
+            );
+            body["reasoning_effort"] = json!(effort.as_str());
+        }
+        Wire::OpenaiResponses => {
+            ensure!(
+                body.get("reasoning_effort").is_none(),
+                "Responses uses reasoning.effort"
+            );
+            ensure!(
+                !body["reasoning"]
+                    .get("effort")
+                    .is_some_and(|value| value.as_str() != Some(effort.as_str())),
+                "model parameters conflict with resolved effort"
+            );
+            body["reasoning"]["effort"] = json!(effort.as_str());
+        }
+        Wire::Anthropic => {
+            let budget = match effort {
+                EffortLevel::Low => 2048,
+                EffortLevel::Medium | EffortLevel::Auto => 4096,
+                EffortLevel::High => 8192,
+                EffortLevel::Xhigh => 16384,
+            };
+            ensure!(
+                body.get("thinking").is_none(),
+                "model parameters conflict with resolved effort"
+            );
+            let ceiling = body["max_tokens"].as_u64().context("missing max_tokens")?;
+            ensure!(ceiling > 1024, "output budget cannot fit native thinking");
+            body["thinking"] =
+                json!({"type":"enabled","budget_tokens":(budget as u64).min(ceiling - 1)});
+        }
+        Wire::Gemini => {
+            let budget = match effort {
+                EffortLevel::Low => 1024,
+                EffortLevel::Medium | EffortLevel::Auto => 4096,
+                EffortLevel::High => 8192,
+                EffortLevel::Xhigh => 16384,
+            };
+            ensure!(
+                body["generationConfig"].get("thinkingConfig").is_none(),
+                "model parameters conflict with resolved effort"
+            );
+            body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget":budget});
+        }
+        Wire::Ollama => {
+            ensure!(
+                body.get("think").is_none(),
+                "model parameters conflict with resolved effort"
+            );
+            body["think"] = json!(effort != EffortLevel::Low);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct FrameDecoder {
     buffer: Vec<u8>,
@@ -1019,6 +1217,50 @@ impl Accumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_effort_uses_wire_fields_and_respects_output_ceiling() -> Result<()> {
+        use layeragent_protocol::EffortLevel;
+        let mut provider = Provider {
+            wire: Wire::OpenaiResponses,
+            base_url: "https://fixture.invalid".into(),
+            key_env: None,
+            oauth: None,
+            headers: Default::default(),
+        };
+        let mut responses = json!({"reasoning":{"summary":"auto"}});
+        apply_native_effort(&provider, &mut responses, EffortLevel::High)?;
+        assert_eq!(
+            responses["reasoning"],
+            json!({"effort":"high","summary":"auto"})
+        );
+        assert!(responses.get("reasoning_effort").is_none());
+        assert!(apply_native_effort(&provider, &mut responses, EffortLevel::Low).is_err());
+        provider.wire = Wire::OpenaiChat;
+        let mut chat = json!({});
+        apply_native_effort(&provider, &mut chat, EffortLevel::Low)?;
+        assert_eq!(chat, json!({"reasoning_effort":"low"}));
+        provider.wire = Wire::Anthropic;
+        let mut anthropic = json!({"max_tokens":2048});
+        apply_native_effort(&provider, &mut anthropic, EffortLevel::Xhigh)?;
+        assert_eq!(anthropic["thinking"]["budget_tokens"], 2047);
+        assert!(
+            apply_native_effort(&provider, &mut json!({"max_tokens":1024}), EffortLevel::Low)
+                .is_err()
+        );
+        provider.wire = Wire::Gemini;
+        let mut gemini = json!({"generationConfig":{}});
+        apply_native_effort(&provider, &mut gemini, EffortLevel::High)?;
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            8192
+        );
+        provider.wire = Wire::Ollama;
+        let mut ollama = json!({});
+        apply_native_effort(&provider, &mut ollama, EffortLevel::Medium)?;
+        assert_eq!(ollama["think"], true);
+        Ok(())
+    }
+
     #[test]
     fn fragmented_unicode_and_crlf() -> Result<()> {
         let frame = "data: {\"text\":\"acción 🦀\"}\r\n\r\n".as_bytes();

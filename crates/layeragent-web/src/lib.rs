@@ -489,6 +489,18 @@ struct NewTask {
     executor: Option<String>,
     #[serde(default)]
     idempotency_key: Option<String>,
+    #[serde(default = "default_effort")]
+    effort: String,
+    #[serde(default)]
+    bridge: bool,
+    #[serde(default = "default_mode")]
+    mode: String,
+}
+fn default_effort() -> String {
+    "auto".into()
+}
+fn default_mode() -> String {
+    "normal".into()
 }
 
 async fn create_task(State(state): State<WebState>, Json(request): Json<NewTask>) -> Response {
@@ -511,6 +523,9 @@ async fn create_task(State(state): State<WebState>, Json(request): Json<NewTask>
         "session_id": request.session_id,
         "model": request.model,
         "executor": request.executor,
+        "effort": request.effort,
+        "bridge": request.bridge,
+        "mode": request.mode,
         "idempotency_key": key,
     });
     let mut headers = HeaderMap::new();

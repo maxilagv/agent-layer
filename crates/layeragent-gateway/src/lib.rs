@@ -31,6 +31,7 @@ mod connections;
 pub mod mcp;
 mod remote_view;
 mod tasks;
+mod teams;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -191,6 +192,13 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/sessions", get(sessions).post(create_session))
         .route("/v1/sessions/{id}/turns", post(run))
+        .route("/v1/sessions/{id}/history", get(session_history))
+        .route("/v1/sessions/{id}/context", get(session_context))
+        .route("/v1/sessions/{id}/compact", post(session_compact))
+        .route(
+            "/v1/sessions/{id}/preferences",
+            get(session_preferences).post(set_session_preferences),
+        )
         .route("/v1/sessions/{id}/events", get(events))
         .route(
             "/v1/sessions/{id}/artifacts/{hash}",
@@ -207,6 +215,17 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/tasks/{id}/approvals/{approval}", post(tasks::approve))
         .route("/v1/tasks/{id}/artifacts/{hash}", get(tasks::task_artifact))
         .route("/v1/tasks/{id}/metrics", get(tasks::metrics))
+        .route("/v1/tasks/{id}/team", get(teams::snapshot))
+        .route("/v1/tasks/{id}/team/export", get(teams::export))
+        .route(
+            "/v1/tasks/{id}/team/messages",
+            get(teams::messages).post(teams::message),
+        )
+        .route(
+            "/v1/tasks/{id}/team/commands/{action}",
+            post(teams::command),
+        )
+        .route("/v1/tasks/{id}/team/{resource}", get(teams::resource))
         .route("/v1/artifacts/{hash}", get(tasks::artifact))
         .route("/v1/connections", get(connections::connections))
         .route("/v1/remote/jobs", get(remote_view::remote_jobs))
@@ -439,10 +458,74 @@ async fn create_session(
             .await?
     )))
 }
+async fn session_history(
+    State(s): State<ApiState>,
+    axum::Extension(i): axum::Extension<Identity>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let store = s.engine.store(&i.scope).await?;
+    i.require_workspace(&store.session(&id, &i.scope.principal).await?.workspace)?;
+    Ok(Json(json!(store.history(&id).await?)))
+}
+async fn session_context(
+    State(s): State<ApiState>,
+    axum::Extension(i): axum::Extension<Identity>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let store = s.engine.store(&i.scope).await?;
+    i.require_workspace(&store.session(&id, &i.scope.principal).await?.workspace)?;
+    Ok(Json(s.engine.context_status(&i.scope, &id).await?))
+}
+async fn session_compact(
+    State(s): State<ApiState>,
+    axum::Extension(i): axum::Extension<Identity>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let store = s.engine.store(&i.scope).await?;
+    i.require_workspace(&store.session(&id, &i.scope.principal).await?.workspace)?;
+    Ok(Json(s.engine.compact_session(i.scope, id).await?))
+}
+async fn session_preferences(
+    State(s): State<ApiState>,
+    axum::Extension(i): axum::Extension<Identity>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let store = s.engine.store(&i.scope).await?;
+    i.require_workspace(&store.session(&id, &i.scope.principal).await?.workspace)?;
+    Ok(Json(json!(
+        store.session_preferences(&id, &i.scope.principal).await?
+    )))
+}
+async fn set_session_preferences(
+    State(s): State<ApiState>,
+    axum::Extension(i): axum::Extension<Identity>,
+    Path(id): Path<String>,
+    Json(preferences): Json<layeragent_protocol::SessionPreferences>,
+) -> ApiResult<Json<Value>> {
+    if preferences.bridge {
+        return Err(anyhow::anyhow!("bridge is not implemented yet").into());
+    }
+    let store = s.engine.store(&i.scope).await?;
+    i.require_workspace(&store.session(&id, &i.scope.principal).await?.workspace)?;
+    store
+        .set_session_preferences(&id, &i.scope.principal, preferences.clone())
+        .await?;
+    Ok(Json(json!(preferences)))
+}
 #[derive(Deserialize)]
 struct TurnInput {
     prompt: String,
     model: Option<String>,
+    #[serde(default)]
+    effort: layeragent_protocol::EffortLevel,
+    #[serde(default)]
+    bridge: bool,
+    #[serde(default)]
+    mode: layeragent_protocol::RunMode,
+    #[serde(default)]
+    execution: layeragent_protocol::ExecutionMode,
+    #[serde(default)]
+    cooperative: Option<layeragent_protocol::CooperativeOptions>,
 }
 async fn run(
     State(s): State<ApiState>,
@@ -484,6 +567,11 @@ async fn run(
                     workspace: None,
                     prompt: r.prompt,
                     model: r.model,
+                    effort: r.effort,
+                    bridge: r.bridge,
+                    mode: r.mode,
+                    execution: r.execution,
+                    cooperative: r.cooperative,
                 },
                 cancel,
             )
@@ -879,6 +967,11 @@ pub fn start_channel_workers(engine: Arc<Engine>) {
                                     workspace: None,
                                     prompt: item["body"].as_str().unwrap_or("").into(),
                                     model: None,
+                                    effort: Default::default(),
+                                    bridge: false,
+                                    mode: Default::default(),
+                                    execution: Default::default(),
+                                    cooperative: None,
                                 },
                                 e.shutdown.child_token(),
                             )

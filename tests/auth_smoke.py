@@ -20,7 +20,9 @@ def main():
         other = base / 'other'
         allowed.mkdir()
         other.mkdir()
-        subprocess.run([binary, '--home', str(state), 'init'], check=True, capture_output=True)
+        subprocess.run([binary, '--home', str(state), 'init', '--model', 'auth-fixture',
+                        '--protocol', 'openai_chat', '--base-url', 'http://127.0.0.1:9/v1'],
+                       check=True, capture_output=True)
         with socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))
             port = listener.getsockname()[1]
@@ -77,9 +79,30 @@ def main():
             assert status == 200
             assert request('/v1/sessions', bob)[1] == []
             assert request('/v1/sessions', bob, {'workspace': str(other)})[0] == 400
+            # Cooperative routes use the same actual bearer authentication and
+            # task ownership boundary, even if the unavailable fixture model fails.
+            status, team_task = request('/v1/tasks', owner, {
+                'session_id': session['id'], 'objective': 'Authorization fixture only',
+                'execution': 'cooperative', 'idempotency_key': 'auth-team',
+            })
+            assert status == 201, team_task
+            team_path = f'/v1/tasks/{team_task["id"]}/team'
+            for suffix in ('', '/messages', '/deliveries', '/finding_revisions', '/export'):
+                assert request(team_path + suffix)[0] == 401
+                assert request(team_path + suffix, bob)[0] == 404
+                assert request(team_path + suffix, owner)[0] == 200
+            assert request(team_path + '/messages', bob, {
+                'idempotency_key': 'foreign-message', 'expected_revision': 1,
+                'recipient': None, 'purpose': 'user_instruction', 'body': 'Foreign instruction',
+            })[0] == 404
             status, bob_session = request('/v1/sessions', bob, {'workspace': str(allowed)})
             assert status == 200
             assert request(f'/v1/sessions/{session["id"]}/events', bob)[0] == 400
+            for suffix, payload in [('history', None), ('context', None), ('preferences', None), ('preferences', {'effort':'high'}), ('compact', {})]:
+                assert request(f'/v1/sessions/{session["id"]}/{suffix}', bob, payload)[0] == 400
+            assert request(f'/v1/sessions/{bob_session["id"]}/preferences', bob, {'effort':'high'})[0] == 200
+            assert request(f'/v1/sessions/{bob_session["id"]}/preferences', bob)[1]['effort'] == 'high'
+            assert request(f'/v1/sessions/{bob_session["id"]}/preferences', bob, {'bridge':True})[0] == 400
             assert request('/mcp', bob, {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})[0] == 403
             assert request('/v1/shutdown', bob, {})[0] == 400
             config.write_text(config.read_text().replace(json.dumps(str(allowed)), json.dumps(str(other))))
@@ -91,7 +114,7 @@ def main():
             assert request('/v1/memory/search', bob, {'workspace': str(allowed), 'query': 'old project'})[0] == 400
             assert request('/v1/shutdown', owner, {})[0] == 200
             process.wait(timeout=5)
-            print(json.dumps({'http_authentication': 'passed', 'cross_tenant_isolation': 'passed', 'workspace_allowlist': 'passed', 'mcp_owner_boundary': 'passed'}))
+            print(json.dumps({'http_authentication': 'passed', 'cross_tenant_isolation': 'passed', 'workspace_allowlist': 'passed', 'mcp_owner_boundary': 'passed', 'cooperative_route_authentication': 'passed'}))
         finally:
             if process.poll() is None:
                 process.terminate()

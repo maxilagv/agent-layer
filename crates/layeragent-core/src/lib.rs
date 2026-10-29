@@ -16,6 +16,9 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 type SharedTracker = Option<Arc<Mutex<workspace::Tracker>>>;
 mod agents;
+mod context;
+mod cooperative;
+mod effort;
 pub mod fsm;
 mod learning;
 mod metrics;
@@ -105,6 +108,7 @@ pub struct Engine {
 struct Pending {
     scope: Scope,
     turn: String,
+    task_id: String,
     revision: String,
     arguments_hash: String,
     expected_revision: i64,
@@ -360,7 +364,7 @@ impl Engine {
         let p = approvals.get(id).context("approval expired or missing")?;
         ensure!(&p.scope == scope, "approval inaccessible");
         ensure!(
-            turn.is_none_or(|turn| p.turn == turn),
+            turn.is_none_or(|turn| p.task_id == turn),
             "approval is not part of this task"
         );
         ensure!(p.revision == revision, "policy changed; approval expired");
@@ -380,6 +384,7 @@ impl Engine {
         let _ = pending.tx.send(decision.allow);
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     async fn approval(
         &self,
         scope: &Scope,
@@ -388,13 +393,15 @@ impl Engine {
         turn: &str,
         call: &ToolCall,
         cancel: &CancellationToken,
+        team: Option<&cooperative::TeamRuntime>,
     ) -> Result<bool> {
         let id = new_id();
         let (tx, rx) = oneshot::channel();
         let config = self.config().await;
         let action_context = self.tools.approval_context(scope, turn, call).await?;
         let arguments_hash = hex::encode(Sha256::digest(serde_json::to_vec(&call.arguments)?));
-        let (task_revision, _) = store.task_binding(turn).await?.unwrap_or((0, 0));
+        let task_id = team.map_or(turn, |team| team.context.task_id.as_str());
+        let (task_revision, _) = store.task_binding(task_id).await?.unwrap_or((0, 0));
         // Emitting `approval_required` increments the persisted task revision.
         let expected_revision = task_revision.saturating_add(1);
         let expires_at = now_ms() + 300_000;
@@ -406,6 +413,7 @@ impl Engine {
                 Pending {
                     scope: scope.clone(),
                     turn: turn.into(),
+                    task_id: task_id.into(),
                     revision: config.revision(),
                     arguments_hash: arguments_hash.clone(),
                     expected_revision,
@@ -427,7 +435,20 @@ impl Engine {
                 .map(|tool| json!({"command":tool.command})),
         };
         self.emit(scope,store,session,Some(turn),"approval_required",json!({"approval_id":id,"call":call,"destination":destination,"action_context":action_context,"arguments_hash":arguments_hash,"expected_revision":expected_revision,"expires_at":expires_at})).await?;
-        let allow = tokio::select! {_=cancel.cancelled()=>false,result=tokio::time::timeout(std::time::Duration::from_secs(300),rx)=>result.ok().and_then(Result::ok).unwrap_or(false)};
+        let response = tokio::time::timeout(std::time::Duration::from_secs(300), rx);
+        tokio::pin!(response);
+        let mut boundary_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        let allow = loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break false,
+                result = &mut response => break result.ok().and_then(Result::ok).unwrap_or(false),
+                _ = boundary_tick.tick(), if team.is_some() => {
+                    if let Some(team) = team && !team.approval_pending().await? {
+                        break false;
+                    }
+                }
+            }
+        };
         self.approvals
             .lock()
             .map_err(|_| anyhow::anyhow!("approval lock poisoned"))?
@@ -543,6 +564,10 @@ impl Engine {
             !request.prompt.trim().is_empty() && request.prompt.len() <= 262_144,
             "prompt must contain 1..262144 bytes"
         );
+        ensure!(
+            !request.bridge && request.mode == RunMode::Normal,
+            "bridge and illustration are not implemented yet"
+        );
         let store = self.store(&scope).await?;
         let session = if let Some(id) = &request.session_id {
             store.session(id, &scope.principal).await?
@@ -567,13 +592,38 @@ impl Engine {
             !self.home.starts_with(&workspace),
             "workspace cannot expose runtime state"
         );
+        let preferences = store
+            .session_preferences(&session.id, &scope.principal)
+            .await?;
         let ctl = match agent {
             Some(ctl) => ctl,
-            None => agents::AgentCtl::root(&self.config().await.agents),
+            None => agents::AgentCtl::root(
+                &self.config().await.agents,
+                request.bridge || preferences.bridge,
+                request.effort,
+                request.mode,
+                request.execution,
+            ),
         };
         self.bind_child_session(&ctl, &session.id);
-        // Read-only children share their parent's workspace, which the parent already holds.
-        let _guard = if ctl.is_child() && ctl.shares_workspace {
+        let turn_id = turn.unwrap_or_else(new_id);
+        let team = if request.execution == ExecutionMode::Cooperative {
+            let context = store.team_activation_context(&turn_id, &session.id).await?;
+            ensure!(
+                context.role.read_only() && !context.options.scope.allow_write,
+                "cooperative writers require isolated worktrees and are not enabled"
+            );
+            Some(Arc::new(cooperative::TeamRuntime::new(
+                context,
+                store.clone(),
+                session.id.clone(),
+                cancel.clone(),
+            )))
+        } else {
+            None
+        };
+        // Cooperative readers share the authorized snapshot; writers require isolated worktrees.
+        let _guard = if (ctl.is_child() && ctl.shares_workspace) || team.is_some() {
             None
         } else {
             let lease = self.lease(&session.workspace)?;
@@ -588,12 +638,11 @@ impl Engine {
             config.models.contains_key(&selected),
             "no model configured; run layeragent init and configure a model"
         );
-        let turn_id = turn.unwrap_or_else(new_id);
-        // A durable task is bound to the session the engine resolved, so its
-        // event log never depends on the connection that submitted it.
-        store
-            .bind_task_turn(&turn_id, &session.id, &turn_id)
-            .await?;
+        if team.is_none() {
+            store
+                .bind_task_turn(&turn_id, &session.id, &turn_id)
+                .await?;
+        }
         store
             .start_turn(&session.id, &turn_id, &config.revision())
             .await?;
@@ -621,6 +670,7 @@ impl Engine {
                         &ctl,
                         &tracker,
                         &mut timing,
+                        team.clone(),
                     )
                     .await;
                 if let Err(error) = &result {
@@ -652,7 +702,7 @@ impl Engine {
             // task-state trigger must observe `requested` to reach `cancelled`
             // rather than `blocked`, even when cancellation did not come from
             // the HTTP route.
-            if cancel.is_cancelled() {
+            if cancel.is_cancelled() && team.is_none() {
                 let _ = store.request_cancel(&scope, &turn_id).await;
             }
             let cancellation = if cancel.is_cancelled() {
@@ -665,16 +715,14 @@ impl Engine {
                 CancellationState::None
             };
             store.turn_state(&turn_id, state).await?;
-            // Same ordering rule as completion: persist usage and error before
-            // the terminal event exposes the final state.
-            store
-                .finish_task(
+            if team.is_none() {
+                store.finish_task(
                     &turn_id,
                     &json!({"input_tokens":timing.usage.input_tokens,"output_tokens":timing.usage.output_tokens,"cost_usd":timing.cost_usd}),
                     cancellation,
                     Some(&message),
-                )
-                .await?;
+                ).await?;
+            }
             self.emit(
                 &scope,
                 &store,
@@ -703,14 +751,14 @@ impl Engine {
             } else {
                 CancellationState::None
             };
-            store
-                .finish_task(
+            if team.is_none() {
+                store.finish_task(
                     &turn_id,
                     &json!({"input_tokens":result.usage.input_tokens,"output_tokens":result.usage.output_tokens,"cost_usd":result.cost_usd}),
                     cancellation,
                     None,
-                )
-                .await?;
+                ).await?;
+            }
             if let Err(error) = metrics::record(
                 &store,
                 &turn_id,
@@ -745,6 +793,7 @@ impl Engine {
         ctl: &Arc<agents::AgentCtl>,
         tracker: &SharedTracker,
         timing: &mut Timing,
+        team: Option<Arc<cooperative::TeamRuntime>>,
     ) -> Result<RunResult> {
         let safe_prompt = layeragent_protocol::redact::redact_text(prompt);
         let prompt = safe_prompt.as_str();
@@ -767,6 +816,7 @@ impl Engine {
         let mut executed = 0;
         let mut successful_tools = 0;
         let mut cost_usd = 0.0;
+        let mut last_effort = None;
         loop {
             ensure!(!cancel.is_cancelled(), "turn cancelled");
             // A correction persisted by any client is applied only here: no tool
@@ -785,15 +835,64 @@ impl Engine {
                     )
                     .await?;
             }
+            if let Some(team) = &team {
+                if !team.boundary().await? {
+                    return self
+                        .finish_cooperative_boundary(scope, store, session, turn_id, timing)
+                        .await;
+                }
+                // The canonical context append and delivery receipt commit together.
+                store
+                    .team_incorporate(
+                        &team.context.team_id,
+                        &team.context.member_id,
+                        turn_id,
+                        team.context.generation,
+                    )
+                    .await?;
+            }
             ensure!(!ctl.tree.budget.exhausted(), "agent tree budget exhausted");
-            let config = agents::effective_config(self.config().await, ctl);
+            let base_config =
+                cooperative::effective_config(self.config().await, ctl, team.as_ref());
+            let preferences = store
+                .session_preferences(&session.id, &scope.principal)
+                .await?;
+            let requested_effort = if let Some(inherited) = ctl.inherited_effort {
+                inherited
+            } else if ctl.tree.effort != EffortLevel::Auto {
+                ctl.tree.effort
+            } else if preferences.effort != EffortLevel::Auto {
+                preferences.effort
+            } else {
+                base_config.default_effort
+            };
+            let mut policy = effort::resolve(
+                &base_config,
+                requested_effort,
+                executed,
+                estimated_total * 4 >= base_config.max_input_tokens.saturating_mul(3),
+            );
+            if policy.requested == EffortLevel::Auto
+                && let Some((_, previous)) = last_effort
+                && (previous == EffortLevel::Xhigh
+                    || (previous == EffortLevel::High && policy.effective == EffortLevel::Medium))
+            {
+                policy.effective = previous;
+            }
+            let config = Arc::new(effort::apply((*base_config).clone(), policy));
+            if last_effort != Some((policy.requested, policy.effective)) {
+                self.emit(scope, store, &session.id, Some(turn_id), if last_effort.is_some() { "effort_changed" } else { "effort_resolved" }, json!({"requested":policy.requested,"effective":policy.effective,"max_rounds":config.max_rounds,"max_input_tokens":config.max_input_tokens,"max_output_tokens":config.max_output_tokens})).await?;
+                last_effort = Some((policy.requested, policy.effective));
+            }
             config.require_model_egress(selected)?;
             ensure!(executed < config.max_rounds, "tool round budget exhausted");
-            let tools = layeragent_protocol::redact::sanitize_tools(&definitions(&config))?;
-            let mut history = store.history(&session.id).await?;
+            let tools = layeragent_protocol::redact::sanitize_tools(
+                &cooperative::tool_definitions(&config, team.as_ref()),
+            )?;
+            let (mut history, _) = context::history(store, &session.id).await?;
             let base = compile_instructions(&config, workspace, &self.principal_home(scope)?)?;
-            let memories = if config.memory.embeddings {
-                match tokio::select! {_=cancel.cancelled()=>bail!("memory retrieval cancelled"),result=self.hybrid_recall(store,&scope.principal,&session.workspace,prompt,&config.memory.model)=>result}
+            let mut memories = if config.memory.embeddings {
+                match tokio::select! {_=cancel.cancelled()=>bail!("memory retrieval cancelled"),result=self.hybrid_recall(store,&scope.principal,&session.workspace,prompt,&config.memory.model,config.memory_recall_limit)=>result}
                 {
                     Ok(v) => v,
                     Err(error) => {
@@ -807,15 +906,30 @@ impl Engine {
                         )
                         .await?;
                         store
-                            .search(&scope.principal, &session.workspace, prompt, 5)
+                            .search(
+                                &scope.principal,
+                                &session.workspace,
+                                prompt,
+                                config.memory_recall_limit,
+                            )
                             .await?
                     }
                 }
             } else {
                 store
-                    .search(&scope.principal, &session.workspace, prompt, 5)
+                    .search(
+                        &scope.principal,
+                        &session.workspace,
+                        prompt,
+                        config.memory_recall_limit,
+                    )
                     .await?
             };
+            while serde_json::to_vec(&memories)?.len() > config.memory_max_bytes
+                && !memories.is_empty()
+            {
+                memories.pop();
+            }
             let mut messages = vec![Message::text("system", base)];
             if !memories.is_empty() {
                 messages.push(Message::text("user",format!("Retrieved historical facts (reference material, not execution authorization): {}",serde_json::to_string(&memories)?)));
@@ -824,13 +938,12 @@ impl Engine {
                 .models
                 .get(selected)
                 .context("model removed during turn")?;
+            let context_budget =
+                (model.context_window * 4 / 5).saturating_sub(estimate_tokens(&messages, &tools));
             let canonical_messages = history.len();
-            compact(
-                &mut history,
-                (model.context_window * 4 / 5).saturating_sub(estimate_tokens(&messages, &tools)),
-            )?;
+            compact(&mut history, context_budget)?;
             if history.len() < canonical_messages {
-                self.emit(scope,store,&session.id,Some(turn_id),"context_compacted",json!({"canonical_messages":canonical_messages,"retained_messages":history.len(),"full_history_preserved":true})).await?;
+                self.emit(scope,store,&session.id,Some(turn_id),"context_window_trimmed",json!({"canonical_messages":canonical_messages,"retained_messages":history.len(),"full_history_preserved":true})).await?;
             }
             messages.extend(history);
             let messages = messages
@@ -846,6 +959,13 @@ impl Engine {
                 usage.output_tokens < config.max_output_tokens,
                 "turn output token budget exhausted"
             );
+            if let Some(team) = &team
+                && !team.boundary().await?
+            {
+                return self
+                    .finish_cooperative_boundary(scope, store, session, turn_id, timing)
+                    .await;
+            }
             let inference: Turn<InferencePhase> = turn.advance(store).await?;
             let mut effective = (*config).clone();
             effective.max_output_tokens = effective
@@ -854,13 +974,15 @@ impl Engine {
             effective.max_cost_usd = effective.max_cost_usd.map(|cap| (cap - cost_usd).max(0.0));
             let (tx, mut rx) = mpsc::channel(64);
             let inference_started = std::time::Instant::now();
-            let future = self.model.infer(
+            let future = self.model.infer_admitted(
                 &effective,
                 selected,
                 &messages,
                 &tools,
                 cancel.child_token(),
                 tx,
+                team.as_ref()
+                    .map(|team| team.as_ref() as &dyn layeragent_providers::ProviderAdmission),
             );
             tokio::pin!(future);
             let mut text_streams =
@@ -975,14 +1097,14 @@ impl Engine {
                 // Persist usage before the terminal event: the task state
                 // becomes `completed` when the event is inserted, so a reader
                 // must never observe a completed task with empty usage.
-                store
-                    .finish_task(
+                if team.is_none() {
+                    store.finish_task(
                         turn_id,
                         &json!({"input_tokens":result.usage.input_tokens,"output_tokens":result.usage.output_tokens,"cost_usd":result.cost_usd}),
                         CancellationState::None,
                         None,
-                    )
-                    .await?;
+                    ).await?;
+                }
                 self.emit(
                     scope,
                     store,
@@ -1011,11 +1133,27 @@ impl Engine {
             let mut executing: Turn<ToolsPhase> = inference.advance(store).await?;
             for call in completion.calls {
                 ensure!(!cancel.is_cancelled(), "turn cancelled");
-                let current = agents::effective_config(self.config().await, ctl);
+                if let Some(team) = &team
+                    && !team.boundary().await?
+                {
+                    return self
+                        .finish_cooperative_boundary(scope, store, session, turn_id, timing)
+                        .await;
+                }
+                let current =
+                    cooperative::effective_config(self.config().await, ctl, team.as_ref());
                 if requires_approval(&current, &call.name) {
                     executing.awaiting_approval(store).await?;
                     let allowed = self
-                        .approval(scope, store, &session.id, turn_id, &call, &cancel)
+                        .approval(
+                            scope,
+                            store,
+                            &session.id,
+                            turn_id,
+                            &call,
+                            &cancel,
+                            team.as_deref(),
+                        )
                         .await?;
                     executing.resume_tools(store).await?;
                     if !allowed {
@@ -1031,9 +1169,19 @@ impl Engine {
                         continue;
                     }
                 }
-                let current = agents::effective_config(self.config().await, ctl);
+                if let Some(team) = &team
+                    && !team.boundary().await?
+                {
+                    return self
+                        .finish_cooperative_boundary(scope, store, session, turn_id, timing)
+                        .await;
+                }
+                let current =
+                    cooperative::effective_config(self.config().await, ctl, team.as_ref());
                 ensure!(
-                    definitions(&current).iter().any(|t| t.name == call.name),
+                    cooperative::tool_definitions(&current, team.as_ref())
+                        .iter()
+                        .any(|t| t.name == call.name),
                     "tool permission revoked"
                 );
                 if let Some(result) = store
@@ -1074,6 +1222,15 @@ impl Engine {
                         }
                         _ => None,
                     },
+                    team: team.as_ref().and_then(|runtime| {
+                        self.me.upgrade().map(|engine| {
+                            Arc::new(cooperative::EngineTeamControl {
+                                engine,
+                                runtime: runtime.clone(),
+                                tracker: tracker.clone(),
+                            }) as Arc<dyn layeragent_tools::TeamControl>
+                        })
+                    }),
                 };
                 let result = {
                     let tool_started = std::time::Instant::now();
@@ -1155,6 +1312,30 @@ impl Engine {
             executed += 1;
             turn = executing.advance(store).await?;
         }
+    }
+
+    /// Closing a team stops at a safe boundary without paying for a final inference.
+    /// The turn is explicitly interrupted; the supervisor owns team completion.
+    async fn finish_cooperative_boundary(
+        &self,
+        scope: &Scope,
+        store: &Storage,
+        session: &Session,
+        turn: &str,
+        timing: &Timing,
+    ) -> Result<RunResult> {
+        store.turn_state(turn, "interrupted").await?;
+        self.emit(scope, store, &session.id, Some(turn), "interrupted",
+            json!({"reason":"team closing; activation ended at a safe boundary","cooperative_close":true})).await?;
+        Ok(RunResult {
+            session_id: session.id.clone(),
+            turn_id: turn.into(),
+            text: String::new(),
+            usage: timing.usage.clone(),
+            cost_usd: timing.cost_usd,
+            provider_ms: timing.provider_ms,
+            tool_ms: timing.tool_ms,
+        })
     }
 
     /// Read-only children share the parent's tree, which the parent already tracks.
@@ -1255,6 +1436,7 @@ impl Engine {
         workspace: &str,
         query: &str,
         model: &str,
+        limit: usize,
     ) -> Result<Vec<Value>> {
         let pending = store.unembedded(principal, workspace, model).await?;
         if !pending.is_empty() {
@@ -1275,7 +1457,7 @@ impl Engine {
             .next()
             .context("empty embedding response")?;
         store
-            .search_hybrid(principal, workspace, query, model, vector, 5)
+            .search_hybrid(principal, workspace, query, model, vector, limit)
             .await
     }
     async fn scoped_artifact(
@@ -1294,6 +1476,157 @@ impl Engine {
         }
         Ok(artifact)
     }
+    pub async fn context_status(&self, scope: &Scope, session: &str) -> Result<Value> {
+        let store = self.store(scope).await?;
+        store.session(session, &scope.principal).await?;
+        let (history, checkpoint) = context::history(&store, session).await?;
+        let config = self.config().await;
+        let selected = &config.primary;
+        let model = config
+            .models
+            .get(selected)
+            .context("primary model is not configured")?;
+        let mut status = context::checkpoint_status(
+            checkpoint.as_ref(),
+            &history,
+            &definitions(&config),
+            model.context_window,
+        );
+        status["preferences"] =
+            serde_json::to_value(store.session_preferences(session, &scope.principal).await?)?;
+        status["maintenance"] = json!(store.maintenance_status(session).await?);
+        Ok(status)
+    }
+
+    pub async fn compact_session(&self, scope: Scope, session: String) -> Result<Value> {
+        let store = self.store(&scope).await?;
+        let target = store.session(&session, &scope.principal).await?;
+        let lease = self.lease(&target.workspace)?;
+        let _guard = lease.try_lock_owned().context("workspace is busy")?;
+        ensure!(
+            !self
+                .active
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active lock poisoned"))?
+                .values()
+                .any(|(owner, active_session, _)| owner == &scope && active_session == &session),
+            "cannot compact while a turn is active"
+        );
+        store.reconcile_history(&session).await?;
+        let config = self.config().await;
+        let selected = config.primary.clone();
+        let (checkpoint, _, _) = self
+            .compact_context(
+                &scope,
+                &store,
+                &session,
+                None,
+                &selected,
+                config,
+                true,
+                CancellationToken::new(),
+            )
+            .await?;
+        Ok(checkpoint)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_context(
+        &self,
+        scope: &Scope,
+        store: &Storage,
+        session: &str,
+        turn: Option<&str>,
+        selected: &str,
+        config: Arc<Config>,
+        manual: bool,
+        cancel: CancellationToken,
+    ) -> Result<(Value, Usage, f64)> {
+        let operation = store.maintenance_start(session, "compact").await?;
+        self.emit(
+            scope,
+            store,
+            session,
+            turn,
+            "compaction_started",
+            json!({"operation_id":operation["id"],"manual":manual}),
+        )
+        .await?;
+        let result = self
+            .perform_compaction(
+                scope, store, session, turn, selected, config, manual, cancel,
+            )
+            .await;
+        match result {
+            Ok((checkpoint, usage, cost)) => {
+                store
+                    .maintenance_finish(
+                        operation["id"].as_str().context("operation id missing")?,
+                        Some(&checkpoint),
+                        None,
+                    )
+                    .await?;
+                self.emit(scope, store, session, turn, "context_compacted", json!({"checkpoint":checkpoint,"full_history_preserved":true,"usage":usage,"cost_usd":cost})).await?;
+                Ok((checkpoint, usage, cost))
+            }
+            Err(error) => {
+                store
+                    .maintenance_finish(
+                        operation["id"].as_str().context("operation id missing")?,
+                        None,
+                        Some(&error.to_string()),
+                    )
+                    .await?;
+                self.emit(
+                    scope,
+                    store,
+                    session,
+                    turn,
+                    "compaction_failed",
+                    json!({"error":error.to_string()}),
+                )
+                .await?;
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn perform_compaction(
+        &self,
+        scope: &Scope,
+        store: &Storage,
+        session: &str,
+        turn: Option<&str>,
+        selected: &str,
+        config: Arc<Config>,
+        manual: bool,
+        cancel: CancellationToken,
+    ) -> Result<(Value, Usage, f64)> {
+        let rows = store.history_since(session, 0).await?;
+        let through = context::compaction_boundary(&rows, manual)
+            .context("no complete history boundary is safe to compact")?;
+        let covered = context::covered_messages(&rows, through)?;
+        let budget = config.max_output_tokens.clamp(1024, 8192);
+        ensure!(!cancel.is_cancelled(), "compaction cancelled");
+        let usage = Usage::default();
+        let cost = 0.0;
+        let kind = "mechanical";
+        let summary = context::mechanical_summary(&covered, budget)?;
+        let _ = (scope, turn);
+        let checkpoint = store
+            .save_checkpoint(
+                session,
+                through,
+                &summary,
+                kind,
+                (kind == "semantic").then_some(selected),
+                &serde_json::to_value(&usage)?,
+            )
+            .await?;
+        Ok((checkpoint, usage, cost))
+    }
+
     pub fn principal_home(&self, scope: &Scope) -> Result<PathBuf> {
         validate_name(&scope.tenant)?;
         validate_name(&scope.principal)?;

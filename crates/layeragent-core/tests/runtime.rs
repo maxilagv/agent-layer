@@ -138,6 +138,11 @@ async fn repository_instructions_cannot_grant_revoked_write_authority() -> Resul
                 workspace: Some(workspace.path().to_string_lossy().into()),
                 prompt: "inspect".into(),
                 model: None,
+                effort: Default::default(),
+                bridge: false,
+                mode: Default::default(),
+                execution: Default::default(),
+                cooperative: None,
             },
             CancellationToken::new(),
         )
@@ -206,6 +211,11 @@ async fn authorized_execution_keeps_original_arguments_while_durable_copies_are_
                 workspace: Some(workspace.path().to_string_lossy().into()),
                 prompt: "write authorized fixture".into(),
                 model: None,
+                effort: Default::default(),
+                bridge: false,
+                mode: Default::default(),
+                execution: Default::default(),
+                cooperative: None,
             },
             CancellationToken::new(),
         )
@@ -244,6 +254,11 @@ async fn permission_reload_cancels_active_and_queued_turns() -> Result<()> {
         workspace: Some(workspace.path().to_string_lossy().into()),
         prompt: "wait".into(),
         model: None,
+        effort: Default::default(),
+        bridge: false,
+        mode: Default::default(),
+        execution: Default::default(),
+        cooperative: None,
     };
     let mut events = engine.events.subscribe();
     let first_engine = engine.clone();
@@ -326,6 +341,11 @@ async fn complete_turn_persists_replays_and_preserves_user_changes() -> Result<(
                 workspace: Some(workspace.path().to_string_lossy().into()),
                 prompt: "Implement the fixture".into(),
                 model: None,
+                effort: Default::default(),
+                bridge: false,
+                mode: Default::default(),
+                execution: Default::default(),
+                cooperative: None,
             },
             CancellationToken::new(),
         )
@@ -363,7 +383,12 @@ async fn complete_turn_persists_replays_and_preserves_user_changes() -> Result<(
                     session_id: Some(result.session_id),
                     workspace: None,
                     prompt: "read another user's session".into(),
-                    model: None
+                    model: None,
+                    effort: Default::default(),
+                    bridge: false,
+                    mode: Default::default(),
+                    execution: Default::default(),
+                    cooperative: None,
                 },
                 CancellationToken::new()
             )
@@ -398,6 +423,11 @@ async fn cancellation_seals_turn_and_keeps_history() -> Result<()> {
                 workspace: Some(path),
                 prompt: "wait".into(),
                 model: None,
+                effort: Default::default(),
+                bridge: false,
+                mode: Default::default(),
+                execution: Default::default(),
+                cooperative: None,
             },
             token,
         )
@@ -519,6 +549,11 @@ async fn tool_output_secrets_never_reach_history_or_events() -> Result<()> {
                 workspace: Some(workspace.path().to_string_lossy().into()),
                 prompt: "go".into(),
                 model: None,
+                effort: Default::default(),
+                bridge: false,
+                mode: Default::default(),
+                execution: Default::default(),
+                cooperative: None,
             },
             CancellationToken::new(),
         )
@@ -607,6 +642,11 @@ async fn shell_output_streams_as_redacted_events_before_completion() -> Result<(
                 workspace: Some(workspace.path().to_string_lossy().into()),
                 prompt: "build".into(),
                 model: None,
+                effort: Default::default(),
+                bridge: false,
+                mode: Default::default(),
+                execution: Default::default(),
+                cooperative: None,
             },
             CancellationToken::new(),
         )
@@ -767,6 +807,11 @@ fn delegate(workspace: &tempfile::TempDir, prompt: &str) -> RunRequest {
         workspace: Some(workspace.path().to_string_lossy().into()),
         prompt: prompt.into(),
         model: None,
+        effort: Default::default(),
+        bridge: false,
+        mode: Default::default(),
+        execution: Default::default(),
+        cooperative: None,
     }
 }
 
@@ -1058,5 +1103,10 @@ fn delegate_ws(workspace: &tempfile::TempDir, prompt: &str) -> RunRequest {
         workspace: Some(workspace.path().to_string_lossy().into()),
         prompt: prompt.into(),
         model: None,
+        effort: Default::default(),
+        bridge: false,
+        mode: Default::default(),
+        execution: Default::default(),
+        cooperative: None,
     }
 }

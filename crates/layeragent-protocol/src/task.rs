@@ -2,6 +2,7 @@
 //!
 //! A task identity is independent from the connection that submitted it. State
 //! changes are persisted before they become visible and survive a daemon restart.
+use crate::{EffortLevel, RunMode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -108,6 +109,17 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub last_event_seq: i64,
+    #[serde(default)]
+    pub effort: EffortLevel,
+    #[serde(default)]
+    pub mode: RunMode,
+    /// Deprecated compatibility field. `true` is never treated as cooperative execution.
+    #[serde(default)]
+    pub bridge: bool,
+    #[serde(default)]
+    pub execution: crate::ExecutionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -124,18 +136,39 @@ pub struct NewTask {
     /// Defaults to `local`.
     #[serde(default)]
     pub executor: Option<String>,
+    #[serde(default)]
+    pub effort: EffortLevel,
+    #[serde(default)]
+    pub mode: RunMode,
+    /// Deprecated compatibility field. Use `execution` and `cooperative` instead.
+    #[serde(default)]
+    pub bridge: bool,
+    #[serde(default)]
+    pub execution: crate::ExecutionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooperative: Option<crate::CooperativeOptions>,
 }
 impl NewTask {
     /// Content whose hash makes a repeated request idempotent. The key itself is
     /// never persisted in the task body or exposed by the API.
     pub fn fingerprint(&self) -> anyhow::Result<String> {
         use sha2::{Digest, Sha256};
+        let cooperative = self
+            .cooperative
+            .as_ref()
+            .map(|options| options.normalized(None))
+            .transpose()?;
         let body = serde_json::to_vec(&(
             &self.workspace,
             &self.session_id,
             &self.objective,
             &self.model,
             &self.executor,
+            self.effort,
+            self.mode,
+            self.bridge,
+            self.execution,
+            cooperative,
         ))?;
         Ok(hex::encode(Sha256::digest(body)))
     }
@@ -212,6 +245,11 @@ mod tests {
             objective: "ship".into(),
             model: None,
             executor: None,
+            effort: EffortLevel::Auto,
+            mode: RunMode::Normal,
+            bridge: false,
+            execution: crate::ExecutionMode::Delegated,
+            cooperative: None,
         };
         let mut other = base.clone();
         other.objective = "ship it".into();

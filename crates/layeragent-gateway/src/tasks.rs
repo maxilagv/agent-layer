@@ -59,6 +59,16 @@ pub(super) struct TaskInput {
     executor: Option<String>,
     #[serde(default)]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    effort: layeragent_protocol::EffortLevel,
+    #[serde(default)]
+    mode: layeragent_protocol::RunMode,
+    #[serde(default)]
+    bridge: bool,
+    #[serde(default)]
+    execution: layeragent_protocol::ExecutionMode,
+    #[serde(default)]
+    cooperative: Option<layeragent_protocol::CooperativeOptions>,
 }
 
 /// Creates the durable task and returns its identity before execution starts.
@@ -86,6 +96,18 @@ pub(super) async fn create(
     if r.objective.trim().is_empty() || r.objective.len() > 262_144 {
         return Err(anyhow::anyhow!("objective must contain 1..262144 bytes").into());
     }
+    if r.bridge {
+        return Err(anyhow::anyhow!(
+            "bridge is deprecated; use execution=cooperative with typed cooperative options"
+        )
+        .into());
+    }
+    if r.mode != layeragent_protocol::RunMode::Normal {
+        return Err(anyhow::anyhow!("illustration is not implemented yet").into());
+    }
+    if r.execution != layeragent_protocol::ExecutionMode::Cooperative && r.cooperative.is_some() {
+        return Err(anyhow::anyhow!("cooperative options require execution=cooperative").into());
+    }
     let executor = r.executor.clone().unwrap_or_else(|| "local".into());
     if executor != "local" {
         return Err(ApiError::with_status(
@@ -97,6 +119,42 @@ pub(super) async fn create(
     // A revoked or disabled connection must not start new work. Existing work
     // was stopped when the generation changed.
     let config = s.engine.config().await;
+    let cooperative = if r.execution == layeragent_protocol::ExecutionMode::Cooperative {
+        let options = r
+            .cooperative
+            .clone()
+            .unwrap_or_default()
+            .normalized(config.agents.tree_max_tokens)?;
+        for model in options.role_models.values() {
+            if !config.models.contains_key(model) {
+                return Err(anyhow::anyhow!(
+                    "unknown role model {model}; no provider fallback is applied"
+                )
+                .into());
+            }
+        }
+        if options.limits.max_cost_usd.is_some() {
+            let selected = r.model.clone().unwrap_or_else(|| config.primary.clone());
+            for alias in std::iter::once(&selected).chain(options.role_models.values()) {
+                let model = config
+                    .models
+                    .get(alias)
+                    .ok_or_else(|| anyhow::anyhow!("model {alias} is not configured"))?;
+                if model.input_per_million.is_none() || model.output_per_million.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "cost limits require configured input and output prices for model {alias}"
+                    )
+                    .into());
+                }
+            }
+        }
+        if options.scope.allow_write && !config.policy.write {
+            return Err(anyhow::anyhow!("cooperative write scope exceeds task policy").into());
+        }
+        Some(options)
+    } else {
+        None
+    };
     let alias = r.model.clone().unwrap_or_else(|| config.primary.clone());
     let provider = config
         .models
@@ -149,10 +207,15 @@ pub(super) async fn create(
         objective: r.objective.clone(),
         model: r.model.clone(),
         executor: Some(executor.clone()),
+        effort: r.effort,
+        mode: r.mode,
+        bridge: r.bridge,
+        execution: r.execution,
+        cooperative: cooperative.clone(),
     };
     let fingerprint = request.fingerprint()?;
     let created = store
-        .create_task(
+        .create_task_with_execution(
             &i.scope,
             &workspace,
             session_id.as_deref(),
@@ -160,6 +223,11 @@ pub(super) async fn create(
             &executor,
             &key,
             &fingerprint,
+            request.effort,
+            request.mode,
+            request.bridge,
+            request.execution,
+            request.cooperative.clone(),
         )
         .await
         .map_err(|error| {
@@ -192,7 +260,7 @@ fn should_start(s: &ApiState, task: &Task) -> bool {
         .unwrap_or(false)
 }
 
-fn start(s: &ApiState, i: &Identity, task: &Task, model: Option<String>) {
+pub(super) fn start(s: &ApiState, i: &Identity, task: &Task, model: Option<String>) {
     let cancel = i.authority.child_token();
     {
         let Ok(mut jobs) = s.jobs.lock() else {
@@ -210,24 +278,37 @@ fn start(s: &ApiState, i: &Identity, task: &Task, model: Option<String>) {
     let session = task.session_id.clone();
     let workspace = session.is_none().then_some(task.project.clone());
     let objective = task.objective.clone();
+    let (effort, bridge, mode, execution) = (task.effort, task.bridge, task.mode, task.execution);
     tokio::spawn(async move {
         let _registration = JobRegistration {
             jobs: jobs.clone(),
             id: id.clone(),
         };
-        let result = engine
-            .run_bound(
-                scope.clone(),
-                RunRequest {
-                    session_id: session,
-                    workspace,
-                    prompt: objective,
-                    model,
-                },
-                cancel,
-                id.clone(),
-            )
-            .await;
+        let result = if execution == layeragent_protocol::ExecutionMode::Cooperative {
+            engine
+                .run_cooperative(scope.clone(), id.clone(), model, cancel)
+                .await
+        } else {
+            engine
+                .run_bound(
+                    scope.clone(),
+                    RunRequest {
+                        session_id: session,
+                        workspace,
+                        prompt: objective,
+                        model,
+                        effort,
+                        bridge,
+                        mode,
+                        execution,
+                        cooperative: None,
+                    },
+                    cancel,
+                    id.clone(),
+                )
+                .await
+                .map(|_| ())
+        };
         if let Err(error) = result {
             // Execution may have failed before the engine opened the turn, so
             // make sure the durable task cannot remain `prepared` forever.

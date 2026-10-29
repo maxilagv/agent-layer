@@ -20,11 +20,14 @@ pub enum TaskCreate {
 
 fn read_task(c: &Connection, id: &str) -> Result<Task> {
     c.query_row(
-        "SELECT id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,correction,error,last_event_seq,created_at,updated_at FROM tasks WHERE id=?1",
+        "SELECT id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,correction,error,last_event_seq,effort,mode,bridge,execution,team_id,created_at,updated_at FROM tasks WHERE id=?1",
         [id],
         |r| {
             let state: String = r.get(8)?;
             let cancellation: String = r.get(11)?;
+            let effort: String = r.get(15)?;
+            let mode: String = r.get(16)?;
+            let execution: String = r.get(18)?;
             Ok(Task {
                 id: r.get(0)?,
                 tenant: r.get(1)?,
@@ -53,8 +56,13 @@ fn read_task(c: &Connection, id: &str) -> Result<Task> {
                 correction: r.get(12)?,
                 error: r.get(13)?,
                 last_event_seq: r.get(14)?,
-                created_at: r.get(15)?,
-                updated_at: r.get(16)?,
+                effort: effort.parse().unwrap_or_default(),
+                mode: if mode == "illustration" { layeragent_protocol::RunMode::Illustration } else { layeragent_protocol::RunMode::Normal },
+                bridge: r.get(17)?,
+                execution: execution.parse().unwrap_or_default(),
+                team_id: r.get(19)?,
+                created_at: r.get(20)?,
+                updated_at: r.get(21)?,
             })
         },
     )
@@ -81,6 +89,68 @@ impl Storage {
         idempotency_key: &str,
         request_sha256: &str,
     ) -> Result<TaskCreate> {
+        self.create_task_with_options(
+            scope,
+            project,
+            session_id,
+            objective,
+            executor,
+            idempotency_key,
+            request_sha256,
+            Default::default(),
+            Default::default(),
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_task_with_options(
+        &self,
+        scope: &Scope,
+        project: &str,
+        session_id: Option<&str>,
+        objective: &str,
+        executor: &str,
+        idempotency_key: &str,
+        request_sha256: &str,
+        effort: layeragent_protocol::EffortLevel,
+        mode: layeragent_protocol::RunMode,
+        bridge: bool,
+    ) -> Result<TaskCreate> {
+        self.create_task_with_execution(
+            scope,
+            project,
+            session_id,
+            objective,
+            executor,
+            idempotency_key,
+            request_sha256,
+            effort,
+            mode,
+            bridge,
+            Default::default(),
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_task_with_execution(
+        &self,
+        scope: &Scope,
+        project: &str,
+        session_id: Option<&str>,
+        objective: &str,
+        executor: &str,
+        idempotency_key: &str,
+        request_sha256: &str,
+        effort: layeragent_protocol::EffortLevel,
+        mode: layeragent_protocol::RunMode,
+        bridge: bool,
+        execution: layeragent_protocol::ExecutionMode,
+        cooperative: Option<layeragent_protocol::CooperativeOptions>,
+    ) -> Result<TaskCreate> {
         ensure!(
             !idempotency_key.is_empty() && idempotency_key.len() <= 200,
             "idempotency key must contain 1..200 bytes"
@@ -89,6 +159,13 @@ impl Storage {
             !objective.trim().is_empty() && objective.len() <= 262_144,
             "objective must contain 1..262144 bytes"
         );
+        ensure!(
+            (execution == layeragent_protocol::ExecutionMode::Cooperative) == cooperative.is_some(),
+            "cooperative options must match execution mode"
+        );
+        let cooperative = cooperative
+            .map(|options| options.normalized(None))
+            .transpose()?;
         let (tenant, principal) = (scope.tenant.clone(), scope.principal.clone());
         let (project, session_id) = (project.to_string(), session_id.map(str::to_string));
         let objective = layeragent_protocol::redact::redact_text(objective);
@@ -111,18 +188,22 @@ impl Storage {
             }
             let id = new_id();
             let at = now_ms();
-            // The task id *is* the turn id: binding it at creation lets the
-            // engine mirror every event before the first turn row exists, so a
-            // lost HTTP response cannot lose task progress.
+            let cooperative_body = cooperative.as_ref().map(serde_json::to_string).transpose()?;
             tx.execute(
-                "INSERT INTO tasks(id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,last_event_seq,idempotency_key,request_sha256,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?1,?6,?7,'prepared',1,'{}','none',0,?8,?9,?10,?10)",
-                params![id, tenant, principal, project, session_id, objective, executor, key, fingerprint, at],
+                "INSERT INTO tasks(id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,last_event_seq,idempotency_key,request_sha256,created_at,updated_at,effort,mode,bridge,execution,cooperative) VALUES(?1,?2,?3,?4,?5,?1,?6,?7,'prepared',1,'{}','none',0,?8,?9,?10,?10,?11,?12,?13,?14,?15)",
+                params![id, tenant, principal, project, session_id, objective, executor, key, fingerprint, at, effort.as_str(), mode.as_str(), bridge, execution.as_str(), cooperative_body],
             )?;
+            let team_id = if let Some(options) = &cooperative {
+                let scope = Scope { tenant: tenant.clone(), principal: principal.clone() };
+                let team = crate::team::create_team_in_tx(&tx, &id, &scope, &project, options, at)?;
+                tx.execute("UPDATE tasks SET team_id=?2 WHERE id=?1", params![id, team])?;
+                Some(team)
+            } else { None };
             add_event(
                 &tx,
                 &id,
                 "task_prepared",
-                json!({"executor": executor, "objective": objective, "project": project}),
+                json!({"executor": executor, "objective": objective, "project": project, "execution": execution, "team_id": team_id}),
                 at,
             )?;
             let task = read_task(&tx, &id)?;
@@ -173,11 +254,14 @@ impl Storage {
         let (tenant, principal) = (scope.tenant.clone(), scope.principal.clone());
         let limit = limit.clamp(1, 200) as i64;
         self.read(move |c| {
-            let mut q = c.prepare("SELECT rowid,id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,correction,error,last_event_seq,created_at,updated_at FROM tasks WHERE tenant=?1 AND principal=?2 AND rowid>?3 ORDER BY rowid LIMIT ?4")?;
+            let mut q = c.prepare("SELECT rowid,id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,correction,error,last_event_seq,effort,mode,bridge,execution,team_id,created_at,updated_at FROM tasks WHERE tenant=?1 AND principal=?2 AND rowid>?3 ORDER BY rowid LIMIT ?4")?;
             let rows = q
                 .query_map(params![tenant, principal, after, limit], |r| {
                     let state: String = r.get(9)?;
                     let cancellation: String = r.get(12)?;
+                    let effort: String = r.get(16)?;
+                    let mode: String = r.get(17)?;
+                    let execution: String = r.get(19)?;
                     Ok((r.get::<_,i64>(0)?, Task {
                         id: r.get(1)?,
                         tenant: r.get(2)?,
@@ -197,8 +281,13 @@ impl Storage {
                         correction: r.get(13)?,
                         error: r.get(14)?,
                         last_event_seq: r.get(15)?,
-                        created_at: r.get(16)?,
-                        updated_at: r.get(17)?,
+                        effort: effort.parse().unwrap_or_default(),
+                        mode: if mode == "illustration" { layeragent_protocol::RunMode::Illustration } else { layeragent_protocol::RunMode::Normal },
+                        bridge: r.get(18)?,
+                        execution: execution.parse().unwrap_or_default(),
+                        team_id: r.get(20)?,
+                        created_at: r.get(21)?,
+                        updated_at: r.get(22)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

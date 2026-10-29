@@ -2,6 +2,7 @@ mod backup;
 mod client;
 mod remote;
 mod setup;
+mod team;
 mod tui;
 use anyhow::{Context, Result, ensure};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -59,6 +60,13 @@ enum Command {
         model: Option<String>,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        execution: team::ExecutionOptions,
+    },
+    /// Inspect and direct a durable cooperative team.
+    Team {
+        #[command(subcommand)]
+        command: team::TeamCommand,
     },
     /// Resume a stored session.
     Resume {
@@ -416,10 +424,18 @@ async fn entry() -> Result<()> {
             session,
             model,
             json,
+            execution,
         } => {
+            let options = execution.body()?;
             let client = client::Client::connect(&home, &profile).await?;
             let session = client.session(session, workspace).await?;
-            client.print_turn(&session, &prompt, model, json).await?;
+            client
+                .print_turn_options(&session, &prompt, model, json, options)
+                .await?;
+        }
+        Command::Team { command } => {
+            let client = client::Client::connect(&home, &profile).await?;
+            team::dispatch(&client, command).await?;
         }
         Command::Resume {
             session,
@@ -762,6 +778,46 @@ async fn serve(home: PathBuf, profile: String, ipc_only: bool) -> Result<()> {
 #[cfg(test)]
 mod doctor_tests {
     use super::*;
+
+    #[test]
+    fn cooperative_cli_parses_modes_controls_and_export_without_changing_defaults() -> Result<()> {
+        let args = Args::try_parse_from(["layeragent", "run", "inspect"])?;
+        let Some(Command::Run { execution, .. }) = args.command else {
+            anyhow::bail!("run expected");
+        };
+        assert_eq!(execution.body()?["execution"], "delegated");
+        let args = Args::try_parse_from([
+            "layeragent",
+            "run",
+            "inspect",
+            "--execution",
+            "cooperative",
+            "--template",
+            "audit",
+            "--max-tokens",
+            "1000",
+            "--max-seconds",
+            "45",
+            "--max-cost-usd",
+            "1",
+        ])?;
+        let Some(Command::Run { execution, .. }) = args.command else {
+            anyhow::bail!("run expected");
+        };
+        assert_eq!(
+            execution.body()?["cooperative"]["limits"]["max_tokens"],
+            1000
+        );
+        for command in [
+            vec!["team", "watch", "task-one", "--json"],
+            vec!["team", "pause", "task-one", "--reason", "wait"],
+            vec!["team", "message", "task-one", "--to", "reviewer", "check"],
+            vec!["team", "export", "task-one", "--format", "json"],
+        ] {
+            assert!(Args::try_parse_from(std::iter::once("layeragent").chain(command)).is_ok());
+        }
+        Ok(())
+    }
 
     fn checks(unavailable: &str) -> Vec<layeragent_sandbox::Diagnostic> {
         [

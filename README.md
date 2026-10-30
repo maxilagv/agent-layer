@@ -26,8 +26,8 @@ confined tools, a terminal workspace and an extensible integration layer.
 
 ## Contents
 
-- [Cooperative investigation](#cooperative-investigation)
 - [What LayerAgent does](#what-layeragent-does)
+- [God Eye: cooperative agent teams](#god-eye-cooperative-agent-teams)
 - [Capabilities](#capabilities)
 - [Architecture](#architecture)
 - [Requirements](#requirements)
@@ -60,25 +60,98 @@ The same engine powers the CLI, animated TUI, authenticated HTTP API, MCP server
 - **Continue later:** reopen durable sessions and retrieve scoped historical facts.
 - **Extend deliberately:** add custom tools, scoped project-files MCP and reusable verified skills.
 - **Inspect evidence:** retain hashes, artifacts and observed/inferred/unknown analysis records.
+- **Investigate as a team:** [God Eye](#god-eye-cooperative-agent-teams) lets agents challenge each other directly and ties conclusions to execution receipts (experimental, read-only).
 
-## Cooperative investigation
+## God Eye: cooperative agent teams
 
-Create a temporary team whose analyst, reviewer and verifier consult each other,
-challenge a premise and preserve the evidence behind a changed conclusion. The
-CLI and TUI expose members, questions, delivery states, findings and budget use.
-Cooperative teams currently investigate read-only workspaces.
+> **Experimental.** God Eye is the product name for LayerAgent's cooperative
+> execution mode (`--execution cooperative`, `/team` in the TUI). It currently
+> investigates read-only workspaces and has been exercised with a scripted model,
+> not with live-provider quality evaluations. See [what is and is not verified](#what-god-eye-does-not-claim-yet).
 
-Try the reproducible local demonstration after building the CLI:
+Most multi-agent tools use a **hub and spoke**: a parent agent spawns children,
+waits for each summary and decides everything alone. Children never talk to each
+other, so a wrong premise reaches the parent as a confident paragraph and nobody
+in between can challenge it.
+
+God Eye runs a **team** instead. Members have separate contexts and exchange
+durable messages **directly**, without the coordinator relaying them. One member
+can question another's premise, record an objection, ask a third member to run a
+check, and the conclusion changes only when runtime evidence supports it.
+
+```text
+Delegated subagents                    God Eye team
+
+   parent                               coordinator ── plans, assigns, closes
+  ┌──┼──┐                              ┌────┴─────┐
+ A   B   C   (no contact)            analyst ⇄ reviewer ⇄ verifier
+  └──┼──┘                              question · objection · verification request
+   summary                              └── findings backed by execution receipts
+```
+
+### What a team gives you
+
+| Property | How it works |
+| --- | --- |
+| **Peer-to-peer messaging** | Members send each other questions, observations, objections, responses and verification requests. Sender identity and kind are set by the runtime, never by the model. |
+| **Challengeable conclusions** | A finding moves through `hypothesis`, `investigating`, `reproduced`, `reviewed`, `discarded` or `inconclusive`. Review requires a *different* reviewer or verifier and evidence recorded on the current workspace snapshot. |
+| **Runtime evidence** | `team_verify` runs a command through the production sandbox and stores a receipt: command, workspace snapshot, exit code and observed output. A newer snapshot marks earlier conclusions stale instead of deleting them. |
+| **Honest uncertainty** | If no check ran, the finding stays **inconclusive**. Environmental failures cannot reproduce or discard a finding. |
+| **Bounded cost** | Token, time, cost and activation limits apply to the whole team. Every provider call is reserved before it runs and settled after; uncertain consumption keeps counting. |
+| **Human in the loop** | Pause, resume, message a member, change work priority, close or cancel at any time. Approvals name the member requesting the action. Operator messages cannot widen permissions. |
+| **Durable and resumable** | State lives in the daemon. Closing the terminal does not stop the team; reopening shows a consistent snapshot. After a daemon restart the team is blocked until you resume it explicitly. |
+| **Auditable export** | `team export` writes JSON or Markdown with messages, delivery receipts, finding history and evidence, with credentials redacted. |
+
+Templates are `audit`, `debug` and `review`. The initial team has a coordinator,
+analyst, reviewer and verifier; the coordinator may add justified specialists up
+to the member limit. Peer messages are data, not authorization.
+
+### Try it without an API key
 
 ```bash
+cargo build -p layeragent-cli --locked
 python3 tests/cooperative_smoke.py
 python3 tests/cooperative_tui_smoke.py
 ```
 
-The demo uses a scripted loopback provider and no API key. Its default result is
-explicitly inconclusive; the optional native variant runs a confined check before
-discarding the hypothesis. See the [terminal team guide](docs/15-cooperative-terminal.md)
-for activation, controls, exports and the limits of this evidence.
+The demo uses a scripted loopback provider. An analyst suspects missing
+authorization, a reviewer points out that the gateway may reject the request
+earlier, and a verifier is asked to check. By default the result is
+**inconclusive**; the optional native variant runs a confined check and discards
+the hypothesis with a receipt.
+
+### Use it with your configured model
+
+These commands use your provider and can incur usage.
+
+```bash
+layeragent run "Investigate the authorization path" --workspace . \
+  --execution cooperative --template audit --max-tokens 200000 --max-seconds 600
+layeragent team watch TASK_ID
+layeragent team message TASK_ID --to reviewer "Check the gateway premise first."
+layeragent team pause TASK_ID
+layeragent team findings TASK_ID --json
+layeragent team export TASK_ID --format markdown > investigation.md
+```
+
+In the TUI: `/execution cooperative`, then `/team start audit -- <objective>`,
+`/team message reviewer …`, `/team pause`, `/team findings`, `/team evidence`.
+
+### What God Eye does not claim yet
+
+- It is **read-only**. Writer members and writable scope are refused until
+  isolated worktrees and an explicit integration flow exist.
+- Evidence proves that a command ran with an observed result on a snapshot. It
+  does not prove the command tests the claim; a reviewer is a separate member, not
+  an independent oracle. Treat findings as leads to confirm.
+- Behavior is verified with fixtures and a scripted model. Whether a team finds
+  better answers than a single agent, and at what cost, has **not** been measured
+  with live models.
+- Web and desktop team interfaces, private investigation memory and cross-mode
+  evaluation are not implemented.
+
+Details: [terminal team guide](docs/15-cooperative-terminal.md) and the
+[implementation status](docs/10-implementation-status.md).
 
 ## Capabilities
 
@@ -88,7 +161,7 @@ for activation, controls, exports and the limits of this evidence.
 | Runtime | Typed lifecycle, session/workspace serialization and cooperative cancellation | Fixture and executable tests; broader task evaluation remains |
 | Tools | Files, shell/PTY, protected Git operations and custom JSON tools | Execution requires verified native confinement |
 | Subagents | Scoped children, shared budgets, concurrency and writable isolated worktrees | Scripted-model validation |
-| Cooperative teams | Direct durable messaging, read-only roles, terminal panel, pause/resume and evidence export | Scripted provider and explicit native qualification; real-model quality remains unqualified |
+| God Eye (cooperative teams) | Direct durable messaging, read-only roles, terminal panel, pause/resume and evidence export | Scripted provider and explicit native qualification; real-model quality remains unqualified |
 | Models | Five wire adapters, authorized fallback and circuit breakers | Live provider compatibility must be qualified separately |
 | Memory | SQLite WAL/FULL, FTS5/BM25, revisions and optional vector retrieval | Lexical retrieval has no model-download requirement |
 | Skills | Progressive discovery, staged fixtures, promotion, versions and rollback | Promotion requires a working sandbox |
@@ -457,6 +530,8 @@ Global options: `--home PATH`, `--profile NAME`.
 | `init` | Create configuration without overwriting an existing file |
 | `setup` | Guided, resumable installation: host, provider, credential, connection, isolation, browser |
 | `run PROMPT --workspace PATH` | Execute through the shared runtime |
+| `run PROMPT --execution cooperative` | Start a God Eye team (`--template audit\|debug\|review`) |
+| `team show / watch / message / pause / resume / findings / evidence / export / close / cancel` | Observe and control a God Eye team |
 | `resume ID PROMPT` | Continue a stored session |
 | `tui --workspace PATH` | Open the terminal interface |
 | `web --bind ADDRESS` | Serve the shared web interface on a loopback address |
@@ -591,6 +666,7 @@ Future maintainers can attach an Ed25519 signature with [`scripts/sign_source.py
 | [11 · Configuration and operations](docs/11-configuration-and-operations.md) | Policy, HTTP deployment and troubleshooting |
 | [12 · Guía en español](docs/12-guia-rapida-es.md) | Instalación y uso inicial en español |
 | [13 · Backup and recovery](docs/13-backup-and-recovery.md) | Encrypted snapshots, retention and restoration |
+| [15 · God Eye terminal teams](docs/15-cooperative-terminal.md) | Team roles, controls, recovery and the evidence boundary |
 | [15 · Web, frontend and desktop](docs/15-web-and-desktop-interfaces.md) | Loopback web surface, shared frontend, desktop shell and their authority limits |
 | [16 · Task measurement](docs/16-task-measurement.md) | Measured times, cost rules, budget guard and qualified percentiles |
 

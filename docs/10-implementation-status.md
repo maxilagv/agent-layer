@@ -80,6 +80,48 @@ seeing peer conclusions; review checks a different reviewer and linked current
 evidence, not independence of every evidence producer. These remain qualification
 boundaries rather than claims of a complete independent-audit workflow.
 
+## CLI session-control increment
+
+This increment is **partial coverage** of the CLI roadmap. It does not complete
+all six milestones or certify new paid controls.
+
+- The terminal command catalog now supplies aliases, help and command-name Tab
+  completion. Existing argument handlers remain specialized; subcommand/argument
+  completion and a fully typed dispatcher remain pending.
+- Enter while an ordinary task is active submits a revision-checked correction in
+  the background. The runtime still applies it only at a safe boundary. A conflict,
+  finished task or missing task identity restores the draft rather than starting
+  another task. Corrections before task admission require an explicit retry.
+- `context_status` and `compact_context` are model tools, subject to the existing
+  tool allowlist, approval policy, claim/result journal and sanitized event path.
+  Neither changes permissions or issues an additional provider request.
+- `compact_context` currently creates a **mechanical** checkpoint only, covering
+  complete requests before the current request. It preserves canonical messages
+  and the current request verbatim. It uses the running turn's existing lease.
+- Before inference, estimated compiled input plus the output reserve triggers
+  automatic durable mechanical compaction at 80% of the model window when a new
+  completed-request boundary exists. This estimate includes instructions, skill
+  descriptions, retrieved memory and tools. A long first request or a previously
+  checkpointed boundary continues to use the existing bounded in-memory trimming;
+  a 60% target and semantic compaction are not implemented.
+- The status tool uses the active task's selected model; the human `/context`
+  still uses the configured primary model. Both status surfaces retain their
+  explicit estimation exclusions below; they are not full-request measurements.
+
+Remaining roadmap: approved durable spending envelopes, semantic compaction,
+`set_effort`, `ask_user`, visible task plans, `/init`, agent-initiated teams,
+command argument completion, file mentions, multiline/editor input, mode and
+permission controls, sessions and panel recovery, operational slash commands,
+undo/rewind with attributable file journals, exports, localization and attachments.
+`/bridge` and `/ilustration` remain unavailable. No unconfined fallback or new
+platform has been enabled.
+
+Verification for the maintained source belongs to [`verification.json`](verification.json).
+Fixture tests exercise audited controls, checkpoint persistence, canonical-history
+preservation and current-request retention. They do not qualify native confinement
+or semantic-summary quality. Native outcomes are recorded separately by the
+verifier; blocked and skipped checks are not passes.
+
 ## Terminal continuation implementation
 
 The interrupted terminal work has been resumed. This is a partial implementation
@@ -101,10 +143,11 @@ Implemented surfaces:
   the workspace lease. Full canonical messages remain stored. Repeating compaction
   at the same boundary reuses the checkpoint. Loading checks the covered history
   hash; restart marks unfinished maintenance failed. Semantic summarization and
-  automatic durable compaction remain pending; automatic in-memory trimming remains.
+  automatic semantic compaction remain pending. Automatic mechanical checkpoints are described above; bounded in-memory trimming remains.
 - Opening a TUI session loads stored user and assistant text. Restoring tool panels
   and reconnecting an already running task remain pending. Unknown slash commands
-  are rejected locally instead of becoming model prompts.
+  are rejected locally instead of becoming model prompts. Command-name completion
+  and background task corrections are implemented in the increment above.
 - Task effort/mode/bridge fields have compatible defaults and participate in the
   idempotency fingerprint; options are inserted atomically with the task. Bridge
   and illustration execution are rejected until their implementations exist.
@@ -122,7 +165,7 @@ this mapping (see [extended thinking](https://platform.claude.com/docs/en/build-
 
 Still pending: semantic compaction with fully charged usage, complete memory and
 context controls, agent mailboxes and `/bridge`, secure remote skill acquisition
-and `/ilustration`, general confined MCP transports, command completion, CLI run
+and `/ilustration`, general confined MCP transports, argument completion, CLI run
 flags and real-provider quality qualification. Existing MCP confinement restrictions
 remain in place. No native confinement or live-provider pass is implied by these
 terminal changes.

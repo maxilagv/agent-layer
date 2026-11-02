@@ -1280,21 +1280,15 @@ fn help_modal(f: &mut Frame, area: Rect) {
         row("↑ / ↓", "Mensajes anteriores"),
         row("RePág / AvPág", "Desplazar la conversación"),
         row("Ctrl+C", "Cancelar, o salir si no hay trabajo"),
-        row("/new", "Empezar una conversación nueva"),
-        row("/effort", "auto|low|medium|high|xhigh"),
-        row("/context", "Consultar contexto estimado"),
-        row("/compact", "Guardar checkpoint mecánico"),
-        row("/execution", "individual|delegated|cooperative"),
-        row("/team start", "audit|debug|review -- objetivo"),
-        row("/team attach", "Consultar un equipo por task-id"),
-        row("/team", "toggle|members|messages|findings|evidence"),
-        row("/team message", "miembro texto (instrucción del usuario)"),
-        row("/team", "pause|resume|close|cancel|priority"),
-        row("/clear", "Limpiar la pantalla"),
-        row("/exit", "Salir"),
-        Line::raw(""),
-        Line::from(Span::styled("  Pulsa Esc para cerrar", dim())),
     ];
+    let mut lines = lines;
+    for command in crate::commands::COMMANDS {
+        lines.push(row(command.name, command.help));
+    }
+    lines.push(Line::from(Span::styled(
+        "  Tab completa · Esc cierra",
+        dim(),
+    )));
     let w = 60.min(area.width.saturating_sub(4));
     let h = (lines.len() + 2) as u16;
     let r = rect(

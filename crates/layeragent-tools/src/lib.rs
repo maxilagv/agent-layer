@@ -38,6 +38,12 @@ pub const AGENT_TOOLS: [&str; 4] = ["spawn_agent", "wait_agent", "cancel_agent",
 pub trait TeamControl: Send + Sync {
     async fn execute(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value>;
 }
+
+/// Session controls are implemented by the engine, never by project commands.
+#[async_trait::async_trait]
+pub trait SessionControl: Send + Sync {
+    async fn execute(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value>;
+}
 pub const TEAM_TOOLS: [&str; 14] = [
     "team_members",
     "team_message",
@@ -97,6 +103,7 @@ pub struct ToolContext<'a> {
     pub stream: Option<mpsc::Sender<String>>,
     pub agents: Option<Arc<dyn AgentControl>>,
     pub team: Option<Arc<dyn TeamControl>>,
+    pub session: Option<Arc<dyn SessionControl>>,
 }
 fn def(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolDefinition {
     ToolDefinition {
@@ -109,6 +116,18 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
     let string = json!({"type":"string","maxLength":1_048_576});
     let short = json!({"type":"string","maxLength":4096});
     let mut tools = vec![
+        def(
+            "context_status",
+            "Inspect estimated session context and its explicit measurement exclusions; does not change permissions",
+            json!({}),
+            &[],
+        ),
+        def(
+            "compact_context",
+            "Create a durable mechanical checkpoint of completed history before the current request. Full history is preserved; no model request or permission change",
+            json!({}),
+            &[],
+        ),
         def(
             "read_file",
             "Read a workspace UTF-8 file with its SHA-256 hash",
@@ -676,6 +695,14 @@ impl Tools {
             .await?;
         }
         match call.name.as_str() {
+            "context_status" | "compact_context" => {
+                return ctx
+                    .session
+                    .as_ref()
+                    .context("session controls unavailable")?
+                    .execute(ctx, &call.name, a)
+                    .await;
+            }
             name if TEAM_TOOLS.contains(&name) => {
                 return ctx
                     .team

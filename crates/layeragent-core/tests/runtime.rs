@@ -1110,3 +1110,118 @@ fn delegate_ws(workspace: &tempfile::TempDir, prompt: &str) -> RunRequest {
         cooperative: None,
     }
 }
+
+struct SessionControlsModel(AtomicUsize);
+#[async_trait]
+impl LanguageModel for SessionControlsModel {
+    async fn infer(
+        &self,
+        _: &Config,
+        _: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        _: CancellationToken,
+        _: mpsc::Sender<Delta>,
+    ) -> Result<Completion> {
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content == "preserve current request verbatim")
+        );
+        assert!(tools.iter().any(|t| t.name == "context_status"));
+        if let Some(message) = messages.last().filter(|m| m.role == "tool") {
+            let value: serde_json::Value = serde_json::from_str(&message.content)?;
+            assert!(value.get("error").is_none(), "{value}");
+        }
+        let index = self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(if index < 2 {
+            Completion {
+                calls: vec![ToolCall {
+                    id: format!("session-control-{index}"),
+                    name: ["context_status", "compact_context"][index].into(),
+                    arguments: json!({}),
+                    provider_data: serde_json::Value::Null,
+                }],
+                ..Default::default()
+            }
+        } else {
+            Completion {
+                text: "controls verified".into(),
+                ..Default::default()
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn session_controls_are_audited_and_auto_compaction_preserves_canonical_history() -> Result<()>
+{
+    let home = tempfile::tempdir()?;
+    let workspace = tempfile::tempdir()?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut cfg = config();
+    cfg.policy.write = false;
+    cfg.policy.shell = false;
+    cfg.auto_skills = false;
+    cfg.policy.allowed_tools = vec!["context_status".into(), "compact_context".into()];
+    let engine = Engine::with_components(
+        home.path().into(),
+        "default".into(),
+        cfg,
+        Arc::new(SessionControlsModel(AtomicUsize::new(0))),
+        Arc::new(FixtureSandbox {
+            calls: calls.clone(),
+        }),
+    )?;
+    let scope = Scope::local();
+    let store = engine.store(&scope).await?;
+    let session = store
+        .create_session(&scope.principal, workspace.path())
+        .await?;
+    let original = "old request ".repeat(12_000);
+    store
+        .message(&session.id, &Message::text("user", &original))
+        .await?;
+    store
+        .message(
+            &session.id,
+            &Message::text("assistant", "prior work complete"),
+        )
+        .await?;
+    let result = engine
+        .run(
+            scope,
+            RunRequest {
+                session_id: Some(session.id.clone()),
+                workspace: None,
+                prompt: "preserve current request verbatim".into(),
+                model: None,
+                effort: Default::default(),
+                bridge: false,
+                mode: Default::default(),
+                execution: Default::default(),
+                cooperative: None,
+            },
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(result.text, "controls verified");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.history(&session.id).await?[0].content, original);
+    let checkpoint = store
+        .latest_checkpoint(&session.id)
+        .await?
+        .expect("durable checkpoint");
+    assert_eq!(checkpoint["kind"], "mechanical");
+    let events = store.events(&session.id, 0).await?;
+    assert!(events.iter().any(|e| e.kind == "context_compacted"));
+    assert_eq!(
+        events.iter().filter(|e| e.kind == "tool_started").count(),
+        2
+    );
+    assert_eq!(
+        events.iter().filter(|e| e.kind == "tool_completed").count(),
+        2
+    );
+    Ok(())
+}

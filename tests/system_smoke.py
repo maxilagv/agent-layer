@@ -10,9 +10,16 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+
+# LayerAgent refuses private directories below symlinks; macOS reaches its
+# temporary directory through one (/var -> /private/var).
+# macOS temporary directories are long enough to push runtime sockets past the
+# 104-byte UNIX socket path limit; use the short real /tmp there instead.
+tempfile.tempdir = os.path.realpath('/tmp' if sys.platform == 'darwin' else tempfile.gettempdir())
 
 
 class Model(http.server.BaseHTTPRequestHandler):
@@ -52,6 +59,28 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(30)
         self.sock.connect(self.socket_path)
+
+
+def find_daemon_pid(home):
+    """PID of the IPC daemon serving `home`, via /proc or, where absent, ps."""
+    if pathlib.Path('/proc').is_dir():
+        for entry in pathlib.Path('/proc').iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                argv = (entry / 'cmdline').read_bytes().split(b'\0')
+            except OSError:
+                continue
+            if str(home).encode() in argv and b'serve' in argv and b'--ipc-only' in argv:
+                return int(entry.name)
+        return None
+    listing = subprocess.run(['ps', '-axww', '-o', 'pid=,args='], capture_output=True, text=True, check=True)
+    for line in listing.stdout.splitlines():
+        pid, _, args = line.strip().partition(' ')
+        argv = args.split()
+        if str(home) in argv and 'serve' in argv and '--ipc-only' in argv:
+            return int(pid)
+    return None
 
 
 def main():
@@ -163,17 +192,7 @@ def main():
                 time.sleep(.05)
             else:
                 raise AssertionError('slow task never started')
-            daemon_pid = None
-            for entry in pathlib.Path('/proc').iterdir():
-                if not entry.name.isdigit():
-                    continue
-                try:
-                    argv = (entry / 'cmdline').read_bytes().split(b'\0')
-                except OSError:
-                    continue
-                if str(home).encode() in argv and b'serve' in argv and b'--ipc-only' in argv:
-                    daemon_pid = int(entry.name)
-                    break
+            daemon_pid = find_daemon_pid(home)
             assert daemon_pid, 'daemon process not found'
             os.kill(daemon_pid, signal.SIGKILL)
             time.sleep(.5)

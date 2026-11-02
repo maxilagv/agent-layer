@@ -694,7 +694,15 @@ async fn serve(home: PathBuf, profile: String, ipc_only: bool) -> Result<()> {
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
-        let listener = tokio::net::UnixListener::bind(&path)?;
+        // sun_path holds 108 bytes on Linux and 104 on macOS/BSD, NUL included.
+        let limit = if cfg!(target_os = "linux") { 107 } else { 103 };
+        anyhow::ensure!(
+            path.as_os_str().len() <= limit,
+            "runtime socket path {} exceeds the {limit}-byte platform limit; use a shorter LayerAgent home",
+            path.display()
+        );
+        let listener = tokio::net::UnixListener::bind(&path)
+            .with_context(|| format!("binding runtime socket {}", path.display()))?;
         let router =
             layeragent_gateway::router(layeragent_gateway::ApiState::new(engine.clone(), true));
         let token = engine.shutdown.clone();

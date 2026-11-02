@@ -106,7 +106,7 @@ fn nested_files(workspace: &Path) -> Vec<String> {
             e.path()
                 .strip_prefix(workspace)
                 .ok()
-                .map(|p| p.display().to_string())
+                .map(crate::workspace::portable)
         })
         .collect()
 }

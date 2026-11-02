@@ -80,6 +80,103 @@ seeing peer conclusions; review checks a different reviewer and linked current
 evidence, not independence of every evidence producer. These remain qualification
 boundaries rather than claims of a complete independent-audit workflow.
 
+## Cooperative bus hardening increment
+
+This increment closes defects found by auditing the existing cooperative
+runtime before it becomes the inter-agent message bus. It adds no new
+cooperative capability beyond read helpers. Each item has a regression test in
+`crates/layeragent-storage/src/team.rs`, `crates/layeragent-core/tests/cooperative_runtime.rs`,
+`crates/layeragent-core/src/cooperative.rs` or `crates/layeragent-gateway/src/teams.rs`;
+outcomes for the maintained source belong to `verification.json`.
+
+Runtime and lifecycle:
+
+- A runtime stop or graceful shutdown leaves a running team `blocked` for explicit
+  resume. Previously the supervisor's own token was cancelled by the stop and the
+  team was recorded as `cancelled`, which made it unrecoverable. A paused team
+  stays paused.
+- Terminal team states (`cancelled`, `terminated`, `failed`) are final: a late
+  supervisor write can no longer turn a cancelled team back into a resumable one.
+  Runtime state changes now advance the team revision.
+- A member is never a candidate while it has a live activation, including after
+  `team_wait`. The existing unique index already prevented a second concurrent
+  activation; the supervisor no longer retries it every polling interval, and
+  capacity is computed from its own live activations.
+- An activation admitted by the supervisor is finished as `failed` if its session
+  cannot be created or bound, instead of holding a concurrency slot until restart.
+- The runtime-derived idempotency key for team appends includes the observed team
+  revision, so a deliberate repeat after the team changed is a new operation
+  rather than a permanent conflict. Retries of one call remain deduplicated by
+  the tool-call journal.
+- An added member's model must have configured prices when the team has a cost
+  ceiling; unpriced usage would otherwise be charged as zero.
+
+Messages, work and findings:
+
+- Message validation (size, recipient membership, team-scoped references) runs
+  before late and rejected dispositions. Self-addressed messages are refused.
+- A failed or terminated member cannot receive targeted messages, and its
+  accepted deliveries are cancelled when it fails, so the team cannot wait on it
+  forever.
+- Only a recipient of a question can mark it responded, and open-question checks
+  consider only accepted responses from the same team.
+- An idle check counts notice rounds, not notice rows: a wait cycle receives a
+  second round of notices before the team blocks. An accepted member response is
+  progress.
+- The coordinator can cancel or mark inconclusive work nobody else can finish
+  (unassigned work behind an inconclusive dependency, or work owned by a failed
+  member). Work cannot be claimed while the team is not active or reopened while
+  it is closing. Clearing a member's current work only affects that work item.
+- Findings and their transitions require an active team and team-scoped evidence;
+  transition evidence must belong to the finding. A snapshot can only be declared
+  current when it is the team's current snapshot. Leaving `reviewed` clears the
+  recorded reviewer; the revision history retains it. A message disposition is
+  recorded once.
+
+Interfaces:
+
+- Task routes (read, events, stream, metrics, cancel, correct, approve, task
+  artifacts, `?task=` artifacts and listing) enforce the identity's workspace
+  grant, as team routes already did. A task outside the grant is reported as not
+  found on both task and team routes.
+- A task-level correction on a cooperative task is refused with a conflict instead
+  of being stored and never applied. The TUI delivers text typed during a
+  cooperative task to the coordinator as an operator team message.
+- `/team attach` discards the previous team's panel before the new snapshot
+  arrives, so no control can target the previous team.
+- Markdown exports keep model-written text inside its list item, and the CLI
+  escapes control and bidirectional-override characters before printing an export.
+- Live team views refresh from bounded resource tails
+  (`GET /v1/tasks/{id}/team/{resource}?tail=N`, at most 200 rows) instead of
+  downloading the complete export on every refresh.
+
+Foundations for the message bus: `GET /v1/tasks/{id}/team/threads/{message}`
+returns a reply chain (root and replies, bounded to 500 messages of the team),
+and migration 008 adds indexes for reservations by activation and messages by
+finding or work item.
+
+Platform and effort fixes found by CI on this increment: Auto effort now
+escalates on output consumption as well as rounds (previously a first response
+larger than the medium share failed the turn with "turn output token budget
+exhausted", which broke the native remote `agent-edit` smoke); the resource-limit
+code no longer casts platform-specific `setrlimit` resource types; and the web
+surface's UNIX-socket daemon client and its tests are compiled only on UNIX hosts.
+Worktree paths are handed to Git without the Windows verbatim prefix, which Git
+cannot create directories under.
+The daemon refuses a runtime socket path longer than the platform's UNIX socket
+limit with an explicit error, and the smokes use the short real `/tmp` on macOS.
+These are compile and behavior fixes; macOS and Windows execution stay disabled.
+
+Known open items, not changed by this increment: one member's failed activation
+still fails the whole team; activation leases are renewed by heartbeats and are
+not reaped on expiry, so a hung activation keeps its slot; the objection debate
+limit resets when an objection's claim changes or it becomes inconclusive;
+uncertain reservations and deliveries have no reconciliation command; incorporated
+peer messages are `user` turns, so under context pressure the activation prompt
+can be trimmed before later peer messages; TUI team controls use the revision at
+command time rather than the revision displayed in the panel. Native confinement
+and live-provider behavior are not qualified by this increment.
+
 ## CLI session-control increment
 
 This increment is **partial coverage** of the CLI roadmap. It does not complete
@@ -134,8 +231,9 @@ Implemented surfaces:
 - `/effort [auto|low|medium|high|xhigh]` reads or stores a session preference.
   The engine applies preferences between operations. A task override takes
   precedence over the session preference, then the configured default. Auto
-  increases effort before reaching its initial round ceiling and does not decrease
-  during a task. Input, output, cost and agent-tree ceilings remain enforced.
+  increases effort before reaching its initial round ceiling or exhausting its
+  current share of the configured output budget, and does not decrease during a
+  task, so an Auto turn is never stopped below the operator's output ceiling. Input, output, cost and agent-tree ceilings remain enforced.
 - `/context` reports an estimate for compiled history, checkpoints and tool
   definitions, with explicit exclusions for instructions, skills, memory and output
   reserve. It is not a measurement of the complete inference request.

@@ -39,7 +39,9 @@ def main():
                         pass
                 if check():
                     return
-                if process.poll() is not None:
+                # Re-check after observing an exit: the process may have exited
+                # between the check and the poll, which is not early.
+                if process.poll() is not None and not check():
                     raise AssertionError(f'TUI exited early:\n{screen.text()}')
                 time.sleep(.15)
             raise AssertionError(f'TUI timeout:\n{screen.text()}')

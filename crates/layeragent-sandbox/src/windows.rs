@@ -10,7 +10,9 @@
 //! Known gaps, reported by `doctor`: reads are not restricted (secrets are only hidden
 //! from file tools), there is no network, and no AppContainer. Execution therefore stays
 //! disabled in production until those gaps are closed and certified on Windows.
-#![cfg_attr(not(test), allow(dead_code))]
+// Execution is disabled, so the Windows-only ACL and job helpers have no caller
+// outside their own unit tests; tests on other hosts exercise the portable parts.
+#![cfg_attr(any(not(test), windows), allow(dead_code))]
 use crate::guard::{Guard, GuardKind, RootSpec};
 use std::path::{Path, PathBuf};
 
@@ -154,8 +156,11 @@ mod native {
         changes: Vec<AclChange>,
     }
 
-    fn counts() -> &'static Mutex<HashMap<(PathBuf, Vec<String>), usize>> {
-        static COUNTS: OnceLock<Mutex<HashMap<(PathBuf, Vec<String>), usize>>> = OnceLock::new();
+    /// Active ACL edits by (root, grant), counted across concurrent runs.
+    type AclCounts = Mutex<HashMap<(PathBuf, Vec<String>), usize>>;
+
+    fn counts() -> &'static AclCounts {
+        static COUNTS: OnceLock<AclCounts> = OnceLock::new();
         COUNTS.get_or_init(Default::default)
     }
 

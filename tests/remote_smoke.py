@@ -15,12 +15,19 @@ import signal
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+
+# LayerAgent refuses private directories below symlinks; macOS reaches its
+# temporary directory through one (/var -> /private/var).
+# macOS temporary directories are long enough to push runtime sockets past the
+# 104-byte UNIX socket path limit; use the short real /tmp there instead.
+tempfile.tempdir = os.path.realpath('/tmp' if sys.platform == 'darwin' else tempfile.gettempdir())
 
 
 def private(path, value):

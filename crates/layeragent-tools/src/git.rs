@@ -49,6 +49,19 @@ pub(crate) fn audit_config(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// A path as Git accepts it on the command line. Canonical Windows paths carry
+/// the verbatim prefix (`\\?\C:\...`), which Git cannot create directories under.
+fn git_arg(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{unc}");
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
+        _ => text.into_owned(),
+    }
+}
+
 async fn run(workspace: &Path, args: &[&str]) -> Result<(i32, String)> {
     let mut command = tokio::process::Command::new("git");
     command
@@ -172,7 +185,7 @@ pub async fn worktree_add(repo: &Path, dest: &Path) -> Result<()> {
     let dir = git_dir(repo)?;
     audit_config(&std::fs::read_to_string(dir.join("config")).unwrap_or_default())?;
     ensure!(!dest.exists(), "worktree destination already exists");
-    let dest_text = dest.to_string_lossy().into_owned();
+    let dest_text = git_arg(dest);
     let (code, output) = run(repo, &["worktree", "add", "--detach", &dest_text, "HEAD"]).await?;
     ensure!(code == 0, "git worktree add failed: {output}");
     Ok(())
@@ -188,7 +201,7 @@ pub async fn worktree_patch(worktree: &Path) -> Result<String> {
 }
 
 pub async fn worktree_remove(repo: &Path, dest: &Path) {
-    let dest_text = dest.to_string_lossy().into_owned();
+    let dest_text = git_arg(dest);
     let _ = run(repo, &["worktree", "remove", "--force", &dest_text]).await;
     let _ = std::fs::remove_dir_all(dest);
     let _ = run(repo, &["worktree", "prune"]).await;
@@ -197,6 +210,20 @@ pub async fn worktree_remove(repo: &Path, dest: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbatim_windows_paths_are_passed_to_git_in_plain_form() {
+        assert_eq!(
+            git_arg(Path::new(r"\\?\C:\Temp\agents\x")),
+            r"C:\Temp\agents\x"
+        );
+        assert_eq!(
+            git_arg(Path::new(r"\\?\UNC\server\share\x")),
+            r"\\server\share\x"
+        );
+        assert_eq!(git_arg(Path::new("/var/state/x")), "/var/state/x");
+        assert_eq!(git_arg(Path::new(r"\\?\Volume{1}\x")), r"\\?\Volume{1}\x");
+    }
 
     #[test]
     fn config_audit_rejects_code_execution_vectors() {

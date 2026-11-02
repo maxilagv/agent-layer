@@ -441,6 +441,16 @@ impl App {
         self.entries.push(Entry::User(objective.into()));
     }
 
+    /// Switches the panel to another existing team. The previous team's view is
+    /// discarded so no control can target it before the new snapshot arrives.
+    pub fn attach_team(&mut self) {
+        self.screen = Screen::Chat;
+        self.team = None;
+        self.team_notice = None;
+        self.team_visible = true;
+        self.team_event_seq = 0;
+    }
+
     pub fn team_note(&mut self, text: &str) {
         self.team_notice = Some(text.into());
         self.note(text);
@@ -1317,5 +1327,17 @@ mod tests {
         assert!(!a.team_visible);
         assert!(a.team_notice.is_none());
         assert!(a.is_busy());
+    }
+
+    #[test]
+    fn attaching_another_team_discards_the_previous_panel() {
+        let mut a = app();
+        a.on_event(&json!({"kind":"team_snapshot","data":{"team":{"task_id":"old-team-task","state":"active","last_event_seq":8,"members":[]}}}));
+        a.team_note("Old team notice");
+        a.attach_team();
+        assert!(a.team.is_none(), "no control may target the previous team");
+        assert!(a.team_notice.is_none());
+        assert!(a.team_visible);
+        assert_eq!(a.team_event_seq, 0);
     }
 }

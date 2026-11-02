@@ -22,7 +22,15 @@ async fn task(s: &ApiState, identity: &Identity, id: &str) -> ApiResult<Task> {
         .task(&identity.scope, id)
         .await
         .map_err(|_| ApiError::not_found(anyhow::anyhow!("task not found or inaccessible")))?;
-    identity.require_workspace(&task.project)?;
+    if identity.authority.is_cancelled() {
+        return Err(anyhow::anyhow!("authority changed; reconnect").into());
+    }
+    // Outside the workspace grant a team is indistinguishable from a missing one.
+    if !identity.permits_workspace(&task.project) {
+        return Err(ApiError::not_found(anyhow::anyhow!(
+            "task not found or inaccessible"
+        )));
+    }
     if task.execution != ExecutionMode::Cooperative || task.team_id.is_none() {
         return Err(ApiError::not_found(anyhow::anyhow!(
             "cooperative team not found"
@@ -61,6 +69,8 @@ pub(super) struct ResourceQuery {
     #[serde(default)]
     after: i64,
     limit: Option<usize>,
+    /// Return the most recent rows (at most 200) instead of a forward page.
+    tail: Option<usize>,
 }
 
 pub(super) async fn resource(
@@ -70,10 +80,14 @@ pub(super) async fn resource(
     Query(query): Query<ResourceQuery>,
 ) -> ApiResult<Json<Value>> {
     task(&s, &identity, &id).await?;
-    let (items, next) = s
-        .engine
-        .store(&identity.scope)
-        .await?
+    let store = s.engine.store(&identity.scope).await?;
+    if let Some(tail) = query.tail {
+        let items = store
+            .team_resource_tail(&identity.scope, &id, &resource, tail)
+            .await?;
+        return Ok(Json(json!({"items":items,"next":null})));
+    }
+    let (items, next) = store
         .team_resource(
             &identity.scope,
             &id,
@@ -83,6 +97,22 @@ pub(super) async fn resource(
         )
         .await?;
     Ok(Json(json!({"items":items,"next":next})))
+}
+
+pub(super) async fn thread(
+    State(s): State<ApiState>,
+    axum::Extension(identity): axum::Extension<Identity>,
+    Path((id, message)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    task(&s, &identity, &id).await?;
+    let thread = s
+        .engine
+        .store(&identity.scope)
+        .await?
+        .team_thread(&identity.scope, &id, &message)
+        .await
+        .map_err(|_| ApiError::not_found(anyhow::anyhow!("message not found in this team")))?;
+    Ok(Json(thread))
 }
 
 pub(super) async fn messages(
@@ -281,6 +311,7 @@ mod tests {
                 .route("/v1/tasks/{id}/team/export", get(export))
                 .route("/v1/tasks/{id}/team/messages", get(messages).post(message))
                 .route("/v1/tasks/{id}/team/commands/{action}", post(command))
+                .route("/v1/tasks/{id}/team/threads/{message}", get(thread))
                 .route("/v1/tasks/{id}/team/{resource}", get(resource))
                 .layer(axum::Extension(identity))
                 .with_state(self.state.clone())
@@ -308,9 +339,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_routes_enforce_the_same_workspace_grant_as_team_routes() -> Result<()> {
+        let f = Fixture::new().await?;
+        let app = |workspace_allowed: bool| {
+            let identity = Identity {
+                scope: Scope::local(),
+                read_only: false,
+                owner: false,
+                workspaces: Some(if workspace_allowed {
+                    vec![f.workspace.path().into()]
+                } else {
+                    vec![]
+                }),
+                authority: CancellationToken::new(),
+            };
+            Router::new()
+                .route("/v1/tasks", get(super::super::tasks::list))
+                .route("/v1/tasks/{id}", get(super::super::tasks::get))
+                .route("/v1/tasks/{id}/events", get(super::super::tasks::events))
+                .route(
+                    "/v1/tasks/{id}/events/stream",
+                    get(super::super::tasks::stream),
+                )
+                .route("/v1/tasks/{id}/metrics", get(super::super::tasks::metrics))
+                .route("/v1/tasks/{id}/cancel", post(super::super::tasks::cancel))
+                .route("/v1/tasks/{id}/correct", post(super::super::tasks::correct))
+                .route("/v1/tasks/{id}/team", get(snapshot))
+                .layer(axum::Extension(identity))
+                .with_state(f.state.clone())
+        };
+        let request = |method: &str, path: String, body: Value| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+        };
+        let task = &f.task;
+        for (method, path, body) in [
+            ("GET", format!("/v1/tasks/{task}"), json!({})),
+            ("GET", format!("/v1/tasks/{task}/events"), json!({})),
+            ("GET", format!("/v1/tasks/{task}/events/stream"), json!({})),
+            ("GET", format!("/v1/tasks/{task}/metrics"), json!({})),
+            ("GET", format!("/v1/tasks/{task}/team"), json!({})),
+            ("POST", format!("/v1/tasks/{task}/cancel"), json!({})),
+            (
+                "POST",
+                format!("/v1/tasks/{task}/correct"),
+                json!({"instruction":"x","expected_revision":1}),
+            ),
+        ] {
+            let response = app(false)
+                .oneshot(request(method, path.clone(), body)?)
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {path} must not reveal or act on a task outside the grant"
+            );
+        }
+        let listed = app(false)
+            .oneshot(request("GET", "/v1/tasks".into(), json!({}))?)
+            .await?;
+        let bytes = axum::body::to_bytes(listed.into_body(), 1 << 20).await?;
+        let listed: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            listed["tasks"],
+            json!([]),
+            "listing hides tasks outside the grant"
+        );
+        // The granted identity still reaches the task, and a correction for a
+        // cooperative task is refused instead of being silently dropped.
+        let response = app(true)
+            .oneshot(request("GET", format!("/v1/tasks/{task}"), json!({}))?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app(true)
+            .oneshot(request(
+                "POST",
+                format!("/v1/tasks/{task}/correct"),
+                json!({"instruction":"focus on auth","expected_revision":1}),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn team_routes_enforce_identity_workspace_and_read_only_authority() -> Result<()> {
         let f = Fixture::new().await?;
         let principal = Scope::local().principal;
+        assert_eq!(
+            f.call(
+                f.app(true, &principal, true),
+                "GET",
+                "/threads/missing",
+                json!({})
+            )
+            .await?
+            .0,
+            StatusCode::NOT_FOUND,
+            "a thread outside the team is not found"
+        );
         for suffix in [
             "",
             "/export",

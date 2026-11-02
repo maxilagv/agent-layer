@@ -176,6 +176,23 @@ async fn interface(
                 }
             }
             Action::Correct(instruction) => {
+                // Cooperative members never read task-level corrections: deliver the
+                // instruction to the coordinator as a team message instead.
+                if let Some((team_task, coordinator)) = app.team.as_ref().and_then(|view| {
+                    let task = view["team"]["task_id"].as_str()?;
+                    let coordinator = view["team"]["members"].as_array()?.iter().find(|m| m["role"] == "coordinator")?["id"].as_str()?;
+                    Some((task.to_string(), coordinator.to_string()))
+                }) && job.as_deref() == Some(team_task.as_str())
+                {
+                    match crate::team::message(&client, &team_task, &coordinator, &instruction).await {
+                        Ok(_) => app.team_note("Instrucción enviada al coordinador; se incorporará en su próximo punto seguro."),
+                        Err(error) => {
+                            app.restore_draft(&instruction);
+                            app.team_note(&format!("Instrucción no enviada: {error}"));
+                        }
+                    }
+                    continue;
+                }
                 let client = client.clone();
                 let task = job.clone();
                 let output = tx.clone();
@@ -229,6 +246,7 @@ async fn interface(
                             if let Some(handle) = follower.take() { handle.abort(); }
                             view_generation += 1;
                             job = Some(task.into());
+                            app.attach_team();
                             if let Some(id) = value["session_id"].as_str() { session = id.into(); }
                             cancel_on_start = false;
                             follower = Some(spawn_follow(client.clone(), session.clone(), None, Some(task.into()), tx.clone(), view_generation));

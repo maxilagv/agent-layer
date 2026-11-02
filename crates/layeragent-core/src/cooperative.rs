@@ -197,8 +197,16 @@ fn with_defaults(name: &str, args: &Value, activation: &str, revision: i64) -> R
             | "team_finding_transition"
     ) && !object.contains_key("idempotency_key")
     {
+        // Retried calls are deduplicated earlier by the engine's tool-call journal;
+        // this key only has to be stable for one call. Including the observed team
+        // revision lets a deliberate repeat (for example a second "any update?")
+        // after the team changed become a new operation instead of a conflict.
         let digest = Sha256::digest(
-            format!("{activation}\0{name}\0{}", Value::Object(object.clone())).as_bytes(),
+            format!(
+                "{activation}\0{name}\0{revision}\0{}",
+                Value::Object(object.clone())
+            )
+            .as_bytes(),
         );
         object.insert(
             "idempotency_key".into(),
@@ -252,9 +260,18 @@ impl TeamControl for EngineTeamControl {
             "team_add_member" => {
                 let input: TeamMemberInput = serde_json::from_value(args.clone())?;
                 if let Some(model) = &input.model {
+                    let configured = ctx
+                        .config
+                        .models
+                        .get(model)
+                        .with_context(|| format!("unknown role model {model}"))?;
+                    // Unpriced usage is charged as zero, which would silently
+                    // escape a team cost ceiling.
                     ensure!(
-                        ctx.config.models.contains_key(model),
-                        "unknown role model {model}"
+                        snapshot.options.limits.max_cost_usd.is_none()
+                            || (configured.input_per_million.is_some()
+                                && configured.output_per_million.is_some()),
+                        "role model {model} has no configured prices; the team has a cost ceiling"
                     );
                 }
                 store.team_add_member(team, member, input).await
@@ -483,6 +500,7 @@ impl Engine {
             "cooperative writers require isolated worktrees and are not enabled"
         );
         let run_cancel = cancel.child_token();
+        store.team_supervisor_started(&team).await?;
         self.active
             .lock()
             .map_err(|_| anyhow::anyhow!("active lock poisoned"))?
@@ -490,7 +508,6 @@ impl Engine {
                 task_id.clone(),
                 (scope.clone(), String::new(), run_cancel.clone()),
             );
-        store.team_supervisor_started(&team).await?;
         let result = self
             .supervise(
                 scope.clone(),
@@ -505,7 +522,21 @@ impl Engine {
             .lock()
             .map_err(|_| anyhow::anyhow!("active lock poisoned"))?
             .remove(&task_id);
-        if run_cancel.is_cancelled() {
+        if self.shutdown.is_cancelled() {
+            // Stopping the runtime cancels every active token, including this
+            // supervisor's; that is an interruption, not an operator cancellation.
+            // A paused team stays paused, and terminal states are never rewritten.
+            let state = store.team_snapshot_by_id(&team).await?.state;
+            if !matches!(state.as_str(), "paused" | "blocked") {
+                store
+                    .team_runtime_state(
+                        &team,
+                        "blocked",
+                        Some("runtime stopped; explicit resume required"),
+                    )
+                    .await?;
+            }
+        } else if run_cancel.is_cancelled() {
             let snapshot = store.team_snapshot_by_id(&team).await?;
             if snapshot.state != "cancelled" && snapshot.state != "terminated" {
                 store.team_runtime_state(&team, "cancelled", Some("execution cancelled; activations reaped and pending deliveries cancelled")).await?;
@@ -559,12 +590,7 @@ impl Engine {
                     }
                 }
                 "active" => {
-                    let live = snapshot
-                        .members
-                        .iter()
-                        .filter(|member| member["state"] == "working")
-                        .count();
-                    let capacity = snapshot.options.limits.max_concurrency.saturating_sub(live);
+                    let capacity = snapshot.options.limits.max_concurrency.saturating_sub(jobs.len());
                     if capacity > 0 {
                         let candidates = store.team_candidates(&team).await?;
                         if candidates.is_empty()
@@ -593,37 +619,46 @@ impl Engine {
                             let generation = started["generation"]
                                 .as_i64()
                                 .context("activation generation")?;
-                            let session = match candidate["session_id"].as_str() {
-                                Some(id) => id.to_string(),
-                                None => {
-                                    store
-                                        .create_session(&scope.principal, Path::new(&task.project))
-                                        .await?
-                                        .id
+                            // From here the activation is committed as running: every
+                            // failure must finish it, or the member keeps a slot forever.
+                            let bound = async {
+                                let session = match candidate["session_id"].as_str() {
+                                    Some(id) => id.to_string(),
+                                    None => {
+                                        store
+                                            .create_session(&scope.principal, Path::new(&task.project))
+                                            .await?
+                                            .id
+                                    }
+                                };
+                                store
+                                    .team_bind_member_session(
+                                        &team,
+                                        &member,
+                                        &activation,
+                                        generation,
+                                        &session,
+                                    )
+                                    .await?;
+                                Ok::<_, anyhow::Error>(session)
+                            }
+                            .await;
+                            let session = match bound {
+                                Ok(session) => session,
+                                Err(error) => {
+                                    let _ = store
+                                        .team_finish_activation(
+                                            &activation,
+                                            &member,
+                                            generation,
+                                            "failed",
+                                            Some(&error.to_string()),
+                                            &json!({}),
+                                        )
+                                        .await;
+                                    continue;
                                 }
                             };
-                            if let Err(error) = store
-                                .team_bind_member_session(
-                                    &team,
-                                    &member,
-                                    &activation,
-                                    generation,
-                                    &session,
-                                )
-                                .await
-                            {
-                                let _ = store
-                                    .team_finish_activation(
-                                        &activation,
-                                        &member,
-                                        generation,
-                                        "failed",
-                                        Some(&error.to_string()),
-                                        &json!({}),
-                                    )
-                                    .await;
-                                continue;
-                            }
                             let initial = candidate["activations"].as_i64() == Some(0);
                             let prompt = activation_prompt(&task, &snapshot, &candidate, initial);
                             let selected = candidate["model"]
@@ -664,9 +699,9 @@ impl Engine {
                     return Ok(());
                 }
                 _ = self.shutdown.cancelled() => {
+                    // run_cooperative records the interruption once every job is reaped.
                     activation_cancel.cancel();
                     while jobs.join_next().await.is_some() {}
-                    store.team_runtime_state(&team, "blocked", Some("runtime stopped; explicit resume required")).await?;
                     return Ok(());
                 }
                 Some(joined) = jobs.join_next(), if !jobs.is_empty() => {
@@ -720,4 +755,31 @@ fn activation_prompt(
         prompt.push_str(" Continue from your canonical session. Pending deliveries are incorporated only at safe boundaries. Answer linked questions, challenge unsupported claims, and preserve inconclusive outcomes when evidence is insufficient.");
     }
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_append_after_the_team_changed_is_a_new_operation() -> Result<()> {
+        let args = json!({"purpose":"question","body":"any update?"});
+        let first = with_defaults("team_message", &args, "activation", 4)?;
+        let replay = with_defaults("team_message", &args, "activation", 4)?;
+        let later = with_defaults("team_message", &args, "activation", 5)?;
+        assert_eq!(first["idempotency_key"], replay["idempotency_key"]);
+        assert_ne!(
+            first["idempotency_key"], later["idempotency_key"],
+            "the same body after a revision change must not replay into a conflict"
+        );
+        assert_eq!(later["expected_revision"], 5);
+        let explicit = with_defaults(
+            "team_message",
+            &json!({"purpose":"question","body":"x","idempotency_key":"mine"}),
+            "activation",
+            5,
+        )?;
+        assert_eq!(explicit["idempotency_key"], "mine");
+        Ok(())
+    }
 }

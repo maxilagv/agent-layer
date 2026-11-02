@@ -491,6 +491,8 @@ mod lifecycle_tests {
             .unwrap();
         assert!(!status.success());
         drop(cleanup);
+        // The process table is inspected through /proc, which only Linux has.
+        #[cfg(target_os = "linux")]
         if let Some(pid) = pid {
             // The group can briefly contain a zombie awaiting the host's reaper;
             // no live child may remain after escalation.

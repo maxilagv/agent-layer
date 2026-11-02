@@ -873,6 +873,7 @@ impl Engine {
                 requested_effort,
                 executed,
                 estimated_total * 4 >= base_config.max_input_tokens.saturating_mul(3),
+                usage.output_tokens,
             );
             if policy.requested == EffortLevel::Auto
                 && let Some((_, previous)) = last_effort

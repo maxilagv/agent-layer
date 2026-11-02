@@ -10,6 +10,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'scripts'))
 from prepare_release import payload, prepare
 from source_fingerprint import fingerprint
 
+import os
+# LayerAgent refuses private directories below symlinks; macOS reaches its
+# temporary directory through one (/var -> /private/var).
+# macOS temporary directories are long enough to push runtime sockets past the
+# 104-byte UNIX socket path limit; use the short real /tmp there instead.
+tempfile.tempdir = os.path.realpath('/tmp' if sys.platform == 'darwin' else tempfile.gettempdir())
+
 
 def main():
     with tempfile.TemporaryDirectory(prefix='layeragent-release-') as directory:

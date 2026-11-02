@@ -142,7 +142,11 @@ The existing task creation endpoint accepts `execution` and `cooperative` option
 `pause_pending` and pending approvals. The existing task event stream includes
 `team_member_event` envelopes identifying the member and activation. Team resource
 queries include `deliveries` and `finding_revisions`; JSON exports also include
-attributed events. Reads and writes retain task, project and principal checks.
+attributed events. `GET /v1/tasks/{id}/team/{resource}?tail=N` returns the most
+recent rows of a resource (at most 200), and
+`GET /v1/tasks/{id}/team/threads/{message}` returns the reply chain containing a
+message. A task-level correction on a cooperative task is refused; send an
+operator instruction as a team message instead. Reads and writes retain task, project and principal checks.
 
 Read the [implementation status](10-implementation-status.md) and current
 fingerprinted [verification report](verification.json) for executed checks and

@@ -959,13 +959,15 @@ async fn paused_inflight_operation_still_consumes_time_budget_until_it_drains() 
 
 #[tokio::test]
 async fn fully_paused_wait_does_not_consume_active_time_budget() -> Result<()> {
-    let f = BoundaryFixture::with_seconds(false, 1).await?;
+    // The pause outlasts the whole active budget; the budget itself leaves room
+    // for the active work around the pause on slow hosts.
+    let f = BoundaryFixture::with_seconds(false, 3).await?;
     let (_, job) = f.start();
     wait_count(&f.inference_calls, 1).await?;
     f.command("pause").await?;
     f.inference_release.add_permits(1);
     f.at_pause_boundary().await?;
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
     assert_eq!(
         f.store
             .team_snapshot(&Scope::local(), &f.task.id)
@@ -976,12 +978,11 @@ async fn fully_paused_wait_does_not_consume_active_time_budget() -> Result<()> {
     f.command("resume").await?;
     f.tool_release.add_permits(1);
     tokio::time::timeout(std::time::Duration::from_secs(5), job).await???;
+    let snapshot = f.store.team_snapshot(&Scope::local(), &f.task.id).await?;
     assert_eq!(
-        f.store
-            .team_snapshot(&Scope::local(), &f.task.id)
-            .await?
-            .state,
-        "terminated"
+        snapshot.state, "terminated",
+        "paused time must not exhaust the active budget: {:?}",
+        snapshot.reason
     );
     Ok(())
 }

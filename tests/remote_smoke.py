@@ -22,6 +22,10 @@ import urllib.error
 import urllib.request
 import uuid
 
+# LayerAgent refuses private directories below symlinks; macOS reaches its
+# temporary directory through one (/var -> /private/var).
+tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
 
 def private(path, value):
     path.write_text(json.dumps(value))

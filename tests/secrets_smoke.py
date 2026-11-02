@@ -9,6 +9,10 @@ import subprocess
 import tempfile
 import threading
 
+# LayerAgent refuses private directories below symlinks; macOS reaches its
+# temporary directory through one (/var -> /private/var).
+tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
 SECRET = 'opaque-credential-for-local-regression-9842'
 received = []
 

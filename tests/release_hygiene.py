@@ -10,6 +10,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'scripts'))
 from prepare_release import payload, prepare
 from source_fingerprint import fingerprint
 
+import os
+# LayerAgent refuses private directories below symlinks; macOS reaches its
+# temporary directory through one (/var -> /private/var).
+tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
 
 def main():
     with tempfile.TemporaryDirectory(prefix='layeragent-release-') as directory:

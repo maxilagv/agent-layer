@@ -14,6 +14,10 @@ import tempfile
 import threading
 import time
 
+# LayerAgent refuses private directories below symlinks; macOS reaches its
+# temporary directory through one (/var -> /private/var).
+tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
 
 class Model(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):

@@ -9,6 +9,10 @@ import subprocess
 import sys
 import tempfile
 
+# LayerAgent refuses private directories below symlinks; macOS reaches its
+# temporary directory through one (/var -> /private/var).
+tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / 'scripts/sign_source.py'
 
 

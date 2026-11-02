@@ -23,6 +23,10 @@ import uuid
 
 from system_smoke import UnixHTTPConnection
 
+# LayerAgent refuses private directories below symlinks; macOS reaches its
+# temporary directory through one (/var -> /private/var).
+tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
 
 class Scenario:
     def __init__(self, native=False, held=False):

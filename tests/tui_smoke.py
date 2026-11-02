@@ -16,6 +16,10 @@ import threading
 import time
 from system_smoke import Model
 
+# LayerAgent refuses private directories below symlinks; macOS reaches its
+# temporary directory through one (/var -> /private/var).
+tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
 
 def main():
     binary = str(pathlib.Path('target/debug/layeragent').resolve())

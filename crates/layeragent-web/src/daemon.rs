@@ -42,6 +42,7 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     /// Builds a client for the daemon socket of one profile.
+    #[cfg(unix)]
     pub fn new(home: &Path, profile: &str) -> Result<Self> {
         let socket = home.join("runtime").join(format!("{profile}.sock"));
         let http = reqwest::Client::builder()
@@ -52,6 +53,12 @@ impl DaemonClient {
             http,
             base: "http://localhost".into(),
         })
+    }
+
+    /// The daemon transport is a UNIX socket; other platforms have no web surface.
+    #[cfg(not(unix))]
+    pub fn new(_home: &Path, _profile: &str) -> Result<Self> {
+        anyhow::bail!("the local web surface requires the daemon's UNIX socket")
     }
 
     pub async fn get(&self, path: &str) -> Result<DaemonReply> {

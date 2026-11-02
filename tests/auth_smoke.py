@@ -51,6 +51,32 @@ def main():
                 raw = error.read()
                 return error.code, json.loads(raw) if raw and error.headers.get('content-type', '').startswith('application/json') else raw.decode()
 
+        def oversized_status(path, token, size):
+            """Status for a body larger than the gateway limit.
+
+            The gateway refuses by declared length and closes the connection without
+            reading the body, so a client already streaming it can see a broken pipe
+            instead of the 413. Expect: 100-continue makes the client wait for the
+            answer first; if the server asks for the body, it is sent and the final
+            status is read, so the assertion stays the same either way.
+            """
+            head = (f'POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n'
+                    f'Authorization: Bearer {token}\r\nContent-Type: application/json\r\n'
+                    f'Content-Length: {size}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n')
+            with socket.create_connection(('127.0.0.1', port), timeout=5) as connection:
+                connection.sendall(head.encode())
+                reader = connection.makefile('rb')
+                status = int(reader.readline().split()[1])
+                if status == 100:
+                    while reader.readline() not in (b'\r\n', b''):
+                        pass
+                    try:
+                        connection.sendall(b'x' * size)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    status = int(reader.readline().split()[1])
+                return status
+
         try:
             for _ in range(100):
                 try:
@@ -70,8 +96,7 @@ def main():
             assert request('/v1/config', bob)[0] == 403
             assert request('/v1/config/reload', bob, {})[0] == 403
             assert request('/v1/config', owner)[0] == 200
-            oversized = {'prompt': 'x' * 1_048_576}
-            assert request('/v1/sessions/unused/turns', owner, oversized)[0] == 413
+            assert oversized_status('/v1/sessions/unused/turns', owner, 1_048_576 + 64) == 413
             challenge = '/webhooks/whatsapp?hub.mode=subscribe&hub.challenge=verified-challenge&hub.verify_token='
             assert request(challenge + 'wrong')[0] == 403
             assert request(challenge + 'fixture-subscription') == (200, 'verified-challenge')

@@ -70,36 +70,44 @@ fn bridge(listener: std::net::TcpListener, socket: &Path) {
     }
 }
 
+/// `setrlimit`'s resource type differs by platform (an unsigned enum on glibc,
+/// `c_int` elsewhere); naming it avoids casts that are lossy on one platform
+/// and redundant on the other.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+type Resource = libc::__rlimit_resource_t;
+#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
+type Resource = libc::c_int;
+
 #[cfg(unix)]
 pub(crate) fn apply_rlimits(limits: &Limits) -> Result<()> {
-    fn set(resource: i32, soft: u64, hard: u64) -> Result<()> {
+    fn set(resource: Resource, soft: u64, hard: u64) -> Result<()> {
         let limit = libc::rlimit {
             rlim_cur: soft as libc::rlim_t,
             rlim_max: hard as libc::rlim_t,
         };
         // SAFETY: plain syscall with a valid pointer.
         ensure!(
-            unsafe { libc::setrlimit(resource as _, &limit) } == 0,
+            unsafe { libc::setrlimit(resource, &limit) } == 0,
             "setrlimit failed: {}",
             std::io::Error::last_os_error()
         );
         Ok(())
     }
-    set(libc::RLIMIT_CORE as i32, 0, 0)?;
+    set(libc::RLIMIT_CORE, 0, 0)?;
     if let Some(bytes) = limits.memory_bytes {
-        set(libc::RLIMIT_AS as i32, bytes, bytes)?;
+        set(libc::RLIMIT_AS, bytes, bytes)?;
     }
     if let Some(n) = limits.max_pids {
-        set(libc::RLIMIT_NPROC as i32, n, n)?;
+        set(libc::RLIMIT_NPROC, n, n)?;
     }
     if let Some(secs) = limits.cpu_secs {
-        set(libc::RLIMIT_CPU as i32, secs, secs.saturating_add(2))?;
+        set(libc::RLIMIT_CPU, secs, secs.saturating_add(2))?;
     }
     if let Some(bytes) = limits.file_size_bytes {
-        set(libc::RLIMIT_FSIZE as i32, bytes, bytes)?;
+        set(libc::RLIMIT_FSIZE, bytes, bytes)?;
     }
     if let Some(n) = limits.open_files {
-        set(libc::RLIMIT_NOFILE as i32, n, n)?;
+        set(libc::RLIMIT_NOFILE, n, n)?;
     }
     Ok(())
 }

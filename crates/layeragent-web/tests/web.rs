@@ -2,6 +2,8 @@
 //! host and origin checks, and server-side authorization before a task or
 //! an artifact is reached.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// The web surface reaches the daemon over its UNIX socket only.
+#![cfg(unix)]
 use axum::{
     Router,
     body::Body,

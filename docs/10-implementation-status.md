@@ -155,6 +155,14 @@ returns a reply chain (root and replies, bounded to 500 messages of the team),
 and migration 008 adds indexes for reservations by activation and messages by
 finding or work item.
 
+Platform and effort fixes found by CI on this increment: Auto effort now
+escalates on output consumption as well as rounds (previously a first response
+larger than the medium share failed the turn with "turn output token budget
+exhausted", which broke the native remote `agent-edit` smoke); the resource-limit
+code no longer casts platform-specific `setrlimit` resource types; and the web
+surface's UNIX-socket daemon client and its tests are compiled only on UNIX hosts.
+These are compile and behavior fixes; macOS and Windows execution stay disabled.
+
 Known open items, not changed by this increment: one member's failed activation
 still fails the whole team; activation leases are renewed by heartbeats and are
 not reaped on expiry, so a hung activation keeps its slot; the objection debate
@@ -219,8 +227,9 @@ Implemented surfaces:
 - `/effort [auto|low|medium|high|xhigh]` reads or stores a session preference.
   The engine applies preferences between operations. A task override takes
   precedence over the session preference, then the configured default. Auto
-  increases effort before reaching its initial round ceiling and does not decrease
-  during a task. Input, output, cost and agent-tree ceilings remain enforced.
+  increases effort before reaching its initial round ceiling or exhausting its
+  current share of the configured output budget, and does not decrease during a
+  task, so an Auto turn is never stopped below the operator's output ceiling. Input, output, cost and agent-tree ceilings remain enforced.
 - `/context` reports an estimate for compiled history, checkpoints and tool
   definitions, with explicit exclusions for instructions, skills, memory and output
   reserve. It is not a measurement of the complete inference request.

@@ -1225,3 +1225,82 @@ async fn session_controls_are_audited_and_auto_compaction_preserves_canonical_hi
     );
     Ok(())
 }
+
+/// First completion uses more output than Auto's initial (medium) share.
+struct LargeFirstOutputModel(AtomicUsize);
+#[async_trait]
+impl LanguageModel for LargeFirstOutputModel {
+    async fn infer(
+        &self,
+        _: &Config,
+        _: &str,
+        _: &[Message],
+        _: &[ToolDefinition],
+        _: CancellationToken,
+        _: mpsc::Sender<Delta>,
+    ) -> Result<Completion> {
+        let index = self.0.fetch_add(1, Ordering::SeqCst);
+        let mut completion = if index == 0 {
+            Completion {
+                calls: vec![ToolCall {
+                    id: "large-output".into(),
+                    name: "context_status".into(),
+                    arguments: json!({}),
+                    provider_data: serde_json::Value::Null,
+                }],
+                ..Default::default()
+            }
+        } else {
+            Completion {
+                text: "finished within the configured ceiling".into(),
+                ..Default::default()
+            }
+        };
+        if index == 0 {
+            completion.usage.output_tokens = 3_000;
+        }
+        Ok(completion)
+    }
+}
+
+#[tokio::test]
+async fn auto_effort_does_not_stop_a_turn_below_the_configured_output_ceiling() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let workspace = tempfile::tempdir()?;
+    let mut cfg = config();
+    cfg.policy.write = false;
+    cfg.policy.shell = false;
+    cfg.auto_skills = false;
+    cfg.max_output_tokens = 4_096;
+    cfg.max_rounds = 16;
+    cfg.policy.allowed_tools = vec!["context_status".into()];
+    let engine = Engine::with_components(
+        home.path().into(),
+        "default".into(),
+        cfg,
+        Arc::new(LargeFirstOutputModel(AtomicUsize::new(0))),
+        Arc::new(FixtureSandbox {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+    )?;
+    let result = engine
+        .run(
+            Scope::local(),
+            RunRequest {
+                session_id: None,
+                workspace: Some(workspace.path().to_string_lossy().into_owned()),
+                prompt: "use more than half of the output budget in one step".into(),
+                model: None,
+                effort: Default::default(),
+                bridge: false,
+                mode: Default::default(),
+                execution: Default::default(),
+                cooperative: None,
+            },
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(result.text, "finished within the configured ceiling");
+    assert_eq!(result.usage.output_tokens, 3_000);
+    Ok(())
+}

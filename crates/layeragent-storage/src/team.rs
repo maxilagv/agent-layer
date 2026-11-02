@@ -68,15 +68,67 @@ fn team_state(c: &Connection, team: &str) -> Result<String> {
     Ok(c.query_row("SELECT state FROM teams WHERE id=?1", [team], |r| r.get(0))?)
 }
 
+thread_local! {
+    /// Teams changed by the write running on this (writer) thread.
+    static CHANGED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One change counter per team that something is waiting on.
+static SIGNALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<u64>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn changed(team: &str) {
+    CHANGED.with(|teams| {
+        let mut teams = teams.borrow_mut();
+        if !teams.iter().any(|known| known == team) {
+            teams.push(team.to_string());
+        }
+    });
+}
+
+/// Called by the writer after each write. Waiters are woken only once the
+/// write has returned successfully, so they never observe the prior state.
+pub(crate) fn publish_changes(succeeded: bool) {
+    let teams = CHANGED.with(|teams| std::mem::take(&mut *teams.borrow_mut()));
+    if !succeeded || teams.is_empty() {
+        return;
+    }
+    let Ok(signals) = SIGNALS.lock() else { return };
+    for team in teams {
+        if let Some(signal) = signals.get(&team) {
+            signal.send_modify(|count| *count = count.wrapping_add(1));
+        }
+    }
+}
+
+impl Storage {
+    /// A receiver that changes after every committed write touching this
+    /// team. It replaces fixed-interval polling; callers keep a slow
+    /// fallback for time-based limits.
+    pub fn team_changes(&self, team: &str) -> tokio::sync::watch::Receiver<u64> {
+        let mut signals = SIGNALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        signals.retain(|_, signal| signal.receiver_count() > 0);
+        signals
+            .entry(team.to_string())
+            .or_insert_with(|| tokio::sync::watch::channel(0).0)
+            .subscribe()
+    }
+}
+
 fn bump(c: &Connection, team: &str, at: i64) -> Result<()> {
     c.execute(
         "UPDATE teams SET revision=revision+1,updated_at=?2 WHERE id=?1",
         params![team, at],
     )?;
+    changed(team);
     Ok(())
 }
 
 fn event(c: &Connection, team: &str, kind: &str, data: Value, at: i64) -> Result<()> {
+    changed(team);
     c.execute(
         "INSERT INTO task_events(task_id,at,kind,data) SELECT task_id,?2,?3,?4 FROM teams WHERE id=?1",
         params![team, at, kind, data.to_string()],
@@ -2481,6 +2533,46 @@ mod tests {
             )
             .await;
         assert!(foreign.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_team_changes_wake_waiters_and_refused_writes_do_not() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let mut changes = f.store.team_changes(&f.team);
+        assert!(!changes.has_changed()?);
+        let mut refused = f
+            .message(
+                "r",
+                MessagePurpose::Question,
+                Some(reviewer.clone()),
+                "stale",
+            )
+            .await?;
+        refused.expected_revision -= 1;
+        assert!(
+            f.store
+                .team_member_message(&f.team, &analyst, refused)
+                .await
+                .is_err()
+        );
+        assert!(
+            !changes.has_changed()?,
+            "a rolled-back write must not wake anyone"
+        );
+        let input = f
+            .message(
+                "q",
+                MessagePurpose::Question,
+                Some(reviewer),
+                "is input validated?",
+            )
+            .await?;
+        f.store
+            .team_member_message(&f.team, &analyst, input)
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.changed()).await??;
         Ok(())
     }
 

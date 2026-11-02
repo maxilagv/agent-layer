@@ -6,6 +6,10 @@ use layeragent_tools::TeamControl;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
+/// Re-check interval when no team change arrives: time budgets, leases and
+/// pause acknowledgement. Messages and commands wake waiters immediately.
+const FALLBACK_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub(crate) struct TeamRuntime {
     pub(crate) context: TeamActivationContext,
     store: Storage,
@@ -31,6 +35,7 @@ impl TeamRuntime {
     /// Finish an in-flight operation, then wait without starting further work.
     /// Heartbeats preserve the same activation and canonical session on resume.
     pub(crate) async fn boundary(&self) -> Result<bool> {
+        let mut changes = self.store.team_changes(&self.context.team_id);
         loop {
             ensure!(
                 !self.cancel.is_cancelled(),
@@ -61,7 +66,8 @@ impl TeamRuntime {
             }
             tokio::select! {
                 _ = self.cancel.cancelled() => bail!("cooperative activation cancelled while paused"),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                Ok(()) = changes.changed() => {}
+                _ = tokio::time::sleep(FALLBACK_POLL) => {}
             }
         }
     }
@@ -568,6 +574,7 @@ impl Engine {
         let owner = new_id();
         let activation_cancel = CancellationToken::new();
         let mut jobs = JoinSet::new();
+        let mut changes = store.team_changes(&team);
         let result = async {
         loop {
             if store.team_check_time_budget(&team).await? {
@@ -719,7 +726,10 @@ impl Engine {
                         }
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                // A committed team change wakes the supervisor at once; the
+                // fallback only serves time-based limits and leases.
+                Ok(()) = changes.changed() => {}
+                _ = tokio::time::sleep(FALLBACK_POLL) => {}
             }
         }
         }.await;

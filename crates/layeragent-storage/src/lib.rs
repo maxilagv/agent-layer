@@ -140,7 +140,9 @@ impl Storage {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Box::new(move |c| {
-                let _ = tx.send(f(c));
+                let result = f(c);
+                team::publish_changes(result.is_ok());
+                let _ = tx.send(result);
             }))
             .await
             .map_err(|_| anyhow::anyhow!("database writer closed"))?;

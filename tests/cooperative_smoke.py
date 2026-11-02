@@ -75,14 +75,8 @@ class Scenario:
             return any(n == 'team_message' and a.get('purpose') == purpose and 'error' not in r
                        for n, a, r in results)
 
-        mail = []
-        for m in messages:
-            body = str(m.get('content', ''))
-            if body.startswith('Peer reference message'):
-                try:
-                    mail.append(json.loads(body.split(': ', 1)[1]))
-                except json.JSONDecodeError as error:
-                    raise AssertionError(f'invalid JSON in fixture peer message: {body!r}') from error
+        mail = [parse_mail(str(m.get('content', ''))) for m in messages
+                if str(m.get('content', '')).startswith('Peer reference message')]
 
         def received(purpose):
             return next((m for m in reversed(mail) if m['purpose'] == purpose), None)
@@ -191,6 +185,22 @@ class Model(http.server.BaseHTTPRequestHandler):
         except Exception as error:
             scenario.errors.append(str(error))
             self.send_error(500, 'scripted fixture failed')
+
+
+def parse_mail(text):
+    """Header fields and body of an incorporated peer message block."""
+    head, marker, rest = text.partition('\n--- body ---\n')
+    assert marker, f'peer message without a body block: {text!r}'
+    fields = {}
+    for line in head.splitlines()[1:]:
+        for part in line.split(' · '):
+            key, separator, value = part.partition(': ')
+            if separator:
+                fields[key] = value
+    body, closed, _ = rest.rpartition(f"\n--- end of message {fields.get('message')} ---")
+    assert closed, f'peer message without its closing marker: {text!r}'
+    return {'id': fields.get('message'), 'purpose': fields.get('purpose'),
+            'finding_id': fields.get('finding'), 'evidence_id': fields.get('evidence'), 'body': body}
 
 
 def find_daemon_pid(home):

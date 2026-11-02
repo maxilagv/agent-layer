@@ -81,6 +81,16 @@ fn call(name: &str, arguments: Value) -> Completion {
     }
 }
 
+/// Reads one `key: value` field from an incorporated message header.
+fn header(content: &str, key: &str) -> String {
+    let body = content.split("\n--- body ---\n").next().unwrap_or("");
+    body.lines()
+        .flat_map(|line| line.split(" · "))
+        .find_map(|part| part.strip_prefix(&format!("{key}: ")))
+        .unwrap_or("")
+        .to_string()
+}
+
 fn text(body: &str) -> Completion {
     Completion {
         text: body.into(),
@@ -110,7 +120,7 @@ impl TeamModel {
         let incorporated = |purpose: &str| {
             history.iter().find(|m| {
                 m.content.starts_with("Peer reference message")
-                    && m.content.contains(&format!("\"purpose\":\"{purpose}\""))
+                    && header(&m.content, "purpose") == purpose
             })
         };
         let ids = self.ids.lock().unwrap().clone();
@@ -136,16 +146,10 @@ impl TeamModel {
                     .iter()
                     .any(|m| m.tool_calls.iter().any(|c| c.name == "team_message"));
                 match incorporated("question") {
-                    Some(question) if !answered => {
-                        let payload: Value = serde_json::from_str(
-                            question.content.split_once(": ").expect("payload").1,
-                        )
-                        .expect("delivery json");
-                        call(
-                            "team_message",
-                            json!({"recipient":ids["analyst"],"purpose":"response","reply_to":payload["id"],"body":"Yes, validated in the gateway layer."}),
-                        )
-                    }
+                    Some(question) if !answered => call(
+                        "team_message",
+                        json!({"recipient":ids["analyst"],"purpose":"response","reply_to":header(&question.content, "message"),"body":"Yes, validated in the gateway layer."}),
+                    ),
                     _ => text("reviewer idle"),
                 }
             }

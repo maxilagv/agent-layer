@@ -161,6 +161,8 @@ larger than the medium share failed the turn with "turn output token budget
 exhausted", which broke the native remote `agent-edit` smoke); the resource-limit
 code no longer casts platform-specific `setrlimit` resource types; and the web
 surface's UNIX-socket daemon client and its tests are compiled only on UNIX hosts.
+Worktree paths are handed to Git without the Windows verbatim prefix, which Git
+cannot create directories under.
 These are compile and behavior fixes; macOS and Windows execution stay disabled.
 
 Known open items, not changed by this increment: one member's failed activation

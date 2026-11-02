@@ -177,62 +177,6 @@ impl Storage {
         }).await
     }
 
-    pub async fn bridge_send(
-        &self,
-        root: &str,
-        sender: Option<&str>,
-        sender_name: &str,
-        recipient: Option<&str>,
-        recipient_name: &str,
-        content: &str,
-    ) -> Result<Value> {
-        ensure!(
-            !content.trim().is_empty() && content.len() <= 65_536,
-            "bridge message must contain 1..65536 bytes"
-        );
-        let message = json!({"id":new_id(),"root_turn_id":root,"sender_agent_id":sender,"sender_name":sender_name,"recipient_agent_id":recipient,"recipient_name":recipient_name,"content":layeragent_protocol::redact::redact_text(content),"created_at":now_ms()});
-        let stored = message.clone();
-        self.write(move |db| {
-            let tx = db.transaction()?;
-            let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM bridge_messages WHERE root_turn_id=?1 AND sender_agent_id IS ?2",params![stored["root_turn_id"].as_str(),stored["sender_agent_id"].as_str()],|row|row.get(0))?;
-            ensure!(sequence <= 1024, "bridge sender message limit reached");
-            tx.execute("INSERT INTO bridge_messages(id,root_turn_id,sender_agent_id,sender_name,recipient_agent_id,recipient_name,sequence,content,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![stored["id"].as_str(),stored["root_turn_id"].as_str(),stored["sender_agent_id"].as_str(),stored["sender_name"].as_str(),stored["recipient_agent_id"].as_str(),stored["recipient_name"].as_str(),sequence,stored["content"].as_str(),stored["created_at"].as_i64()])?;
-            tx.commit()?;
-            Ok(())
-        }).await?;
-        Ok(message)
-    }
-
-    pub async fn bridge_receive(
-        &self,
-        root: &str,
-        recipient: Option<&str>,
-    ) -> Result<Option<Value>> {
-        let (root, recipient) = (root.to_string(), recipient.map(str::to_string));
-        self.write(move |db| {
-            let tx = db.transaction()?;
-            let row = tx.query_row("SELECT id,sender_agent_id,sender_name,recipient_agent_id,recipient_name,sequence,content,created_at FROM bridge_messages WHERE root_turn_id=?1 AND state='pending' AND recipient_agent_id IS ?2 AND sender_agent_id IS NOT ?2 ORDER BY created_at,sequence LIMIT 1",params![root,recipient],|row|Ok(json!({"id":row.get::<_,String>(0)?,"sender_agent_id":row.get::<_,Option<String>>(1)?,"sender_name":row.get::<_,String>(2)?,"recipient_agent_id":row.get::<_,Option<String>>(3)?,"recipient_name":row.get::<_,String>(4)?,"sequence":row.get::<_,i64>(5)?,"content":row.get::<_,String>(6)?,"created_at":row.get::<_,i64>(7)?}))).optional()?;
-            if let Some(message) = &row {
-                let changed = tx.execute("UPDATE bridge_messages SET state='delivered',delivered_at=?2 WHERE id=?1 AND state='pending'",params![message["id"].as_str(),now_ms()])?;
-                ensure!(changed == 1, "bridge message was claimed concurrently");
-            }
-            tx.commit()?;
-            Ok(row)
-        }).await
-    }
-
-    pub async fn bridge_pending(&self, root: &str) -> Result<usize> {
-        let root = root.to_string();
-        self.read(move |db| {
-            Ok(db.query_row(
-                "SELECT COUNT(*) FROM bridge_messages WHERE root_turn_id=?1 AND state='pending'",
-                [root],
-                |row| row.get::<_, i64>(0),
-            )? as usize)
-        })
-        .await
-    }
-
     pub async fn memories(
         &self,
         principal: &str,

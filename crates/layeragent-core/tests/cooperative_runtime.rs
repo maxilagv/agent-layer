@@ -289,6 +289,7 @@ async fn run_team(forge: bool, preload: usize) -> Result<(Storage, Task, Vec<(St
                     evidence_id: None,
                     reply_to: None,
                     provenance: vec![],
+                    urgent: false,
                 },
             )
             .await?;
@@ -731,6 +732,7 @@ async fn pause_drains_inference_and_each_tool_then_resumes_without_uncertain_usa
                 evidence_id: None,
                 reply_to: None,
                 provenance: vec![],
+                urgent: false,
             },
         )
         .await?;

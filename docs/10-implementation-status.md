@@ -251,7 +251,9 @@ Implemented surfaces:
   and illustration execution are rejected until their implementations exist.
 - Memory recall is bounded by count/bytes and excludes retired facts. Scoped
   storage retirement and listing exist; full terminal memory administration remains
-  pending. Bridge tables/methods are foundations only, not a working broker.
+  pending. The unused bridge mailbox methods were removed: agent-to-agent
+  messages travel only through the cooperative team bus (godeye). The
+  `bridge_messages` table stays in existing databases and is not written.
 
 Provider effort is opt-in through `effort_models`: aliases and concrete supported
 levels must be declared by the operator. Request mappings have fixture coverage;

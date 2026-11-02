@@ -304,6 +304,10 @@ pub enum MessagePurpose {
     VerificationRequest,
     Response,
     UserInstruction,
+    /// An assertion. Without an `evidence_id` it travels marked as unsupported.
+    Claim,
+    /// Transfers the sender's in-progress work item to the recipient.
+    Handoff,
 }
 impl MessagePurpose {
     pub fn as_str(self) -> &'static str {
@@ -314,6 +318,8 @@ impl MessagePurpose {
             Self::VerificationRequest => "verification_request",
             Self::Response => "response",
             Self::UserInstruction => "user_instruction",
+            Self::Claim => "claim",
+            Self::Handoff => "handoff",
         }
     }
 }
@@ -327,6 +333,8 @@ impl std::str::FromStr for MessagePurpose {
             "verification_request" => Self::VerificationRequest,
             "response" => Self::Response,
             "user_instruction" => Self::UserInstruction,
+            "claim" => Self::Claim,
+            "handoff" => Self::Handoff,
             other => anyhow::bail!("unknown message purpose {other}"),
         })
     }
@@ -386,6 +394,11 @@ pub struct TeamMessageInput {
     pub reply_to: Option<String>,
     #[serde(default)]
     pub provenance: Vec<String>,
+    /// Delivered between tool calls of a running activation, not only at the
+    /// start of its next round. Omitted when false so earlier requests replay
+    /// byte-identically.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub urgent: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

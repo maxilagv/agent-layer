@@ -651,7 +651,7 @@ impl Storage {
             )?;
             let mut messages = q
                 .query_map(params![root, team], |r| {
-                    Ok(json!({"id":r.get::<_,String>(0)?,"sender_kind":r.get::<_,String>(1)?,"sender_member_id":r.get::<_,Option<String>>(2)?,"recipient_member_id":r.get::<_,Option<String>>(3)?,"purpose":r.get::<_,String>(4)?,"body":r.get::<_,String>(5)?,"reply_to":r.get::<_,Option<String>>(6)?,"work_id":r.get::<_,Option<String>>(7)?,"finding_id":r.get::<_,Option<String>>(8)?,"evidence_id":r.get::<_,Option<String>>(9)?,"state":r.get::<_,String>(10)?,"created_at":r.get::<_,i64>(11)?,"resolved_at":r.get::<_,Option<i64>>(12)?,"depth":r.get::<_,i64>(13)?}))
+                    Ok(json!({"id":r.get::<_,String>(0)?,"sender_kind":r.get::<_,String>(1)?,"sender_member_id":r.get::<_,Option<String>>(2)?,"recipient_member_id":r.get::<_,Option<String>>(3)?,"purpose":r.get::<_,String>(4)?,"body":r.get::<_,String>(5)?,"reply_to":r.get::<_,Option<String>>(6)?,"work_id":r.get::<_,Option<String>>(7)?,"finding_id":r.get::<_,Option<String>>(8)?,"evidence_id":r.get::<_,Option<String>>(9)?,"state":r.get::<_,String>(10)?,"created_at":r.get::<_,i64>(11)?,"resolved_at":r.get::<_,Option<i64>>(12)?,"depth":r.get::<_,i64>(13)?})).map(|mut v| { v["supported"] = json!(supported(&v)); v })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(q);
@@ -1473,6 +1473,11 @@ impl Storage {
 
 /// The whitelist prevents dynamic SQL identifiers from being caller controlled.
 /// Whitelisted resource name to table and team predicate; never interpolates input.
+/// A claim is supported only when it points at a runtime evidence receipt.
+fn supported(message: &Value) -> bool {
+    message["purpose"] != "claim" || !message["evidence_id"].is_null()
+}
+
 fn resource_table(resource: &str) -> Result<(&'static str, &'static str)> {
     let table = match resource {
         "messages" => "team_messages",
@@ -1540,6 +1545,9 @@ fn resource_rows(
                 );
             }
             let mut value = Value::Object(map);
+            if resource == "messages" {
+                value["supported"] = json!(supported(&value));
+            }
             layeragent_protocol::redact::redact_value(&mut value);
             Ok((row.get::<_, i64>(0)?, value))
         })?
@@ -1660,6 +1668,13 @@ fn send_message(
             ensure!(exists, "message reference is outside this team");
         }
     }
+    if input.purpose == MessagePurpose::Handoff {
+        ensure!(sender_kind == "member", "only a member can hand off work");
+        ensure!(
+            input.recipient.is_some() && input.work_id.is_some(),
+            "a handoff requires a recipient and a work_id"
+        );
+    }
     if matches!(
         state.as_str(),
         "closing" | "terminated" | "cancelled" | "failed"
@@ -1747,6 +1762,17 @@ fn send_message(
         !recipients.is_empty(),
         "message has no deliverable recipients"
     );
+    if input.purpose == MessagePurpose::Handoff {
+        let (assignee, work_state): (Option<String>, String) = c.query_row(
+            "SELECT assignee,state FROM team_work WHERE id=?1 AND team_id=?2",
+            params![input.work_id, team],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        ensure!(
+            work_state == "in_progress" && assignee.as_deref() == sender,
+            "only the member working on an in-progress item can hand it off"
+        );
+    }
     let pending: i64 = c.query_row(
         "SELECT count(*) FROM team_deliveries WHERE team_id=?1 AND state='accepted'",
         [team],
@@ -1769,6 +1795,11 @@ fn send_message(
     for recipient in &recipients {
         c.execute("INSERT INTO team_deliveries(id,team_id,message_id,recipient_member_id,created_at) VALUES(?1,?2,?3,?4,?5)", params![new_id(), team, id, recipient, at])?;
     }
+    if input.purpose == MessagePurpose::Handoff {
+        // The transfer commits with the message: the recipient owns the work
+        // (pending, as assigned work is created) and the sender is released.
+        tx_handoff(c, team, sender, &input, &id, at)?;
+    }
     if input.purpose == MessagePurpose::Response
         && let Some(reply) = &input.reply_to
     {
@@ -1778,7 +1809,8 @@ fn send_message(
             params![reply, at, team, sender],
         )?;
     }
-    let result = json!({"id":id,"state":"accepted","deliveries":recipients.len(),"created_at":at});
+    let supported = input.purpose != MessagePurpose::Claim || input.evidence_id.is_some();
+    let result = json!({"id":id,"state":"accepted","deliveries":recipients.len(),"supported":supported,"created_at":at});
     save_operation(
         c,
         team,
@@ -1794,10 +1826,40 @@ fn send_message(
         c,
         team,
         "team_message_accepted",
-        json!({"message_id":id,"sender":actor,"recipient":input.recipient,"purpose":input.purpose,"deliveries":recipients.len()}),
+        json!({"message_id":id,"sender":actor,"recipient":input.recipient,"purpose":input.purpose,"deliveries":recipients.len(),"supported":supported}),
         at,
     )?;
     Ok(result)
+}
+
+fn tx_handoff(
+    c: &Connection,
+    team: &str,
+    sender: Option<&str>,
+    input: &TeamMessageInput,
+    message: &str,
+    at: i64,
+) -> Result<()> {
+    let (work, recipient) = (
+        input.work_id.as_deref().context("work_id")?,
+        input.recipient.as_deref().context("recipient")?,
+    );
+    let changed = c.execute(
+        "UPDATE team_work SET assignee=?2,state='pending',revision=revision+1,updated_at=?3 WHERE id=?1 AND team_id=?4 AND state='in_progress' AND assignee IS ?5",
+        params![work, recipient, at, team, sender],
+    )?;
+    ensure!(changed == 1, TeamConflict);
+    c.execute(
+        "UPDATE team_members SET current_work_id=NULL,work_state='idle',updated_at=?2 WHERE id=?1 AND current_work_id IS ?3",
+        params![sender, at, work],
+    )?;
+    event(
+        c,
+        team,
+        "team_work_handed_off",
+        json!({"work_id":work,"from":sender,"to":recipient,"message_id":message}),
+        at,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2041,7 +2103,26 @@ mod tests {
                 evidence_id: None,
                 reply_to: None,
                 provenance: vec![],
+                urgent: false,
             })
+        }
+
+        async fn handoff(
+            &self,
+            key: &str,
+            work: Option<String>,
+            to: &str,
+        ) -> Result<TeamMessageInput> {
+            let mut input = self
+                .message(
+                    key,
+                    MessagePurpose::Handoff,
+                    Some(to.into()),
+                    "this half is yours",
+                )
+                .await?;
+            input.work_id = work;
+            Ok(input)
         }
 
         async fn activation(&self, member: &str) -> Result<(String, String)> {
@@ -2320,6 +2401,165 @@ mod tests {
             )
             .await;
         assert!(foreign.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_handoff_transfers_in_progress_work_and_releases_the_sender() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let (coordinator, analyst, reviewer) = (
+            f.member("coordinator").await?,
+            f.member("analyst").await?,
+            f.member("reviewer").await?,
+        );
+        let work = f
+            .store
+            .team_create_work(
+                &f.team,
+                &coordinator,
+                TeamWorkInput {
+                    idempotency_key: "w".into(),
+                    expected_revision: f.revision().await?,
+                    title: "trace auth".into(),
+                    deliverable: "path".into(),
+                    assignee: None,
+                    dependencies: vec![],
+                    priority: 1,
+                    close_conditions: "each hop has evidence".into(),
+                },
+            )
+            .await?;
+        let id = work["id"].as_str().context("id")?.to_string();
+        f.store.team_claim_work(&f.team, &analyst, &id, 1).await?;
+        let missing = f
+            .store
+            .team_member_message(&f.team, &analyst, f.handoff("h0", None, &reviewer).await?)
+            .await;
+        assert!(
+            missing
+                .expect_err("work_id required")
+                .to_string()
+                .contains("requires")
+        );
+        let foreign = f
+            .store
+            .team_member_message(
+                &f.team,
+                &reviewer,
+                f.handoff("h1", Some(id.clone()), &coordinator).await?,
+            )
+            .await;
+        assert!(
+            foreign
+                .expect_err("only the owner hands off")
+                .to_string()
+                .contains("only the member working")
+        );
+        f.store
+            .team_member_message(
+                &f.team,
+                &analyst,
+                f.handoff("h2", Some(id.clone()), &reviewer).await?,
+            )
+            .await?;
+        let rows = f
+            .store
+            .team_resource(&f.scope, &f.task, "work", 0, 200)
+            .await?
+            .0;
+        let row = rows
+            .iter()
+            .find(|w| w["id"] == id.as_str())
+            .context("work")?;
+        assert_eq!(
+            (row["assignee"].as_str(), row["state"].as_str()),
+            (Some(reviewer.as_str()), Some("pending"))
+        );
+        let snapshot = f.store.team_snapshot_by_id(&f.team).await?;
+        let sender = snapshot
+            .members
+            .iter()
+            .find(|m| m["id"] == analyst.as_str())
+            .context("analyst")?;
+        assert!(sender["current_work_id"].is_null(), "{sender}");
+        assert!(
+            f.store
+                .team_claim_work(&f.team, &analyst, &id, 3)
+                .await
+                .is_err()
+        );
+        f.store.team_claim_work(&f.team, &reviewer, &id, 3).await?;
+        let events = f
+            .store
+            .team_resource(&f.scope, &f.task, "events", 0, 200)
+            .await?
+            .0;
+        assert!(events.iter().any(|e| e["kind"] == "team_work_handed_off"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claims_without_evidence_reach_peers_marked_unsupported() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let bare = f
+            .message(
+                "c1",
+                MessagePurpose::Claim,
+                Some(reviewer.clone()),
+                "the gateway rejects anonymous calls",
+            )
+            .await?;
+        let sent = f.store.team_member_message(&f.team, &analyst, bare).await?;
+        assert_eq!(sent["supported"], false);
+        let evidence = f
+            .store
+            .team_record_evidence(
+                &f.team,
+                &analyst,
+                EvidenceRecord {
+                    snapshot: "a".repeat(64),
+                    tool: "shell".into(),
+                    invocation: "true".into(),
+                    exit_code: Some(0),
+                    expectation_met: true,
+                    ..Default::default()
+                },
+            )
+            .await?["id"]
+            .as_str()
+            .context("id")?
+            .to_string();
+        let mut backed = f
+            .message(
+                "c2",
+                MessagePurpose::Claim,
+                Some(reviewer.clone()),
+                "and here is the receipt",
+            )
+            .await?;
+        backed.evidence_id = Some(evidence);
+        let sent = f
+            .store
+            .team_member_message(&f.team, &analyst, backed)
+            .await?;
+        assert_eq!(sent["supported"], true);
+        let messages = f
+            .store
+            .team_resource(&f.scope, &f.task, "messages", 0, 200)
+            .await?
+            .0;
+        let flags: Vec<_> = messages
+            .iter()
+            .filter(|m| m["purpose"] == "claim")
+            .map(|m| m["supported"].clone())
+            .collect();
+        assert_eq!(flags, vec![json!(false), json!(true)]);
+        let thread = f
+            .store
+            .team_thread(&f.scope, &f.task, sent["id"].as_str().context("id")?)
+            .await?;
+        assert_eq!(thread["messages"][0]["supported"], true);
         Ok(())
     }
 

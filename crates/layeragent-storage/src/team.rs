@@ -986,16 +986,49 @@ impl Storage {
         .await
     }
 
-    /// Whether an urgent delivery waits for this member. The engine checks it
-    /// before each tool call of a running activation.
-    pub async fn team_urgent_pending(&self, team: &str, member: &str) -> Result<bool> {
+    /// Whether a delivery waits for this member; with `urgent_only`, only an
+    /// urgent one. The engine checks urgency before each tool call.
+    pub async fn team_pending_for(
+        &self,
+        team: &str,
+        member: &str,
+        urgent_only: bool,
+    ) -> Result<bool> {
         let (team, member) = (team.to_string(), member.to_string());
         self.read(move |c| {
             Ok(c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM team_deliveries d JOIN team_messages m ON m.id=d.message_id WHERE d.team_id=?1 AND d.recipient_member_id=?2 AND d.state='accepted' AND m.urgent=1)",
-                params![team, member],
+                "SELECT EXISTS(SELECT 1 FROM team_deliveries d JOIN team_messages m ON m.id=d.message_id WHERE d.team_id=?1 AND d.recipient_member_id=?2 AND d.state='accepted' AND (?3=0 OR m.urgent=1))",
+                params![team, member, urgent_only],
                 |r| r.get(0),
             )?)
+        })
+        .await
+    }
+
+    /// Whether waiting in place for an answer can succeed: the member has an
+    /// open question or verification request, and some recipient is already
+    /// running or a concurrency slot is free for one to start. Waiting without
+    /// that would only hold the slot the answer needs.
+    pub async fn team_reply_possible(&self, team: &str, member: &str) -> Result<(bool, bool)> {
+        let (team, member) = (team.to_string(), member.to_string());
+        self.read(move |c| {
+            let open = "FROM team_messages q WHERE q.team_id=?1 AND q.sender_member_id=?2 AND q.state='accepted' AND q.purpose IN ('question','verification_request') AND q.resolved_at IS NULL AND NOT EXISTS(SELECT 1 FROM team_messages r WHERE r.team_id=q.team_id AND r.reply_to=q.id AND r.purpose='response' AND r.state='accepted')";
+            let waiting: bool = c.query_row(&format!("SELECT EXISTS(SELECT 1 {open})"), params![team, member], |r| r.get(0))?;
+            if !waiting {
+                return Ok((false, false));
+            }
+            let responder_live: bool = c.query_row(
+                &format!("SELECT EXISTS(SELECT 1 {open} AND EXISTS(SELECT 1 FROM team_deliveries d JOIN team_activations a ON a.member_id=d.recipient_member_id WHERE d.message_id=q.id AND a.state IN ('starting','running')))"),
+                params![team, member],
+                |r| r.get(0),
+            )?;
+            let running: i64 = c.query_row(
+                "SELECT count(*) FROM team_activations WHERE team_id=?1 AND state IN ('starting','running')",
+                [&team],
+                |r| r.get(0),
+            )?;
+            let slot_free = (running as usize) < options(c, &team)?.limits.max_concurrency;
+            Ok((true, responder_live || slot_free))
         })
         .await
     }

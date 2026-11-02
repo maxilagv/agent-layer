@@ -1185,7 +1185,7 @@ impl Engine {
                     && !deferred
                     && urgent_interrupts < MAX_URGENT_INTERRUPTS
                     && store
-                        .team_urgent_pending(&team.context.team_id, &team.context.member_id)
+                        .team_pending_for(&team.context.team_id, &team.context.member_id, true)
                         .await?
                 {
                     deferred = true;

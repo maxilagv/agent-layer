@@ -67,6 +67,10 @@ struct TeamModel {
     log: Arc<Mutex<Vec<(String, String)>>>,
     /// Sender identity the analyst tries to forge in its message arguments.
     forge: bool,
+    /// When set, the analyst waits in place for the answer this many seconds.
+    reply_wait: Option<u64>,
+    /// The reviewer takes a moment before answering.
+    slow_answer: bool,
 }
 
 fn call(name: &str, arguments: Value) -> Completion {
@@ -136,7 +140,11 @@ impl TeamModel {
                     }
                     call("team_message", args)
                 } else if last_tool.as_deref() == Some("team_message") {
-                    call("team_wait", json!({"reason":"awaiting reviewer answer"}))
+                    let mut args = json!({"reason":"awaiting reviewer answer"});
+                    if let Some(seconds) = self.reply_wait {
+                        args["reply_timeout_secs"] = json!(seconds);
+                    }
+                    call("team_wait", args)
                 } else {
                     text("waiting for reviewer")
                 }
@@ -186,7 +194,16 @@ impl LanguageModel for TeamModel {
         _: tokio_util::sync::CancellationToken,
         _: mpsc::Sender<Delta>,
     ) -> Result<Completion> {
-        Ok(self.decide(messages).1)
+        let (name, completion) = self.decide(messages);
+        // A slow reviewer makes the asker's choice observable: release the
+        // slot and be activated again, or wait in place for the answer.
+        if self.slow_answer
+            && name == "reviewer"
+            && completion.calls.iter().any(|c| c.name == "team_message")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        Ok(completion)
     }
 
     async fn infer_admitted(
@@ -241,6 +258,16 @@ async fn cooperative_task(
 }
 
 async fn run_team(forge: bool, preload: usize) -> Result<(Storage, Task, Vec<(String, String)>)> {
+    run_team_with(forge, preload, 1, None, false).await
+}
+
+async fn run_team_with(
+    forge: bool,
+    preload: usize,
+    concurrency: usize,
+    reply_wait: Option<u64>,
+    slow_answer: bool,
+) -> Result<(Storage, Task, Vec<(String, String)>)> {
     let home = tempfile::tempdir()?;
     let workspace = tempfile::tempdir()?;
     let ids = Arc::new(Mutex::new(BTreeMap::new()));
@@ -253,16 +280,18 @@ async fn run_team(forge: bool, preload: usize) -> Result<(Storage, Task, Vec<(St
             ids: ids.clone(),
             log: log.clone(),
             forge,
+            reply_wait,
+            slow_answer,
         }),
         Arc::new(NoopSandbox),
     )?;
     let scope = Scope::local();
     let store = engine.store(&scope).await?;
-    // One concurrency slot: asking and answering must not deadlock.
+    // With one slot, asking and answering must not deadlock.
     let options = CooperativeOptions {
         limits: TeamLimits {
             max_members: 3,
-            max_concurrency: 1,
+            max_concurrency: concurrency,
             ..TeamLimits::default()
         },
         ..Default::default()
@@ -387,6 +416,69 @@ async fn peers_exchange_directly_with_one_slot_and_close_without_a_final_model_c
     assert_eq!(snapshot.reservations["uncertain_tokens"], 0);
     // Closing was finalized by the supervisor, not by an extra model turn.
     assert_eq!(log.last().map(|(who, _)| who.as_str()), Some("coordinator"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_answer_awaited_in_place_does_not_cost_the_asker_a_new_activation() -> Result<()> {
+    let activations = |store: Storage, team: String| async move {
+        Ok::<_, anyhow::Error>(
+            store
+                .team_members(&team)
+                .await?
+                .into_iter()
+                .find(|m| m["name"] == "analyst")
+                .and_then(|m| m["activations"].as_i64())
+                .unwrap_or_default(),
+        )
+    };
+    let (store, task, _) = run_team_with(false, 0, 2, None, true).await?;
+    assert_eq!(task.state, TaskState::Completed);
+    let released = activations(store, task.team_id.unwrap()).await?;
+    assert_eq!(
+        released, 2,
+        "finishing to wait means a second activation for the answer"
+    );
+
+    let (store, task, log) = run_team_with(false, 0, 2, Some(10), true).await?;
+    assert_eq!(task.state, TaskState::Completed);
+    let team = task.team_id.clone().unwrap();
+    assert_eq!(activations(store.clone(), team.clone()).await?, 1);
+    let analyst = store
+        .team_members(&team)
+        .await?
+        .into_iter()
+        .find(|m| m["name"] == "analyst")
+        .unwrap();
+    let history = store
+        .history_since(analyst["session_id"].as_str().unwrap(), 0)
+        .await?;
+    assert!(
+        history
+            .iter()
+            .any(|(_, m)| m.role == "tool" && m.content.contains("\"waited\":true"))
+    );
+    assert!(log.contains(&("analyst".into(), "text".into())), "{log:?}");
+
+    // With a single slot the asker would only block the answer: it is told to
+    // release instead of waiting.
+    let (store, task, _) = run_team_with(false, 0, 1, Some(10), false).await?;
+    assert_eq!(task.state, TaskState::Completed);
+    let team = task.team_id.clone().unwrap();
+    let analyst = store
+        .team_members(&team)
+        .await?
+        .into_iter()
+        .find(|m| m["name"] == "analyst")
+        .unwrap();
+    let history = store
+        .history_since(analyst["session_id"].as_str().unwrap(), 0)
+        .await?;
+    assert!(
+        history
+            .iter()
+            .any(|(_, m)| m.role == "tool" && m.content.contains("no free slot"))
+    );
     Ok(())
 }
 

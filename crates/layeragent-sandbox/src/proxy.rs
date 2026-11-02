@@ -154,8 +154,7 @@ impl NetworkProxy {
         decider: Option<Arc<dyn NetworkDecider>>,
         allow_private: bool,
     ) -> Result<Self> {
-        let dir =
-            std::env::temp_dir().join(format!("layeragent-net-{}", layeragent_protocol::new_id()));
+        let dir = socket_dir(&std::env::temp_dir());
         std::fs::create_dir(&dir)?;
         {
             use std::os::unix::fs::PermissionsExt;
@@ -190,6 +189,26 @@ impl NetworkProxy {
     /// Decisions made so far (bounded), for auditing and events.
     pub fn decisions(&self) -> Vec<NetworkDecision> {
         self.log.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+}
+
+/// UNIX socket paths are limited to ~104 bytes on macOS and 108 on Linux.
+#[cfg(unix)]
+const SOCKET_PATH_LIMIT: usize = 100;
+
+/// A private directory for the proxy socket whose full socket path fits the
+/// platform limit. A long temporary directory (macOS `TMPDIR`) falls back to
+/// `/tmp`; the directory name carries 64 random bits and is created exclusively.
+#[cfg(unix)]
+fn socket_dir(base: &Path) -> PathBuf {
+    let id = layeragent_protocol::new_id().replace('-', "");
+    let name = format!("layeragent-net-{}", &id[..16]);
+    let fits = |dir: &Path| dir.join("proxy.sock").as_os_str().len() <= SOCKET_PATH_LIMIT;
+    let preferred = base.join(&name);
+    if fits(&preferred) {
+        preferred
+    } else {
+        Path::new("/tmp").join(name)
     }
 }
 
@@ -486,6 +505,17 @@ mod tests {
         let mut out = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut out)).await;
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn socket_paths_fit_the_platform_limit_even_under_a_long_temporary_directory() {
+        let long = Path::new("/var/folders/s6/5hzmn6lx4dz5nxs7k_0slzph0000gn/T/nested/deeper/x");
+        let dir = socket_dir(long);
+        assert!(dir.join("proxy.sock").as_os_str().len() <= SOCKET_PATH_LIMIT);
+        assert!(dir.starts_with("/tmp"), "{dir:?}");
+        let short = socket_dir(Path::new("/tmp"));
+        assert!(short.to_string_lossy().starts_with("/tmp/layeragent-net-"));
+        assert_ne!(socket_dir(Path::new("/tmp")), short, "names are random");
     }
 
     #[tokio::test]

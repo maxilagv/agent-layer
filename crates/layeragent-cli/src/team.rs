@@ -72,6 +72,9 @@ pub enum TeamCommand {
         task: String,
         #[arg(long)]
         to: String,
+        /// Stop the recipient's current tool batch so it reads this first.
+        #[arg(long)]
+        urgent: bool,
         text: String,
     },
     Pause(Control),
@@ -154,7 +157,13 @@ pub async fn command(
         .await
 }
 
-pub async fn message(client: &Client, task: &str, to: &str, text: &str) -> Result<Value> {
+pub async fn message(
+    client: &Client,
+    task: &str,
+    to: &str,
+    text: &str,
+    urgent: bool,
+) -> Result<Value> {
     identifier(task)?;
     let snapshot = client.get(&format!("/v1/tasks/{task}/team")).await?;
     let to = recipient(&snapshot, to)?;
@@ -164,7 +173,7 @@ pub async fn message(client: &Client, task: &str, to: &str, text: &str) -> Resul
             json!({
                 "idempotency_key":layeragent_protocol::new_id(),
                 "expected_revision":snapshot["team"]["revision"],
-                "recipient":to,"purpose":"user_instruction","body":text,
+                "recipient":to,"purpose":"user_instruction","body":text,"urgent":urgent,
             }),
         )
         .await
@@ -237,7 +246,12 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
         TeamCommand::Findings(args) => client.team_resource(&args.task, "findings").await?,
         TeamCommand::Objections(args) => client.team_resource(&args.task, "objections").await?,
         TeamCommand::Evidence(args) => client.team_resource(&args.task, "evidence").await?,
-        TeamCommand::Message { task, to, text } => message(client, &task, &to, &text).await?,
+        TeamCommand::Message {
+            task,
+            to,
+            urgent,
+            text,
+        } => message(client, &task, &to, &text, urgent).await?,
         TeamCommand::Pause(args) => {
             command(
                 client,

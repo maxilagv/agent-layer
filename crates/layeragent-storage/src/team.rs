@@ -915,8 +915,8 @@ impl Storage {
         self.write(move |c| {
             let tx = c.transaction()?;
             let session: String = tx.query_row("SELECT m.session_id FROM team_activations a JOIN team_members m ON m.id=a.member_id WHERE a.id=?1 AND a.team_id=?2 AND a.member_id=?3 AND a.generation=?4 AND a.state='running' AND a.lease_expires_at>?5", params![activation, team, member, generation, now_ms()], |r| r.get(0)).context("stale activation or missing canonical session cannot incorporate messages")?;
-            let mut q = tx.prepare("SELECT d.id,m.id,m.sender_kind,m.sender_member_id,m.purpose,m.body,m.work_id,m.finding_id,m.evidence_id,m.reply_to,m.provenance,s.name,s.role FROM team_deliveries d JOIN team_messages m ON m.id=d.message_id LEFT JOIN team_members s ON s.id=m.sender_member_id WHERE d.team_id=?1 AND d.recipient_member_id=?2 AND d.state='accepted' ORDER BY d.created_at,d.id")?;
-            let rows = q.query_map(params![team, member], |r| Ok(json!({"delivery_id":r.get::<_,String>(0)?,"id":r.get::<_,String>(1)?,"sender_kind":r.get::<_,String>(2)?,"sender_member_id":r.get::<_,Option<String>>(3)?,"purpose":r.get::<_,String>(4)?,"body":r.get::<_,String>(5)?,"work_id":r.get::<_,Option<String>>(6)?,"finding_id":r.get::<_,Option<String>>(7)?,"evidence_id":r.get::<_,Option<String>>(8)?,"reply_to":r.get::<_,Option<String>>(9)?,"provenance":serde_json::from_str::<Value>(&r.get::<_,String>(10)?).unwrap_or(json!([])),"sender_name":r.get::<_,Option<String>>(11)?,"sender_role":r.get::<_,Option<String>>(12)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut q = tx.prepare("SELECT d.id,m.id,m.sender_kind,m.sender_member_id,m.purpose,m.body,m.work_id,m.finding_id,m.evidence_id,m.reply_to,m.provenance,s.name,s.role,m.urgent FROM team_deliveries d JOIN team_messages m ON m.id=d.message_id LEFT JOIN team_members s ON s.id=m.sender_member_id WHERE d.team_id=?1 AND d.recipient_member_id=?2 AND d.state='accepted' ORDER BY d.created_at,d.id")?;
+            let rows = q.query_map(params![team, member], |r| Ok(json!({"delivery_id":r.get::<_,String>(0)?,"id":r.get::<_,String>(1)?,"sender_kind":r.get::<_,String>(2)?,"sender_member_id":r.get::<_,Option<String>>(3)?,"purpose":r.get::<_,String>(4)?,"body":r.get::<_,String>(5)?,"work_id":r.get::<_,Option<String>>(6)?,"finding_id":r.get::<_,Option<String>>(7)?,"evidence_id":r.get::<_,Option<String>>(8)?,"reply_to":r.get::<_,Option<String>>(9)?,"provenance":serde_json::from_str::<Value>(&r.get::<_,String>(10)?).unwrap_or(json!([])),"sender_name":r.get::<_,Option<String>>(11)?,"sender_role":r.get::<_,Option<String>>(12)?,"urgent":r.get::<_,bool>(13)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
             drop(q);
             let at = now_ms();
             for row in &rows {
@@ -930,6 +930,20 @@ impl Storage {
             }
             tx.commit()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    /// Whether an urgent delivery waits for this member. The engine checks it
+    /// before each tool call of a running activation.
+    pub async fn team_urgent_pending(&self, team: &str, member: &str) -> Result<bool> {
+        let (team, member) = (team.to_string(), member.to_string());
+        self.read(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM team_deliveries d JOIN team_messages m ON m.id=d.message_id WHERE d.team_id=?1 AND d.recipient_member_id=?2 AND d.state='accepted' AND m.urgent=1)",
+                params![team, member],
+                |r| r.get(0),
+            )?)
         })
         .await
     }
@@ -1505,8 +1519,13 @@ fn delivery_text(row: &Value) -> String {
     let mut lines = vec![
         authority.to_string(),
         format!(
-            "from: {from} · purpose: {} · message: {id}",
-            field("purpose")
+            "from: {from} · purpose: {} · message: {id}{}",
+            field("purpose"),
+            if row["urgent"] == true {
+                " · urgent"
+            } else {
+                ""
+            }
         ),
     ];
     let references: Vec<String> = [
@@ -1852,7 +1871,7 @@ fn send_message(
     }
     let id = new_id();
     let at = now_ms();
-    c.execute("INSERT INTO team_messages(id,team_id,sender_key,sender_member_id,sender_kind,recipient_member_id,purpose,body,work_id,finding_id,evidence_id,reply_to,provenance,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![id, team, actor, sender, sender_kind, input.recipient, input.purpose.as_str(), body, input.work_id, input.finding_id, input.evidence_id, input.reply_to, serde_json::to_string(&input.provenance)?, input.idempotency_key, at])?;
+    c.execute("INSERT INTO team_messages(id,team_id,sender_key,sender_member_id,sender_kind,recipient_member_id,purpose,body,work_id,finding_id,evidence_id,reply_to,provenance,idempotency_key,created_at,urgent) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", params![id, team, actor, sender, sender_kind, input.recipient, input.purpose.as_str(), body, input.work_id, input.finding_id, input.evidence_id, input.reply_to, serde_json::to_string(&input.provenance)?, input.idempotency_key, at, input.urgent])?;
     for recipient in &recipients {
         c.execute("INSERT INTO team_deliveries(id,team_id,message_id,recipient_member_id,created_at) VALUES(?1,?2,?3,?4,?5)", params![new_id(), team, id, recipient, at])?;
     }

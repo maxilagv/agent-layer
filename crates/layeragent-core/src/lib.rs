@@ -26,6 +26,9 @@ mod session_control;
 mod workspace;
 
 mod instructions;
+/// Urgent team messages one activation honours by stopping a tool batch;
+/// later ones are incorporated at the start of the next round as usual.
+const MAX_URGENT_INTERRUPTS: u32 = 3;
 const OUTPUT_FLUSH: std::time::Duration = std::time::Duration::from_millis(50);
 const OUTPUT_FLUSH_BYTES: usize = 4096;
 /// Streamed output beyond this is dropped from events; the full result still reaches the artifact.
@@ -819,6 +822,7 @@ impl Engine {
         let mut cost_usd = 0.0;
         let mut last_effort = None;
         let mut last_compaction_boundary = None;
+        let mut urgent_interrupts = 0;
         loop {
             ensure!(!cancel.is_cancelled(), "turn cancelled");
             // A correction persisted by any client is applied only here: no tool
@@ -1169,8 +1173,45 @@ impl Engine {
                 return Ok(result);
             }
             let mut executing: Turn<ToolsPhase> = inference.advance(store).await?;
+            let mut deferred = false;
             for call in completion.calls {
                 ensure!(!cancel.is_cancelled(), "turn cancelled");
+                // An urgent team message stops the rest of this batch before its
+                // next call: the skipped calls get results that keep tool pairing
+                // valid, and the next round incorporates the message before the
+                // model plans again. A bounded number per activation keeps a
+                // noisy peer from starving the recipient.
+                if let Some(team) = &team
+                    && !deferred
+                    && urgent_interrupts < MAX_URGENT_INTERRUPTS
+                    && store
+                        .team_urgent_pending(&team.context.team_id, &team.context.member_id)
+                        .await?
+                {
+                    deferred = true;
+                    urgent_interrupts += 1;
+                    self.emit(
+                        scope,
+                        store,
+                        &session.id,
+                        Some(turn_id),
+                        "team_urgent_interrupt",
+                        json!({"member_id":team.context.member_id,"first_skipped_call":call.id,"interrupts":urgent_interrupts}),
+                    )
+                    .await?;
+                }
+                if deferred {
+                    store
+                        .message(
+                            &session.id,
+                            &Message::tool(
+                                &call,
+                                &json!({"error":"not executed: an urgent team message arrived before this call. Read it in your next message, then re-issue the call if it is still needed."}),
+                            ),
+                        )
+                        .await?;
+                    continue;
+                }
                 if let Some(team) = &team
                     && !team.boundary().await?
                 {

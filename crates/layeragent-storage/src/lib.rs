@@ -62,6 +62,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/006_cooperative_teams.sql"),
     include_str!("migrations/007_cooperative_terminal.sql"),
     include_str!("migrations/008_team_bus_indexes.sql"),
+    include_str!("migrations/009_team_urgent_messages.sql"),
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

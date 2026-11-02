@@ -786,6 +786,71 @@ async fn pause_drains_inference_and_each_tool_then_resumes_without_uncertain_usa
 }
 
 #[tokio::test]
+async fn an_urgent_message_stops_the_rest_of_a_batch_and_is_read_before_the_next_plan() -> Result<()>
+{
+    let f = BoundaryFixture::new(false).await?;
+    let (_, job) = f.start();
+    wait_count(&f.inference_calls, 1).await?;
+    let snapshot = f.store.team_snapshot(&Scope::local(), &f.task.id).await?;
+    let member = &snapshot.members[0];
+    let session = member["session_id"].as_str().unwrap().to_string();
+    let note = "stop: the second operation targets the wrong host";
+    f.store
+        .team_user_message(
+            &Scope::local(),
+            &f.task.id,
+            TeamMessageInput {
+                idempotency_key: new_id(),
+                expected_revision: snapshot.revision,
+                recipient: Some(member["id"].as_str().unwrap().into()),
+                purpose: MessagePurpose::UserInstruction,
+                body: note.into(),
+                work_id: None,
+                finding_id: None,
+                evidence_id: None,
+                reply_to: None,
+                provenance: vec![],
+                urgent: true,
+            },
+        )
+        .await?;
+    // The planned batch was produced without the message; none of it runs.
+    f.inference_release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(10), job).await???;
+    assert_eq!(f.tool_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        f.inference_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    let history: Vec<_> = f
+        .store
+        .history_since(&session, 0)
+        .await?
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect();
+    let skipped: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "tool" && m.content.contains("urgent team message arrived"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(skipped.len(), 2, "{history:?}");
+    let read = history
+        .iter()
+        .position(|m| m.content.contains(note))
+        .expect("urgent message incorporated");
+    assert!(read > skipped[1], "the message follows the paired results");
+    assert!(history[read].content.contains(" · urgent"));
+    let events = f.store.task_events(&f.task.id, 0, 1000).await?;
+    assert!(
+        events.iter().any(|e| e["kind"] == "team_urgent_interrupt"
+            || e["data"]["kind"] == "team_urgent_interrupt")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn member_approval_is_attributed_to_parent_task_and_pause_still_gates_approved_tool()
 -> Result<()> {
     let f = BoundaryFixture::new(true).await?;

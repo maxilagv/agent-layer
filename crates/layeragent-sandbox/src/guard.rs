@@ -1,5 +1,7 @@
 //! Platform-independent decisions about what a sandbox must hide or freeze.
-#![cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+// Only the Linux mount plan resolves roots and scans guards; other platforms use
+// the shared types only, in production and in test builds alike.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 use anyhow::{Result, ensure};
 use layeragent_config::Policy;
 use std::path::{Path, PathBuf};

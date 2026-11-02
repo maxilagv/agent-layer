@@ -414,12 +414,10 @@ impl Tracker {
         Ok(changes(&self.baseline, &self.current))
     }
 
-    #[cfg(test)]
+    /// Only the Linux inotify test asserts which refresh path is under test.
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn watching(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        return self.watcher.is_some();
-        #[cfg(not(target_os = "linux"))]
-        false
+        self.watcher.is_some()
     }
 }
 

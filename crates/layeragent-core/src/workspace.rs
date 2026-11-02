@@ -80,6 +80,15 @@ fn stamp_of(meta: &std::fs::Metadata) -> Stamp {
     }
 }
 
+/// A workspace-relative path with `/` separators on every platform, matching the
+/// file tools, Git and diff headers. On Linux and macOS this is the path as is.
+pub(crate) fn portable(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn excluded_name(name: &str) -> bool {
     layeragent_config::is_secret_path_component(name) || EXCLUDED.contains(&name)
 }
@@ -394,11 +403,12 @@ impl Tracker {
             .files
             .iter()
             .map(|(path, state)| {
-                digest.update(path.to_string_lossy().as_bytes());
+                let path = portable(path);
+                digest.update(path.as_bytes());
                 digest.update([0]);
                 digest.update(state.hash.as_bytes());
                 digest.update([0]);
-                json!({"path":path.to_string_lossy(),"sha256":state.hash,"bytes":state.bytes})
+                json!({"path":path,"sha256":state.hash,"bytes":state.bytes})
             })
             .collect::<Vec<_>>();
         Ok(json!({
@@ -549,7 +559,8 @@ fn render<'a>(
         } else {
             "modified"
         };
-        files.push(json!({"path":path.to_string_lossy(),"kind":kind,"before_sha256":old.map(|s| &s.hash),"after_sha256":new.map(|s| &s.hash),"before_bytes":old.map(|s| s.bytes),"after_bytes":new.map(|s| s.bytes)}));
+        let shown = portable(path);
+        files.push(json!({"path":shown,"kind":kind,"before_sha256":old.map(|s| &s.hash),"after_sha256":new.map(|s| &s.hash),"before_bytes":old.map(|s| s.bytes),"after_bytes":new.map(|s| s.bytes)}));
         let old_text = old.map(|s| s.text.as_deref()).unwrap_or(Some(""));
         let new_text = new.map(|s| s.text.as_deref()).unwrap_or(Some(""));
         if diff.len() >= DIFF_LIMIT {
@@ -560,10 +571,7 @@ fn render<'a>(
             (Some(x), Some(y)) => {
                 let rendered = similar::TextDiff::from_lines(x, y)
                     .unified_diff()
-                    .header(
-                        &format!("a/{}", path.display()),
-                        &format!("b/{}", path.display()),
-                    )
+                    .header(&format!("a/{shown}"), &format!("b/{shown}"))
                     .to_string();
                 if diff.len() + rendered.len() <= DIFF_LIMIT {
                     diff.push_str(&rendered);
@@ -572,8 +580,7 @@ fn render<'a>(
                 }
             }
             _ => diff.push_str(&format!(
-                "{kind}: {} (binary or large file; see SHA-256 manifest)\n",
-                path.display()
+                "{kind}: {shown} (binary or large file; see SHA-256 manifest)\n"
             )),
         }
     }

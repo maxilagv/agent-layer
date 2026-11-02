@@ -89,8 +89,14 @@ async fn call(
 #[tokio::test]
 async fn create_replay_and_conflict_have_distinct_status_codes() -> Result<()> {
     let (app, home) = app()?;
-    let workspace = tempfile::tempdir()?;
-    let workspace = workspace.path().to_string_lossy().into_owned();
+    let directory = tempfile::tempdir()?;
+    // The task records the canonical project path (on macOS the temporary
+    // directory is reached through the /var -> /private/var symlink).
+    let workspace = directory
+        .path()
+        .canonicalize()?
+        .to_string_lossy()
+        .into_owned();
     let body = json!({"workspace": workspace, "objective": "build it", "executor": "local"});
     let (status, first) = call(&app, "POST", "/v1/tasks", Some("key-1"), body.clone()).await?;
     assert_eq!(status, StatusCode::CREATED);

@@ -50,7 +50,9 @@ def main():
                         pass
                 if predicate():
                     return
-                if process.poll() is not None:
+                # Re-check after observing an exit: the process may have exited
+                # between the predicate and the poll, which is not early.
+                if process.poll() is not None and not predicate():
                     raise AssertionError(f'TUI exited early: {captured[-2000:]!r}')
             raise AssertionError(f'TUI timeout: {captured[-2000:]!r}')
 

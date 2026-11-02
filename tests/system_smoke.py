@@ -61,6 +61,28 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self.socket_path)
 
 
+def find_daemon_pid(home):
+    """PID of the IPC daemon serving `home`, via /proc or, where absent, ps."""
+    if pathlib.Path('/proc').is_dir():
+        for entry in pathlib.Path('/proc').iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                argv = (entry / 'cmdline').read_bytes().split(b'\0')
+            except OSError:
+                continue
+            if str(home).encode() in argv and b'serve' in argv and b'--ipc-only' in argv:
+                return int(entry.name)
+        return None
+    listing = subprocess.run(['ps', '-axww', '-o', 'pid=,args='], capture_output=True, text=True, check=True)
+    for line in listing.stdout.splitlines():
+        pid, _, args = line.strip().partition(' ')
+        argv = args.split()
+        if str(home) in argv and 'serve' in argv and '--ipc-only' in argv:
+            return int(pid)
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', default='target/debug/layeragent')
@@ -170,17 +192,7 @@ def main():
                 time.sleep(.05)
             else:
                 raise AssertionError('slow task never started')
-            daemon_pid = None
-            for entry in pathlib.Path('/proc').iterdir():
-                if not entry.name.isdigit():
-                    continue
-                try:
-                    argv = (entry / 'cmdline').read_bytes().split(b'\0')
-                except OSError:
-                    continue
-                if str(home).encode() in argv and b'serve' in argv and b'--ipc-only' in argv:
-                    daemon_pid = int(entry.name)
-                    break
+            daemon_pid = find_daemon_pid(home)
             assert daemon_pid, 'daemon process not found'
             os.kill(daemon_pid, signal.SIGKILL)
             time.sleep(.5)

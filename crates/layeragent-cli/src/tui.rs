@@ -135,6 +135,15 @@ async fn interface(
             },
             Some((generation, event)) = rx.recv() => {
                 if generation != view_generation { continue; }
+                if event["kind"] == "ui_correction" {
+                    if let Some(error) = event["error"].as_str() {
+                        app.restore_draft(event["instruction"].as_str().unwrap_or_default());
+                        app.note(&format!("Corrección no enviada: {error}"));
+                    } else {
+                        app.note("Corrección pendiente: se aplicará en el próximo punto seguro.");
+                    }
+                    continue;
+                }
                 if let Some(id) = event["job_id"].as_str() {
                     job = Some(id.to_string());
                     if cancel_on_start {
@@ -165,6 +174,25 @@ async fn interface(
                     Ok(value) => app.note(&format!("Esfuerzo de sesión: {}. Se aplica entre operaciones, salvo override de tarea.", value["effort"])),
                     Err(error) => app.note(&format!("No se pudo consultar o cambiar el esfuerzo: {error}")),
                 }
+            }
+            Action::Correct(instruction) => {
+                let client = client.clone();
+                let task = job.clone();
+                let output = tx.clone();
+                let generation = view_generation;
+                tokio::spawn(async move {
+                    let result = async {
+                        let task = task.as_deref().ok_or_else(|| anyhow::anyhow!("La tarea aún no tiene identidad; vuelve a enviar la corrección."))?;
+                        let observed = client.get(&format!("/v1/tasks/{task}")).await?;
+                        let revision = observed["revision"].as_i64().ok_or_else(|| anyhow::anyhow!("Falta la revisión de la tarea"))?;
+                        client.post(&format!("/v1/tasks/{task}/correct"), json!({"instruction":instruction,"expected_revision":revision})).await
+                    }.await;
+                    let event = match result {
+                        Ok(_) => json!({"kind":"ui_correction"}),
+                        Err(error) => json!({"kind":"ui_correction","instruction":instruction,"error":error.to_string()}),
+                    };
+                    let _ = output.send((generation, event)).await;
+                });
             }
             Action::Send(prompt) => {
                 cancel_on_start = false;

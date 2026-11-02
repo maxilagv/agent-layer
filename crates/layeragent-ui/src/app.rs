@@ -77,6 +77,7 @@ pub enum Key {
 pub enum Action {
     None,
     Send(String),
+    Correct(String),
     Cancel,
     Approve {
         id: String,
@@ -279,27 +280,27 @@ impl App {
     }
 
     fn submit(&mut self, text: String) -> Action {
-        let text = text.trim().to_string();
+        let text = crate::commands::canonical(text.trim());
         self.reset_input();
         if text.is_empty() {
             return Action::None;
         }
         match text.as_str() {
-            "/help" | "/ayuda" | "/?" => {
+            "/help" => {
                 self.help = !self.help;
                 return Action::None;
             }
-            "/exit" | "/salir" | "/quit" => {
+            "/exit" => {
                 self.begin_farewell();
                 return Action::None;
             }
-            "/clear" | "/limpiar" => {
+            "/clear" => {
                 self.entries.clear();
                 self.streaming.clear();
                 self.scroll = 0;
                 return Action::None;
             }
-            "/new" | "/nuevo" => {
+            "/new" => {
                 if self.busy {
                     self.note("Espera a que termine o cancela antes de crear otra sesión.");
                     return Action::None;
@@ -376,10 +377,8 @@ impl App {
             return Action::None;
         }
         if self.busy {
-            self.note(
-                "El agente sigue trabajando: espera a que termine o pulsa Esc para cancelar.",
-            );
-            return Action::None;
+            self.sent.push(text.clone());
+            return Action::Correct(text);
         }
         self.help = false;
         self.team = None;
@@ -547,6 +546,13 @@ impl App {
                 self.card = d as usize - '1' as usize;
                 self.submit(STARTERS[self.card].2.to_string())
             }
+            Key::Tab if self.input_text().starts_with('/') => {
+                if let Some(command) = crate::commands::complete(&self.input_text()) {
+                    self.input = command.chars().collect();
+                    self.cursor = self.input.len();
+                }
+                Action::None
+            }
             Key::Tab if self.input.is_empty() => {
                 self.card = (self.card + 1) % STARTERS.len();
                 Action::None
@@ -674,6 +680,16 @@ impl App {
         }
     }
 
+    pub fn restore_draft(&mut self, text: &str) {
+        if self.input.is_empty() {
+            self.input = text.chars().collect();
+            self.cursor = self.input.len();
+        } else {
+            self.entries
+                .push(Entry::Note(format!("Texto no enviado: {text}")));
+        }
+    }
+
     fn flush_stream(&mut self) {
         if !self.streaming.trim().is_empty() {
             let text = std::mem::take(&mut self.streaming);
@@ -691,6 +707,17 @@ impl App {
 
     /// Applies one event from the runtime's stream.
     pub fn on_event(&mut self, event: &Value) {
+        if event["kind"] == "task_correction_queued" {
+            if let Some(text) = event["data"]["instruction"].as_str() {
+                self.entries.push(Entry::User(text.to_string()));
+            }
+            self.note("Corrección en cola.");
+            return;
+        }
+        if event["kind"] == "task_correction_applied" {
+            self.note("Corrección aplicada en un punto seguro.");
+            return;
+        }
         if event["kind"] == "team_snapshot" {
             let value = event["data"].clone();
             let changed_task = self
@@ -1168,17 +1195,43 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_cancels_work_before_it_quits_and_enter_is_ignored_while_busy() {
+    fn ctrl_c_cancels_work_and_enter_corrects_while_busy() {
         let mut a = app();
         type_str(&mut a, "x");
         a.on_key(Key::Enter);
         type_str(&mut a, "otra");
-        assert_eq!(a.on_key(Key::Enter), Action::None);
+        assert_eq!(a.on_key(Key::Enter), Action::Correct("otra".into()));
         assert_eq!(a.on_key(Key::Ctrl('c')), Action::Cancel);
         assert!(!a.leaving());
         a.on_event(&json!({"error":"cancelado"}));
         a.on_key(Key::Ctrl('c'));
         assert!(a.leaving());
+    }
+
+    #[test]
+    fn completion_and_corrections_preserve_user_text() {
+        let mut a = app();
+        type_str(&mut a, "/comp");
+        a.on_key(Key::Tab);
+        assert_eq!(a.input_text(), "/compact");
+        a.on_key(Key::Esc);
+        a.submit("first request".into());
+        assert_eq!(
+            a.submit("keep  spaces".into()),
+            Action::Correct("keep  spaces".into())
+        );
+        a.restore_draft("retry this");
+        assert_eq!(a.input_text(), "retry this");
+        a.restore_draft("another rejected correction");
+        assert_eq!(a.input_text(), "retry this");
+        a.on_event(&json!({"kind":"task_correction_queued","data":{"instruction":"change goal"}}));
+        assert!(
+            a.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::User(text) if text == "change goal"))
+        );
+        a.on_event(&json!({"kind":"task_correction_applied","data":{}}));
+        assert!(a.busy);
     }
 
     #[test]

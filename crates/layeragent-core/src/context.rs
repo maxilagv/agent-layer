@@ -44,6 +44,17 @@ pub(crate) async fn history(
     Ok((messages, checkpoint))
 }
 
+/// Only cover complete prior requests; retain the current request verbatim.
+pub(crate) fn completed_request_boundary(rows: &[(i64, Message)]) -> Option<i64> {
+    let index = rows
+        .iter()
+        .rposition(|(_, message)| message.role == "user")?;
+    index
+        .checked_sub(1)
+        .and_then(|i| rows.get(i))
+        .map(|(seq, _)| *seq)
+}
+
 pub(crate) fn compaction_boundary(rows: &[(i64, Message)], manual: bool) -> Option<i64> {
     if manual {
         return rows.last().map(|(seq, _)| *seq);
@@ -140,4 +151,18 @@ pub(crate) fn covered_messages(rows: &[(i64, Message)], through: i64) -> Result<
         "compaction boundary is not durable"
     );
     Ok(covered)
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    #[test]
+    fn active_request_and_pending_tools_are_never_checkpointed() {
+        let mut rows = vec![(1, Message::text("user", "first"))];
+        assert_eq!(completed_request_boundary(&rows), None);
+        rows.push((2, Message::text("assistant", "done")));
+        rows.push((3, Message::text("user", "keep verbatim")));
+        rows.push((4, Message::text("assistant", "pending tool")));
+        assert_eq!(completed_request_boundary(&rows), Some(2));
+    }
 }

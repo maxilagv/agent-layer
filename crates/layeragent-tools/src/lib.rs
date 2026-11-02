@@ -65,26 +65,31 @@ pub const TEAM_TOOLS: [&str; 14] = [
 ///
 /// The cache is discarded when the negotiated capabilities change, so a
 /// server that stops advertising resources cannot leave a stale catalog
-/// behind for a client to reuse.
+/// behind for a client to reuse. Only the Linux project-files adapter uses it.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Default)]
 struct McpCatalog {
     fingerprint: String,
     resources: Vec<Value>,
 }
+#[cfg(target_os = "linux")]
 fn catalog_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, McpCatalog>> {
     static STORE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, McpCatalog>>,
     > = std::sync::OnceLock::new();
     STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
+#[cfg(target_os = "linux")]
 fn cached_catalog(server: &str) -> Option<McpCatalog> {
     catalog_store().lock().ok()?.get(server).cloned()
 }
+#[cfg(target_os = "linux")]
 fn store_catalog(server: &str, catalog: McpCatalog) {
     if let Ok(mut store) = catalog_store().lock() {
         store.insert(server.to_string(), catalog);
     }
 }
+#[cfg(target_os = "linux")]
 fn discard_catalog(server: &str) {
     if let Ok(mut store) = catalog_store().lock() {
         store.remove(server);
@@ -1037,7 +1042,6 @@ impl Tools {
         }
     }
     async fn mcp(&self, call: &ToolCall, ctx: &ToolContext<'_>) -> Result<Value> {
-        use rmcp::ServiceExt;
         let name = call.arguments["server"]
             .as_str()
             .context("server required")?;
@@ -1067,6 +1071,7 @@ impl Tools {
         );
         #[cfg(target_os = "linux")]
         {
+            use rmcp::ServiceExt;
             let mut effective = grant.clone();
             if !ctx.config.policy.write {
                 effective.tools.retain(|tool, _| {

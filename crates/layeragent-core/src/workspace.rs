@@ -84,6 +84,8 @@ fn excluded_name(name: &str) -> bool {
     layeragent_config::is_secret_path_component(name) || EXCLUDED.contains(&name)
 }
 
+/// Only the inotify refresh path reports individual paths to filter.
+#[cfg(target_os = "linux")]
 fn trackable(relative: &Path) -> bool {
     relative
         .components()
@@ -272,6 +274,7 @@ impl Tracker {
     }
 
     /// Applies one reported path: re-hash a file, drop a vanished path, or walk a new directory.
+    #[cfg(target_os = "linux")]
     fn apply_path(&mut self, relative: &Path, delta: &mut Delta, cancel: &CancellationToken) {
         if !trackable(relative) {
             return;

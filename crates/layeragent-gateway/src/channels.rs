@@ -1,6 +1,8 @@
 use super::*;
 use futures_util::{SinkExt, StreamExt};
 use layeragent_config::Channel;
+// Only the Signal connector, which speaks JSON-RPC over a UNIX socket, reads lines.
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub fn start(engine: Arc<Engine>) {
@@ -382,5 +384,8 @@ pub async fn signal_send(channel: &Channel, destination: &str, text: &str) -> Re
         }
     }
     #[cfg(not(unix))]
-    anyhow::bail!("Signal sockets are unavailable")
+    {
+        let _ = (channel, destination, text);
+        anyhow::bail!("Signal sockets are unavailable")
+    }
 }

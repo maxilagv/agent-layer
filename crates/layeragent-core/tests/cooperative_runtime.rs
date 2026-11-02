@@ -985,3 +985,24 @@ async fn fully_paused_wait_does_not_consume_active_time_budget() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn runtime_shutdown_blocks_the_team_for_explicit_resume_instead_of_cancelling_it()
+-> Result<()> {
+    let f = BoundaryFixture::new(false).await?;
+    let (_, job) = f.start();
+    wait_count(&f.inference_calls, 1).await?;
+    f.engine.stop();
+    tokio::time::timeout(std::time::Duration::from_secs(10), job).await???;
+    let snapshot = f.store.team_snapshot(&Scope::local(), &f.task.id).await?;
+    assert_eq!(
+        snapshot.state, "blocked",
+        "a stopped runtime is an interruption, not an operator cancellation"
+    );
+    let task = f.store.task(&Scope::local(), &f.task.id).await?;
+    assert!(
+        !task.state.terminal(),
+        "the task remains resumable: {task:?}"
+    );
+    Ok(())
+}

@@ -28,6 +28,24 @@ fn not_found() -> ApiError {
     ApiError::not_found(anyhow::anyhow!("task not found or inaccessible"))
 }
 
+/// Loads a task the identity may act on: principal scope plus the identity's
+/// workspace grant. A task outside the grant is indistinguishable from a missing
+/// one, so ids cannot be probed across workspaces.
+async fn authorized_task(
+    store: &layeragent_storage::Storage,
+    i: &Identity,
+    id: &str,
+) -> ApiResult<Task> {
+    let task = store.task(&i.scope, id).await.map_err(|_| not_found())?;
+    if i.authority.is_cancelled() {
+        return Err(anyhow::anyhow!("authority changed; reconnect").into());
+    }
+    if !i.permits_workspace(&task.project) {
+        return Err(not_found());
+    }
+    Ok(task)
+}
+
 #[derive(Deserialize)]
 pub(super) struct TaskQuery {
     #[serde(default)]
@@ -43,6 +61,11 @@ pub(super) async fn list(
     let store = s.engine.store(&i.scope).await?;
     let limit = q.limit.unwrap_or(50);
     let (tasks, next) = store.tasks(&i.scope, q.after, limit).await?;
+    // The cursor still advances over the whole page, so filtering cannot loop.
+    let tasks = tasks
+        .into_iter()
+        .filter(|task| i.permits_workspace(&task.project))
+        .collect::<Vec<_>>();
     Ok(Json(json!({"tasks": tasks, "next": next})))
 }
 
@@ -330,14 +353,8 @@ pub(super) async fn get(
     if !valid_id(&id) {
         return Err(not_found());
     }
-    Ok(Json(
-        s.engine
-            .store(&i.scope)
-            .await?
-            .task(&i.scope, &id)
-            .await
-            .map_err(|_| not_found())?,
-    ))
+    let store = s.engine.store(&i.scope).await?;
+    Ok(Json(authorized_task(&store, &i, &id).await?))
 }
 
 #[derive(Deserialize)]
@@ -357,7 +374,7 @@ pub(super) async fn events(
         return Err(not_found());
     }
     let store = s.engine.store(&i.scope).await?;
-    store.task(&i.scope, &id).await.map_err(|_| not_found())?;
+    authorized_task(&store, &i, &id).await?;
     let events = store
         .task_events(&id, q.after, q.limit.unwrap_or(200))
         .await?;
@@ -384,7 +401,7 @@ pub(super) async fn stream(
         Err(status) => return Ok(super::admission::limited_response(status)),
     };
     let store = s.engine.store(&i.scope).await?;
-    store.task(&i.scope, &id).await.map_err(|_| not_found())?;
+    authorized_task(&store, &i, &id).await?;
     let authority = i.authority.clone();
     let mut cursor = q.after;
     let stream = async_stream::stream! {
@@ -441,7 +458,7 @@ pub(super) async fn cancel(
         return Err(not_found());
     }
     let store = s.engine.store(&i.scope).await?;
-    let task = store.task(&i.scope, &id).await.map_err(|_| not_found())?;
+    let task = authorized_task(&store, &i, &id).await?;
     if task.state.terminal() {
         return Ok(Json(json!({"cancelled": false, "task": task})));
     }
@@ -485,7 +502,14 @@ pub(super) async fn correct(
         return Err(not_found());
     }
     let store = s.engine.store(&i.scope).await?;
-    store.task(&i.scope, &id).await.map_err(|_| not_found())?;
+    let task = authorized_task(&store, &i, &id).await?;
+    // Cooperative members run under their own activation turns, so a task-level
+    // correction would be persisted but never applied. Refuse it explicitly.
+    if task.execution == layeragent_protocol::ExecutionMode::Cooperative {
+        return Err(ApiError::conflict(anyhow::anyhow!(
+            "cooperative tasks take operator instructions as team messages; use the team messages route"
+        )));
+    }
     let correction = store
         .correct_task(
             &i.scope,
@@ -510,7 +534,7 @@ pub(super) async fn approve(
         return Err(not_found());
     }
     let store = s.engine.store(&i.scope).await?;
-    let task = store.task(&i.scope, &id).await.map_err(|_| not_found())?;
+    let task = authorized_task(&store, &i, &id).await?;
     s.engine
         .approve(&i.scope, Some(&task.id), &approval, &r)
         .await
@@ -552,7 +576,7 @@ pub(super) async fn artifact(
     }
     let store = s.engine.store(&i.scope).await?;
     if let Some(task) = &q.task {
-        let bound = store.task(&i.scope, task).await.map_err(|_| not_found())?;
+        let bound = authorized_task(&store, &i, task).await?;
         if !bound.session_id.as_deref().is_none_or(|session| {
             q.session
                 .as_deref()
@@ -614,7 +638,7 @@ pub(super) async fn task_artifact(
         return Err(not_found());
     }
     let store = s.engine.store(&i.scope).await?;
-    let task = store.task(&i.scope, &id).await.map_err(|_| not_found())?;
+    let task = authorized_task(&store, &i, &id).await?;
     let value = store
         .artifact_scoped(
             &i.scope,
@@ -638,7 +662,7 @@ pub(super) async fn metrics(
         return Err(not_found());
     }
     let store = s.engine.store(&i.scope).await?;
-    store.task(&i.scope, &id).await.map_err(|_| not_found())?;
+    authorized_task(&store, &i, &id).await?;
     let metrics = store.task_metrics(&id).await?;
     let timing = store.task_timing(&id).await?;
     Ok(Json(json!({"metrics": metrics, "timing": timing})))

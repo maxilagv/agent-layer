@@ -289,11 +289,15 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
             identifier(&task)?;
             let value = client.get(&format!("/v1/tasks/{task}/team/export")).await?;
             if format == "markdown" {
+                // Exports contain model-written text: never send raw control
+                // sequences to the operator's terminal.
                 print!(
                     "{}",
-                    value["markdown"]
-                        .as_str()
-                        .context("export markdown missing")?
+                    terminal_text(
+                        value["markdown"]
+                            .as_str()
+                            .context("export markdown missing")?
+                    )
                 );
                 return Ok(());
             }

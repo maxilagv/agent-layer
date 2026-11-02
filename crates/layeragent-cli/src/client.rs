@@ -155,6 +155,9 @@ impl Client {
         let response = self.http.get(format!("{}{path}", self.base)).send().await?;
         json_response(response).await
     }
+    async fn get_owned(&self, path: String) -> Result<Value> {
+        self.get(&path).await
+    }
     pub async fn post(&self, path: &str, body: Value) -> Result<Value> {
         let response = self
             .http
@@ -360,10 +363,10 @@ impl Client {
     }
 
     async fn team_view(&self, task: &str, mut snapshot: Value) -> Result<Value> {
-        // One request rather than a request per resource. Export retains complete
-        // data; only the terminal projection is limited to the most recent rows.
-        let mut export = self.get(&format!("/v1/tasks/{task}/team/export")).await?;
-        for resource in [
+        // Bounded refresh: the most recent rows of each resource, fetched
+        // concurrently, so a refresh costs the same however long the team runs.
+        // Complete history stays available through `team export`.
+        const RESOURCES: [&str; 7] = [
             "messages",
             "deliveries",
             "work",
@@ -371,13 +374,14 @@ impl Client {
             "objections",
             "evidence",
             "finding_revisions",
-        ] {
-            let mut items = export[resource].take();
-            if let Some(rows) = items.as_array_mut() {
-                let excess = rows.len().saturating_sub(200);
-                rows.drain(..excess);
-            }
-            snapshot[resource] = items;
+        ];
+        let pages =
+            futures_util::future::try_join_all(RESOURCES.iter().map(|resource| {
+                self.get_owned(format!("/v1/tasks/{task}/team/{resource}?tail=200"))
+            }))
+            .await?;
+        for (resource, mut page) in RESOURCES.iter().zip(pages) {
+            snapshot[*resource] = page["items"].take();
         }
         Ok(snapshot)
     }
@@ -807,6 +811,10 @@ mod team_tests {
             return Json(json!({"events":[{"seq":6,"kind":"team_completed","data":{}}],"next":6}))
                 .into_response();
         }
+        if uri.contains("/messages?tail=") {
+            return Json(json!({"items":[{"id":"first"},{"id":"second"}],"next":null}))
+                .into_response();
+        }
         if uri.contains("/messages?after=0") {
             return Json(json!({"items":[{"id":"first"}],"next":7})).into_response();
         }
@@ -855,6 +863,10 @@ mod team_tests {
         assert!(
             !calls.iter().any(|call| call.1.contains("events")),
             "terminal snapshot needs no live stream"
+        );
+        assert!(
+            !calls.iter().any(|call| call.1.ends_with("/team/export")),
+            "a view refresh reads bounded tails, never the complete export"
         );
         server.abort();
         Ok(())

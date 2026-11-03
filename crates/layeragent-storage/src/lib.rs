@@ -15,7 +15,10 @@ mod team;
 mod terminal;
 pub use memory::{EmbeddingWorker, embedding_worker_main};
 pub use tasks::{TaskConflict, TaskCreate};
-pub use team::{EvidenceRecord, TeamConflict, TeamPaused};
+pub use team::{
+    EvidenceRecord, PatchCarry, PatchSubmission, ReviewOutcome, TeamConflict, TeamPaused,
+    WriterState,
+};
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 /// A delegated child agent as recorded for audit and recovery.
@@ -63,6 +66,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/007_cooperative_terminal.sql"),
     include_str!("migrations/008_team_bus_indexes.sql"),
     include_str!("migrations/009_team_urgent_messages.sql"),
+    include_str!("migrations/010_team_writers.sql"),
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

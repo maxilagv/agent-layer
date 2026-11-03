@@ -6,6 +6,10 @@ use layeragent_tools::TeamControl;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
+/// Re-check interval when no team change arrives: time budgets, leases and
+/// pause acknowledgement. Messages and commands wake waiters immediately.
+const FALLBACK_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub(crate) struct TeamRuntime {
     pub(crate) context: TeamActivationContext,
     store: Storage,
@@ -31,6 +35,7 @@ impl TeamRuntime {
     /// Finish an in-flight operation, then wait without starting further work.
     /// Heartbeats preserve the same activation and canonical session on resume.
     pub(crate) async fn boundary(&self) -> Result<bool> {
+        let mut changes = self.store.team_changes(&self.context.team_id);
         loop {
             ensure!(
                 !self.cancel.is_cancelled(),
@@ -61,7 +66,8 @@ impl TeamRuntime {
             }
             tokio::select! {
                 _ = self.cancel.cancelled() => bail!("cooperative activation cancelled while paused"),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                Ok(()) = changes.changed() => {}
+                _ = tokio::time::sleep(FALLBACK_POLL) => {}
             }
         }
     }
@@ -179,6 +185,53 @@ fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("{key} required"))
 }
 
+/// Longest in-place wait for an answer. It stays well inside the activation
+/// lease, which every team tool call renews.
+const MAX_REPLY_WAIT_SECS: u64 = 120;
+
+/// Waits inside the current activation for an answer to this member's open
+/// request, so a short exchange does not cost a new activation. The reply is
+/// incorporated at the start of the next round as usual. Returns early on any
+/// delivery, a team state change, cancellation or timeout.
+async fn wait_for_reply(
+    store: &Storage,
+    team: &str,
+    member: &str,
+    seconds: u64,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    let (open, possible) = store.team_reply_possible(team, member).await?;
+    ensure!(
+        open,
+        "no open question or verification request of yours to wait for"
+    );
+    if !possible {
+        return Ok(
+            json!({"waited":false,"reason":"no running recipient and no free slot for one; call team_wait without reply_timeout_secs and finish your response to release your slot"}),
+        );
+    }
+    let mut changes = store.team_changes(team);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        if store.team_pending_for(team, member, false).await? {
+            return Ok(
+                json!({"waited":true,"reply":"a message is waiting for you; it is incorporated before your next step"}),
+            );
+        }
+        if store.team_snapshot_by_id(team).await?.state != "active" {
+            return Ok(json!({"waited":false,"reason":"the team is no longer active"}));
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => bail!("wait for reply cancelled"),
+            _ = tokio::time::sleep_until(deadline) => {
+                return Ok(json!({"waited":false,"reason":"timed out; continue other work or finish your response"}));
+            }
+            Ok(()) = changes.changed() => {}
+            _ = tokio::time::sleep(FALLBACK_POLL) => {}
+        }
+    }
+}
+
 /// Fills runtime-owned defaults for append operations: a deterministic idempotency
 /// key per activation and call content, and the current team revision.
 fn with_defaults(name: &str, args: &Value, activation: &str, revision: i64) -> Result<Value> {
@@ -245,6 +298,15 @@ impl TeamControl for EngineTeamControl {
                 store
                     .team_member_message(team, member, serde_json::from_value(args.clone())?)
                     .await
+            }
+            "team_wait" if args.get("reply_timeout_secs").is_some() => {
+                let seconds = args["reply_timeout_secs"]
+                    .as_u64()
+                    .filter(|seconds| (1..=MAX_REPLY_WAIT_SECS).contains(seconds))
+                    .with_context(|| {
+                        format!("reply_timeout_secs must be 1..{MAX_REPLY_WAIT_SECS}")
+                    })?;
+                wait_for_reply(store, team, member, seconds, &ctx.cancel).await
             }
             "team_wait" => {
                 store
@@ -568,6 +630,7 @@ impl Engine {
         let owner = new_id();
         let activation_cancel = CancellationToken::new();
         let mut jobs = JoinSet::new();
+        let mut changes = store.team_changes(&team);
         let result = async {
         loop {
             if store.team_check_time_budget(&team).await? {
@@ -719,7 +782,10 @@ impl Engine {
                         }
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                // A committed team change wakes the supervisor at once; the
+                // fallback only serves time-based limits and leases.
+                Ok(()) = changes.changed() => {}
+                _ = tokio::time::sleep(FALLBACK_POLL) => {}
             }
         }
         }.await;

@@ -79,6 +79,10 @@ Members have separate contexts. Messages preserve sender identity and provenance
 peer messages do not grant permissions or approve actions. Terminal messages are
 operator instructions and still cannot expand the task's permissions.
 
+`team message --urgent` stops the member's current tool batch so it reads the
+instruction before its next tool call; without it, the instruction is read at the
+start of the member's next round.
+
 Other commands are `team messages`, `team work`, `team objections`,
 `team priority TASK_ID WORK_ID VALUE`, `team close TASK_ID` and
 `team cancel TASK_ID`. Query commands support JSON. Member targets accept an
@@ -128,6 +132,12 @@ detaches the observer; cancellation is an explicit team command. Exiting the TUI
 leaves the daemon's task intact. Reopening the terminal loads a consistent snapshot
 and follows events from its cursor. A daemon restart requires explicit recovery;
 an already paused team stays paused.
+
+Members exchange questions, observations, objections, verification requests,
+responses, claims and handoffs. A claim without an evidence receipt reaches its
+recipient marked as unsupported. A handoff moves the sender's in-progress work
+item to the recipient. A member can wait in place for an answer to its own open
+question instead of ending its activation, when a slot is free for the answer.
 
 Message acceptance, incorporation into context, response and resolution are
 different observations. Incorporation and the canonical history entry commit

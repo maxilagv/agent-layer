@@ -184,8 +184,8 @@ async fn interface(
                     Some((task.to_string(), coordinator.to_string()))
                 }) && job.as_deref() == Some(team_task.as_str())
                 {
-                    match crate::team::message(&client, &team_task, &coordinator, &instruction).await {
-                        Ok(_) => app.team_note("Instrucción enviada al coordinador; se incorporará en su próximo punto seguro."),
+                    match crate::team::message(&client, &team_task, &coordinator, &instruction, true).await {
+                        Ok(_) => app.team_note("Instrucción urgente enviada al coordinador; la leerá antes de su próxima herramienta."),
                         Err(error) => {
                             app.restore_draft(&instruction);
                             app.team_note(&format!("Instrucción no enviada: {error}"));
@@ -365,7 +365,7 @@ async fn team_action(client: &Client, task: &str, text: &str) -> Result<String> 
             let (recipient, body) = rest
                 .split_once(' ')
                 .ok_or_else(|| anyhow::anyhow!("Uso: /team message <miembro> <texto>"))?;
-            crate::team::message(client, task, recipient, body).await?
+            crate::team::message(client, task, recipient, body, false).await?
         }
         "pause" | "resume" | "close" | "cancel" => {
             let reason = rest.strip_prefix("--reason ").unwrap_or(rest).trim();

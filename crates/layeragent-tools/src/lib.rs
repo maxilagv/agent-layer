@@ -461,7 +461,7 @@ pub fn definitions_with_team(config: &Config, cooperative: bool) -> Vec<ToolDefi
     let key = json!({"type":"string","minLength":1,"maxLength":200});
     let revision = json!({"type":"integer","minimum":1});
     let mutation = json!({"idempotency_key":key,"expected_revision":revision});
-    let purpose = json!({"type":"string","enum":["question","observation","objection","verification_request","response"]});
+    let purpose = json!({"type":"string","enum":["question","observation","objection","verification_request","response","claim","handoff"]});
     let role = json!({"type":"string","enum":["analyst","reviewer","verifier","specialist"]});
     let finding_state = json!({"type":"string","enum":["hypothesis","investigating","reproduced","reviewed","discarded","inconclusive"]});
     let fields = |extra: Value| {
@@ -474,8 +474,8 @@ pub fn definitions_with_team(config: &Config, cooperative: bool) -> Vec<ToolDefi
     // current revision. Supplying a stale revision still yields a conflict.
     tools.extend([
         def("team_members", "List team identities, roles, states, the current team revision and your own member id; identities come from the runtime", json!({}), &[]),
-        def("team_message", "Persist a direct peer message; accepted is not incorporated, understood or resolved", fields(json!({"recipient":id,"purpose":purpose,"body":text,"work_id":id,"finding_id":id,"evidence_id":id,"reply_to":id,"provenance":{"type":"array","items":text,"maxItems":32}})), &["purpose","body"]),
-        def("team_wait", "Mark this response as waiting; finish the response to release the concurrency slot", json!({"reason":text}), &["reason"]),
+        def("team_message", "Persist a direct peer message; accepted is not incorporated, understood or resolved. A claim without evidence_id reaches peers marked unsupported. A handoff transfers your in-progress work_id to the recipient. urgent delivers between the recipient's tool calls instead of at its next round", fields(json!({"recipient":id,"purpose":purpose,"body":text,"work_id":id,"finding_id":id,"evidence_id":id,"reply_to":id,"provenance":{"type":"array","items":text,"maxItems":32},"urgent":{"type":"boolean"}})), &["purpose","body"]),
+        def("team_wait", "Without reply_timeout_secs: mark this response as waiting, then finish it to release the concurrency slot. With reply_timeout_secs (1..120): wait in this activation for an answer to your open question or verification request; returns waited=true when a message arrives, which you read next", json!({"reason":text,"reply_timeout_secs":{"type":"integer","minimum":1,"maximum":120}}), &["reason"]),
         def("team_add_member", "Coordinator only: add a specialist for distinct justified work", fields(json!({"name":text,"role":role,"justification":text,"model":id})), &["name","role","justification"]),
         def("team_work_create", "Create shared work with an explicit deliverable and close conditions", fields(json!({"title":text,"deliverable":text,"assignee":id,"dependencies":{"type":"array","items":id,"maxItems":64},"priority":{"type":"integer"},"close_conditions":text})), &["title","deliverable","close_conditions"]),
         def("team_work_claim", "Atomically claim available shared work", json!({"work_id":id,"expected_revision":revision}), &["work_id","expected_revision"]),

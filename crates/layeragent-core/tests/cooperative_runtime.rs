@@ -67,6 +67,10 @@ struct TeamModel {
     log: Arc<Mutex<Vec<(String, String)>>>,
     /// Sender identity the analyst tries to forge in its message arguments.
     forge: bool,
+    /// When set, the analyst waits in place for the answer this many seconds.
+    reply_wait: Option<u64>,
+    /// The reviewer takes a moment before answering.
+    slow_answer: bool,
 }
 
 fn call(name: &str, arguments: Value) -> Completion {
@@ -79,6 +83,16 @@ fn call(name: &str, arguments: Value) -> Completion {
         }],
         ..Default::default()
     }
+}
+
+/// Reads one `key: value` field from an incorporated message header.
+fn header(content: &str, key: &str) -> String {
+    let body = content.split("\n--- body ---\n").next().unwrap_or("");
+    body.lines()
+        .flat_map(|line| line.split(" · "))
+        .find_map(|part| part.strip_prefix(&format!("{key}: ")))
+        .unwrap_or("")
+        .to_string()
 }
 
 fn text(body: &str) -> Completion {
@@ -110,7 +124,7 @@ impl TeamModel {
         let incorporated = |purpose: &str| {
             history.iter().find(|m| {
                 m.content.starts_with("Peer reference message")
-                    && m.content.contains(&format!("\"purpose\":\"{purpose}\""))
+                    && header(&m.content, "purpose") == purpose
             })
         };
         let ids = self.ids.lock().unwrap().clone();
@@ -126,7 +140,11 @@ impl TeamModel {
                     }
                     call("team_message", args)
                 } else if last_tool.as_deref() == Some("team_message") {
-                    call("team_wait", json!({"reason":"awaiting reviewer answer"}))
+                    let mut args = json!({"reason":"awaiting reviewer answer"});
+                    if let Some(seconds) = self.reply_wait {
+                        args["reply_timeout_secs"] = json!(seconds);
+                    }
+                    call("team_wait", args)
                 } else {
                     text("waiting for reviewer")
                 }
@@ -136,16 +154,10 @@ impl TeamModel {
                     .iter()
                     .any(|m| m.tool_calls.iter().any(|c| c.name == "team_message"));
                 match incorporated("question") {
-                    Some(question) if !answered => {
-                        let payload: Value = serde_json::from_str(
-                            question.content.split_once(": ").expect("payload").1,
-                        )
-                        .expect("delivery json");
-                        call(
-                            "team_message",
-                            json!({"recipient":ids["analyst"],"purpose":"response","reply_to":payload["id"],"body":"Yes, validated in the gateway layer."}),
-                        )
-                    }
+                    Some(question) if !answered => call(
+                        "team_message",
+                        json!({"recipient":ids["analyst"],"purpose":"response","reply_to":header(&question.content, "message"),"body":"Yes, validated in the gateway layer."}),
+                    ),
                     _ => text("reviewer idle"),
                 }
             }
@@ -182,7 +194,16 @@ impl LanguageModel for TeamModel {
         _: tokio_util::sync::CancellationToken,
         _: mpsc::Sender<Delta>,
     ) -> Result<Completion> {
-        Ok(self.decide(messages).1)
+        let (name, completion) = self.decide(messages);
+        // A slow reviewer makes the asker's choice observable: release the
+        // slot and be activated again, or wait in place for the answer.
+        if self.slow_answer
+            && name == "reviewer"
+            && completion.calls.iter().any(|c| c.name == "team_message")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        Ok(completion)
     }
 
     async fn infer_admitted(
@@ -237,6 +258,16 @@ async fn cooperative_task(
 }
 
 async fn run_team(forge: bool, preload: usize) -> Result<(Storage, Task, Vec<(String, String)>)> {
+    run_team_with(forge, preload, 1, None, false).await
+}
+
+async fn run_team_with(
+    forge: bool,
+    preload: usize,
+    concurrency: usize,
+    reply_wait: Option<u64>,
+    slow_answer: bool,
+) -> Result<(Storage, Task, Vec<(String, String)>)> {
     let home = tempfile::tempdir()?;
     let workspace = tempfile::tempdir()?;
     let ids = Arc::new(Mutex::new(BTreeMap::new()));
@@ -249,16 +280,18 @@ async fn run_team(forge: bool, preload: usize) -> Result<(Storage, Task, Vec<(St
             ids: ids.clone(),
             log: log.clone(),
             forge,
+            reply_wait,
+            slow_answer,
         }),
         Arc::new(NoopSandbox),
     )?;
     let scope = Scope::local();
     let store = engine.store(&scope).await?;
-    // One concurrency slot: asking and answering must not deadlock.
+    // With one slot, asking and answering must not deadlock.
     let options = CooperativeOptions {
         limits: TeamLimits {
             max_members: 3,
-            max_concurrency: 1,
+            max_concurrency: concurrency,
             ..TeamLimits::default()
         },
         ..Default::default()
@@ -289,6 +322,7 @@ async fn run_team(forge: bool, preload: usize) -> Result<(Storage, Task, Vec<(St
                     evidence_id: None,
                     reply_to: None,
                     provenance: vec![],
+                    urgent: false,
                 },
             )
             .await?;
@@ -382,6 +416,69 @@ async fn peers_exchange_directly_with_one_slot_and_close_without_a_final_model_c
     assert_eq!(snapshot.reservations["uncertain_tokens"], 0);
     // Closing was finalized by the supervisor, not by an extra model turn.
     assert_eq!(log.last().map(|(who, _)| who.as_str()), Some("coordinator"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_answer_awaited_in_place_does_not_cost_the_asker_a_new_activation() -> Result<()> {
+    let activations = |store: Storage, team: String| async move {
+        Ok::<_, anyhow::Error>(
+            store
+                .team_members(&team)
+                .await?
+                .into_iter()
+                .find(|m| m["name"] == "analyst")
+                .and_then(|m| m["activations"].as_i64())
+                .unwrap_or_default(),
+        )
+    };
+    let (store, task, _) = run_team_with(false, 0, 2, None, true).await?;
+    assert_eq!(task.state, TaskState::Completed);
+    let released = activations(store, task.team_id.unwrap()).await?;
+    assert_eq!(
+        released, 2,
+        "finishing to wait means a second activation for the answer"
+    );
+
+    let (store, task, log) = run_team_with(false, 0, 2, Some(10), true).await?;
+    assert_eq!(task.state, TaskState::Completed);
+    let team = task.team_id.clone().unwrap();
+    assert_eq!(activations(store.clone(), team.clone()).await?, 1);
+    let analyst = store
+        .team_members(&team)
+        .await?
+        .into_iter()
+        .find(|m| m["name"] == "analyst")
+        .unwrap();
+    let history = store
+        .history_since(analyst["session_id"].as_str().unwrap(), 0)
+        .await?;
+    assert!(
+        history
+            .iter()
+            .any(|(_, m)| m.role == "tool" && m.content.contains("\"waited\":true"))
+    );
+    assert!(log.contains(&("analyst".into(), "text".into())), "{log:?}");
+
+    // With a single slot the asker would only block the answer: it is told to
+    // release instead of waiting.
+    let (store, task, _) = run_team_with(false, 0, 1, Some(10), false).await?;
+    assert_eq!(task.state, TaskState::Completed);
+    let team = task.team_id.clone().unwrap();
+    let analyst = store
+        .team_members(&team)
+        .await?
+        .into_iter()
+        .find(|m| m["name"] == "analyst")
+        .unwrap();
+    let history = store
+        .history_since(analyst["session_id"].as_str().unwrap(), 0)
+        .await?;
+    assert!(
+        history
+            .iter()
+            .any(|(_, m)| m.role == "tool" && m.content.contains("no free slot"))
+    );
     Ok(())
 }
 
@@ -731,6 +828,7 @@ async fn pause_drains_inference_and_each_tool_then_resumes_without_uncertain_usa
                 evidence_id: None,
                 reply_to: None,
                 provenance: vec![],
+                urgent: false,
             },
         )
         .await?;
@@ -775,6 +873,71 @@ async fn pause_drains_inference_and_each_tool_then_resumes_without_uncertain_usa
             .filter(|(_, message)| message.content.contains(note))
             .count(),
         1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_urgent_message_stops_the_rest_of_a_batch_and_is_read_before_the_next_plan() -> Result<()>
+{
+    let f = BoundaryFixture::new(false).await?;
+    let (_, job) = f.start();
+    wait_count(&f.inference_calls, 1).await?;
+    let snapshot = f.store.team_snapshot(&Scope::local(), &f.task.id).await?;
+    let member = &snapshot.members[0];
+    let session = member["session_id"].as_str().unwrap().to_string();
+    let note = "stop: the second operation targets the wrong host";
+    f.store
+        .team_user_message(
+            &Scope::local(),
+            &f.task.id,
+            TeamMessageInput {
+                idempotency_key: new_id(),
+                expected_revision: snapshot.revision,
+                recipient: Some(member["id"].as_str().unwrap().into()),
+                purpose: MessagePurpose::UserInstruction,
+                body: note.into(),
+                work_id: None,
+                finding_id: None,
+                evidence_id: None,
+                reply_to: None,
+                provenance: vec![],
+                urgent: true,
+            },
+        )
+        .await?;
+    // The planned batch was produced without the message; none of it runs.
+    f.inference_release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(10), job).await???;
+    assert_eq!(f.tool_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        f.inference_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    let history: Vec<_> = f
+        .store
+        .history_since(&session, 0)
+        .await?
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect();
+    let skipped: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "tool" && m.content.contains("urgent team message arrived"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(skipped.len(), 2, "{history:?}");
+    let read = history
+        .iter()
+        .position(|m| m.content.contains(note))
+        .expect("urgent message incorporated");
+    assert!(read > skipped[1], "the message follows the paired results");
+    assert!(history[read].content.contains(" · urgent"));
+    let events = f.store.task_events(&f.task.id, 0, 1000).await?;
+    assert!(
+        events.iter().any(|e| e["kind"] == "team_urgent_interrupt"
+            || e["data"]["kind"] == "team_urgent_interrupt")
     );
     Ok(())
 }

@@ -80,6 +80,51 @@ seeing peer conclusions; review checks a different reviewer and linked current
 evidence, not independence of every evidence producer. These remain qualification
 boundaries rather than claims of a complete independent-audit workflow.
 
+## Godeye team bus, first increment
+
+Godeye is the name for the cooperative team bus: the only channel through which
+agents in a team exchange messages. The unused bridge mailbox methods were
+removed; the deprecated `bridge` request flag is still refused. This increment
+builds on the existing `team_*` storage, identities, idempotency and no-progress
+protections.
+
+- **Claims and handoffs.** `team_message` accepts two more purposes. A `claim`
+  without an `evidence_id` is accepted but reported as `supported=false` in the
+  send result, the `team_message_accepted` event, message listings and threads,
+  and the recipient reads it as an unsupported claim. A `handoff` requires a
+  recipient and a `work_id` that the sender is working on; the work becomes
+  pending for the recipient in the same transaction as the message, and the
+  sender is released (`team_work_handed_off`).
+- **Readable incorporation.** A delivery enters the recipient's context as a
+  short block (authority, sender and role, purpose, message id, references,
+  provenance, body) instead of a raw JSON object. Model-written header values are
+  kept on one line, and the closing marker names the server-generated message id,
+  so a body cannot fake the end of its block.
+- **Urgent messages.** With `urgent=true`, a pending message stops the
+  recipient's current tool batch before its next call. The skipped calls get
+  "not executed" results, so provider tool pairing stays valid, and the next
+  round incorporates the message before the model plans again. An activation
+  honours at most three urgent interruptions. `layeragent team message --urgent`
+  sends one; a TUI correction on a cooperative task is sent to the coordinator as
+  urgent. Migration 009 adds the flag.
+- **Event-driven wake-up.** The supervisor and paused activations wake on
+  committed team changes through a per-team change counter instead of polling
+  every 50 ms. A refused write wakes nobody. A 250 ms fallback remains for time
+  budgets, leases and pause acknowledgement.
+- **Waiting in place for an answer.** `team_wait` with `reply_timeout_secs`
+  (1..120) waits inside the current activation for an answer to the member's own
+  open question or verification request, so a short exchange does not cost the
+  asker a new activation. It returns immediately when no recipient is running and
+  no slot is free for one.
+
+Verification: storage and runtime tests cover handoff ownership and transfer,
+claim support flags, block rendering against forged fields, urgent interruption
+(the test fails with the interruption disabled), change signalling and the
+in-place wait with and without a free slot. All of it uses scripted models; it
+shows that the mechanisms work, not that a real model chooses well when to
+claim, hand off, mark a message urgent or wait. Cooperative writers remain
+disabled, so a handoff transfers read-only investigation work.
+
 ## Cooperative bus hardening increment
 
 This increment closes defects found by auditing the existing cooperative
@@ -251,7 +296,9 @@ Implemented surfaces:
   and illustration execution are rejected until their implementations exist.
 - Memory recall is bounded by count/bytes and excludes retired facts. Scoped
   storage retirement and listing exist; full terminal memory administration remains
-  pending. Bridge tables/methods are foundations only, not a working broker.
+  pending. The unused bridge mailbox methods were removed: agent-to-agent
+  messages travel only through the cooperative team bus (godeye). The
+  `bridge_messages` table stays in existing databases and is not written.
 
 Provider effort is opt-in through `effort_models`: aliases and concrete supported
 levels must be declared by the operator. Request mappings have fixture coverage;

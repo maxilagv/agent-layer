@@ -6,6 +6,7 @@ use layeragent_tools::TeamControl;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
+mod consult;
 mod writers;
 pub(crate) use writers::prepare_worktree;
 
@@ -99,6 +100,7 @@ impl TeamRuntime {
             TeamRole::Coordinator => "coordination",
             TeamRole::Reviewer => "review",
             TeamRole::Verifier => "verification",
+            TeamRole::Consultant => "consultation",
             _ => "investigation",
         }
     }
@@ -247,6 +249,7 @@ fn with_defaults(name: &str, args: &Value, activation: &str, revision: i64) -> R
         name,
         "team_message"
             | "team_add_member"
+            | "team_consult"
             | "team_work_create"
             | "team_finding"
             | "team_objection"
@@ -273,6 +276,7 @@ fn with_defaults(name: &str, args: &Value, activation: &str, revision: i64) -> R
         name,
         "team_message"
             | "team_add_member"
+            | "team_consult"
             | "team_work_create"
             | "team_finding"
             | "team_objection"
@@ -293,10 +297,15 @@ impl TeamControl for EngineTeamControl {
         let member = &current.member_id;
         let snapshot = store.team_snapshot_by_id(team).await?;
         let args = &with_defaults(name, args, &current.activation_id, snapshot.revision)?;
+        // The tool list already hides these; the check holds even if a model
+        // calls one anyway.
+        ensure!(
+            current.role != TeamRole::Consultant || !consult::CONSULTANT_DENIED.contains(&name),
+            "a consultant answers its question; {name} is not available to it"
+        );
         match name {
-            "team_members" => Ok(
-                json!({"members":snapshot.members,"revision":snapshot.revision,"state":snapshot.state,"self":{"member_id":member,"role":current.role.as_str()},"open_questions":snapshot.open_questions,"limits":snapshot.options.limits}),
-            ),
+            "team_members" => Ok(consult::members_view(ctx.config, &snapshot, &current)),
+            "team_consult" => self.consult(ctx, &snapshot, args).await,
             "team_message" if args["purpose"] == "handoff" => self.handoff(args).await,
             "team_message" => {
                 store
@@ -538,6 +547,9 @@ pub(crate) fn effective_config(
             && team.context.options.scope.allow_write
             && team.context.access == layeragent_protocol::TeamAccess::Write;
         config.auto_skills = false;
+        if team.context.role == TeamRole::Consultant {
+            consult::restrict(&mut config);
+        }
     }
     if ctl.tree.execution == ExecutionMode::Individual {
         config.agents.enabled = false;
@@ -646,6 +658,13 @@ impl Engine {
         let activation_cancel = CancellationToken::new();
         let mut jobs = JoinSet::new();
         let mut changes = store.team_changes(&team);
+        let default_model = match model.clone() {
+            Some(model) => model,
+            None => self.config().await.primary.clone(),
+        };
+        store
+            .team_record_default_model(&team, &default_model)
+            .await?;
         let result = async {
         loop {
             if store.team_check_time_budget(&team).await? {
@@ -679,10 +698,18 @@ impl Engine {
                         }
                         let mut admission_error = None;
                         let mut admitted = false;
+                        let config = self.config().await;
                         for candidate in candidates.into_iter().take(capacity) {
                             let member = candidate["id"].as_str().context("member id")?.to_string();
+                            // The model is fixed and recorded when the activation
+                            // starts, so a review can compare authors and reviewers.
+                            let selected = candidate["model"]
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| default_model.clone());
+                            let identity = config.models.get(&selected).map(|m| model_identity(&m.id));
                             let started =
-                                match store.team_start_activation(&team, &member, &owner).await {
+                                match store.team_start_activation_with_model(&team, &member, &owner, Some(&selected), identity.as_deref()).await {
                                     Ok(started) => started,
                                     Err(error) => {
                                         tracing::debug!(%error, member, "activation not admitted");
@@ -737,11 +764,8 @@ impl Engine {
                                 }
                             };
                             let initial = candidate["activations"].as_i64() == Some(0);
-                            let prompt = activation_prompt(&task, &snapshot, &candidate, initial);
-                            let selected = candidate["model"]
-                                .as_str()
-                                .map(str::to_string)
-                                .or_else(|| model.clone());
+                            let prompt = activation_prompt(&task, &snapshot, &candidate, &selected, initial);
+                            let consultant = candidate["role"] == "consultant";
                             let engine = self.clone();
                             let scope = scope.clone();
                             let store = store.clone();
@@ -749,7 +773,7 @@ impl Engine {
                             let task_effort = task.effort;
                             jobs.spawn(async move {
                                 let result = engine.run_bound(scope, RunRequest {
-                                    session_id: Some(session), workspace: None, prompt, model: selected,
+                                    session_id: Some(session), workspace: None, prompt, model: Some(selected),
                                     effort: task_effort, bridge: false, mode: RunMode::Normal,
                                     execution: ExecutionMode::Cooperative, cooperative: None,
                                 }, token.clone(), activation.clone()).await;
@@ -758,7 +782,14 @@ impl Engine {
                                     Err(error) => (if token.is_cancelled() { "interrupted" } else { "failed" }, Some(error.to_string()), json!({})),
                                 };
                                 let _ = store.team_finish_activation(&activation, &member, generation, state, reason.as_deref(), &usage).await;
-                                result
+                                // A consultation that fails or runs out of budget ends
+                                // the consultation, not the team: storage retires the
+                                // consultant and tells the member that asked.
+                                if consultant && let Err(error) = &result && !token.is_cancelled() {
+                                    tracing::info!(%error, member, "consultation ended by an error");
+                                    return Ok(());
+                                }
+                                result.map(|_| ())
                             });
                         }
                         if !admitted && jobs.is_empty()
@@ -814,9 +845,13 @@ fn activation_prompt(
     task: &Task,
     snapshot: &TeamSnapshot,
     member: &Value,
+    model: &str,
     initial: bool,
 ) -> String {
     let role = member["role"].as_str().unwrap_or("specialist");
+    if role == "consultant" {
+        return consult::prompt(task, snapshot, member, model);
+    }
     let mut prompt = format!(
         "Cooperative template {} v{}. You are {} (member {}). Canonical session continuity is retained across activations. Runtime identity is authoritative. Objective: {}\nAuthorized resources: {}. Deliverables: {}. Write authorized: {}. Use team_* tools to consult peers directly; never use traditional child-agent delegation. Message acceptance is not comprehension. Record findings separately from runtime evidence. Finish a response without ending the team. With team_wait, finish this response to release concurrency.",
         snapshot.template.as_str(),
@@ -841,6 +876,10 @@ fn activation_prompt(
     } else {
         " Access: read. When your work needs file changes, claim the work item, then call team_access with mode=write, its work_id and the paths you will change; your next activation runs in your own worktree. Review other members' patches with team_patch_show and team_patch_review."
     });
+    prompt.push_str(&format!(" You run model {model}; team_members shows every member's model and the configured models. For a second opinion from another model, use team_consult: it brings in a read-only consultant for one question, which answers you and then leaves."));
+    if snapshot.options.cross_model_review {
+        prompt.push_str(" Cross-model review is required: a patch is approved only by a member or consultant running a different model than the one that wrote it. When nobody on another model is free, consult one with team_consult and the patch_id.");
+    }
     if initial {
         prompt.push_str(" This is your first activation. Establish your own assessment before relying on peer conclusions. Coordinator: plan and assign distinct work, then propose close only after disposition of open work. Specialist: report useful conclusions and evidence to the coordinator or requesting peer with team_message.");
     } else {
@@ -872,6 +911,41 @@ mod tests {
             5,
         )?;
         assert_eq!(explicit["idempotency_key"], "mine");
+        let consult = with_defaults("team_consult", &json!({"question":"q"}), "activation", 7)?;
+        assert_eq!(consult["expected_revision"], 7);
+        assert!(consult["idempotency_key"].is_string());
         Ok(())
+    }
+
+    #[test]
+    fn a_consultant_only_reads_and_never_shapes_the_team() {
+        let mut config = Config::default();
+        config.policy.write = true;
+        consult::restrict(&mut config);
+        assert!(!config.policy.write);
+        let names: Vec<String> = layeragent_tools::definitions_with_team(&config, true)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for denied in consult::CONSULTANT_DENIED
+            .iter()
+            .chain(["write_file", "edit_file"].iter())
+        {
+            assert!(!names.contains(&denied.to_string()), "{denied}");
+        }
+        for kept in [
+            "read_file",
+            "team_message",
+            "team_patch_show",
+            "team_patch_review",
+            "team_wait",
+        ] {
+            assert!(names.contains(&kept.to_string()), "{kept}");
+        }
+        // An operator list that leaves nothing keeps meaning nothing.
+        let mut narrow = Config::default();
+        narrow.policy.allowed_tools = vec!["team_consult".into()];
+        consult::restrict(&mut narrow);
+        assert!(layeragent_tools::definitions_with_team(&narrow, true).is_empty());
     }
 }

@@ -10,6 +10,7 @@ use layeragent_protocol::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
+mod consult;
 mod writers;
 pub use writers::{PatchCarry, PatchSubmission, ReviewOutcome, WriterState};
 
@@ -336,7 +337,9 @@ impl Storage {
             ensure!(revision == input.expected_revision, TeamConflict);
             ensure!(!input.name.trim().is_empty() && input.name.len() <= 64 && !input.justification.trim().is_empty(), "member name and distinct-work justification are required");
             ensure!(input.role != TeamRole::Coordinator, "a team has exactly one coordinator");
-            let count: i64 = tx.query_row("SELECT count(*) FROM team_members WHERE team_id=?1", [&team], |r| r.get(0))?;
+            ensure!(input.role != TeamRole::Consultant, "a consultant joins for one question with team_consult, not as a member");
+            // Consultants come and go; they never take a member place.
+            let count: i64 = tx.query_row("SELECT count(*) FROM team_members WHERE team_id=?1 AND role<>'consultant'", [&team], |r| r.get(0))?;
             ensure!((count as usize) < opts.limits.max_members, "team member limit reached");
             let id = new_id();
             let at = now_ms();
@@ -373,8 +376,9 @@ impl Storage {
             let revision: i64 = tx.query_row("SELECT revision FROM teams WHERE id=?1 AND state='active'", [&team], |r| r.get(0))?;
             ensure!(revision == input.expected_revision, TeamConflict);
             ensure!(!input.title.trim().is_empty() && !input.deliverable.trim().is_empty() && !input.close_conditions.trim().is_empty(), "work title, deliverable and close conditions are required");
+            ensure!(member_team(&tx, &team, &member)? != TeamRole::Consultant, "a consultant answers its question; it does not create work");
             if let Some(assignee) = &input.assignee {
-                member_team(&tx, &team, assignee)?;
+                ensure!(member_team(&tx, &team, assignee)? != TeamRole::Consultant, "work cannot be assigned to a consultant; ask it with team_consult");
             }
             let id = new_id();
             let at = now_ms();
@@ -407,7 +411,7 @@ impl Storage {
         let (team, member, work) = (team.to_string(), member.to_string(), work.to_string());
         self.write(move |c| {
             let tx = c.transaction()?;
-            member_team(&tx, &team, &member)?;
+            ensure!(member_team(&tx, &team, &member)? != TeamRole::Consultant, "a consultant answers its question; it does not take work");
             ensure!(team_state(&tx, &team)? == "active", "team is not accepting new work claims");
             let (assignee, revision): (Option<String>, i64) = tx.query_row("SELECT assignee,revision FROM team_work WHERE id=?1 AND team_id=?2 AND state IN ('pending','assigned')", params![work, team], |r| Ok((r.get(0)?, r.get(1)?)))?;
             ensure!(revision == expected_revision, TeamConflict);
@@ -741,7 +745,7 @@ impl Storage {
         let (activation, session) = (activation.to_string(), session.to_string());
         self.read(move |c| {
             c.query_row(
-                "SELECT a.id,a.team_id,t.task_id,a.member_id,m.name,m.role,a.generation,COALESCE(m.model,''),t.template,t.template_version,t.options,m.access_applied,m.worktree FROM team_activations a JOIN teams t ON t.id=a.team_id JOIN team_members m ON m.id=a.member_id AND m.team_id=t.id WHERE a.id=?1 AND m.session_id=?2 AND a.state='running' AND a.lease_expires_at>?3",
+                "SELECT a.id,a.team_id,t.task_id,a.member_id,m.name,m.role,a.generation,COALESCE(m.model,''),t.template,t.template_version,t.options,m.access_applied,m.worktree,a.model,a.model_identity FROM team_activations a JOIN teams t ON t.id=a.team_id JOIN team_members m ON m.id=a.member_id AND m.team_id=t.id WHERE a.id=?1 AND m.session_id=?2 AND a.state='running' AND a.lease_expires_at>?3",
                 params![activation, session, now_ms()],
                 |row| {
                     let model: String = row.get(7)?;
@@ -753,6 +757,8 @@ impl Storage {
                         template_version: row.get(9)?, options: serde_json::from_str(&row.get::<_,String>(10)?).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))))?,
                         access: row.get::<_,String>(11)?.parse().map_err(|error: anyhow::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))))?,
                         worktree: row.get(12)?,
+                        activation_model: row.get(13)?,
+                        model_identity: row.get(14)?,
                     })
                 },
             ).context("activation is stale, expired or outside the member session")
@@ -823,8 +829,8 @@ impl Storage {
     pub async fn team_candidates(&self, team: &str) -> Result<Vec<Value>> {
         let team = team.to_string();
         self.read(move |c| {
-            let mut q = c.prepare("SELECT m.id,m.name,m.role,m.model,m.session_id,m.activations FROM team_members m WHERE m.team_id=?1 AND m.state IN ('inactive','waiting_response') AND NOT EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=m.id AND a.state IN ('starting','running')) AND (m.activations=0 OR EXISTS(SELECT 1 FROM team_deliveries d WHERE d.recipient_member_id=m.id AND d.state='accepted') OR EXISTS(SELECT 1 FROM team_work w WHERE w.assignee=m.id AND w.state IN ('pending','assigned')) OR (m.access='write' AND m.access_applied='read')) ORDER BY m.role='coordinator' DESC,m.created_at,m.rowid")?;
-            let rows = q.query_map([&team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"activations":r.get::<_,i64>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut q = c.prepare("SELECT m.id,m.name,m.role,m.model,m.session_id,m.activations,m.consult_asker,m.consult_question,m.consult_budget,(SELECT s.name FROM team_members s WHERE s.id=m.consult_asker) FROM team_members m WHERE m.team_id=?1 AND m.state IN ('inactive','waiting_response') AND NOT EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=m.id AND a.state IN ('starting','running')) AND (m.activations=0 OR EXISTS(SELECT 1 FROM team_deliveries d WHERE d.recipient_member_id=m.id AND d.state='accepted') OR EXISTS(SELECT 1 FROM team_work w WHERE w.assignee=m.id AND w.state IN ('pending','assigned')) OR (m.access='write' AND m.access_applied='read')) ORDER BY m.role='coordinator' DESC,m.created_at,m.rowid")?;
+            let rows = q.query_map([&team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"activations":r.get::<_,i64>(5)?,"consult":r.get::<_,Option<String>>(6)?.map(|asker| json!({"asker":asker,"question_id":r.get::<_,Option<String>>(7).ok().flatten(),"budget_tokens":r.get::<_,Option<i64>>(8).ok().flatten(),"asker_name":r.get::<_,Option<String>>(9).ok().flatten()}))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         }).await
     }
@@ -846,17 +852,46 @@ impl Storage {
         .await
     }
 
+    /// Records the model alias the supervisor runs members without their own
+    /// model with, so peers can see which model each member uses.
+    pub async fn team_record_default_model(&self, team: &str, model: &str) -> Result<()> {
+        let (team, model) = (team.to_string(), model.to_string());
+        self.write(move |c| {
+            c.execute(
+                "UPDATE teams SET default_model=?2 WHERE id=?1",
+                params![team, model],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn team_start_activation(
         &self,
         team: &str,
         member: &str,
         lease_owner: &str,
     ) -> Result<Value> {
+        self.team_start_activation_with_model(team, member, lease_owner, None, None)
+            .await
+    }
+
+    /// Starts an activation and records the model it runs with: its alias and
+    /// its [`layeragent_protocol::model_identity`].
+    pub async fn team_start_activation_with_model(
+        &self,
+        team: &str,
+        member: &str,
+        lease_owner: &str,
+        model: Option<&str>,
+        identity: Option<&str>,
+    ) -> Result<Value> {
         let (team, member, lease_owner) = (
             team.to_string(),
             member.to_string(),
             lease_owner.to_string(),
         );
+        let (model, identity) = (model.map(str::to_string), identity.map(str::to_string));
         self.write(move |c| {
             let tx = c.transaction()?;
             let opts = options(&tx, &team)?;
@@ -880,11 +915,11 @@ impl Storage {
             let member_live: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM team_activations WHERE member_id=?1 AND state IN ('starting','running'))", [&member], |r| r.get(0))?;
             ensure!(!member_live, "member already has a live activation");
             let id = new_id();
-            tx.execute("INSERT INTO team_activations(id,team_id,member_id,generation,lease_owner,lease_expires_at,state,started_at) VALUES(?1,?2,?3,?4,?5,?6,'running',?7)", params![id, team, member, used + 1, lease_owner, at + 300_000, at])?;
+            tx.execute("INSERT INTO team_activations(id,team_id,member_id,generation,lease_owner,lease_expires_at,state,started_at,model,model_identity) VALUES(?1,?2,?3,?4,?5,?6,'running',?7,?8,?9)", params![id, team, member, used + 1, lease_owner, at + 300_000, at, model, identity])?;
             tx.execute("UPDATE team_members SET activations=activations+1,state='working',reason=NULL,access_applied=access,updated_at=?2 WHERE id=?1", params![member, at])?;
             tx.execute("UPDATE teams SET active_since=COALESCE(active_since,?2),updated_at=?2 WHERE id=?1", params![team, at])?;
             let access: String = tx.query_row("SELECT access FROM team_members WHERE id=?1", [&member], |r| r.get(0))?;
-            event(&tx, &team, "team_activation_started", json!({"activation_id":id,"member_id":member,"generation":used+1,"access":access}), at)?;
+            event(&tx, &team, "team_activation_started", json!({"activation_id":id,"member_id":member,"generation":used+1,"access":access,"model":model}), at)?;
             tx.commit()?;
             Ok(json!({"id":id,"team_id":team,"member_id":member,"generation":used+1}))
         })
@@ -922,6 +957,9 @@ impl Storage {
             }
             settle_active_time(&tx, &team, at)?;
             event(&tx, &team, "team_activation_finished", json!({"activation_id":activation,"member_id":member,"state":state,"reason":reason}), at)?;
+            if member_team(&tx, &team, &member)? == TeamRole::Consultant {
+                consult::settle(&tx, &team, &member, &state, reason.as_deref(), at)?;
+            }
             tx.commit()?;
             Ok(true)
         })
@@ -1046,7 +1084,7 @@ impl Storage {
         ensure!(
             matches!(
                 category,
-                "coordination" | "investigation" | "review" | "verification"
+                "coordination" | "investigation" | "review" | "verification" | "consultation"
             ),
             "invalid usage category"
         );
@@ -1062,6 +1100,7 @@ impl Storage {
             let (state, member_state): (String, String) = tx.query_row("SELECT t.state,m.state FROM teams t JOIN team_activations a ON a.team_id=t.id JOIN team_members m ON m.id=a.member_id WHERE a.id=?1 AND t.id=?2", params![activation,team], |r| Ok((r.get(0)?,r.get(1)?)))?;
             ensure!(!matches!(state.as_str(), "paused" | "blocked") && member_state != "paused", TeamPaused);
             ensure!(state == "active", "team no longer accepts provider calls");
+            consult::check_budget(&tx, &activation)?;
             let opts = options(&tx, &team)?;
             let (usage, reserved_tokens, reserved_cost): (String, i64, f64) = tx.query_row("SELECT usage,COALESCE((SELECT sum(input_tokens+output_tokens) FROM team_reservations WHERE team_id=?1 AND state IN ('reserved','uncertain')),0),COALESCE((SELECT sum(estimated_cost_usd) FROM team_reservations WHERE team_id=?1 AND state IN ('reserved','uncertain')),0) FROM teams WHERE id=?1", [&team], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             let usage: Value = serde_json::from_str(&usage)?;
@@ -1774,6 +1813,10 @@ fn settle_active_time(c: &Connection, team: &str, at: i64) -> Result<()> {
 
 fn team_snapshot(c: &Connection, team: &str) -> Result<TeamSnapshot> {
     let (task, state, reason, revision, template, version, opts, usage, created, updated): (String,String,Option<String>,i64,String,u32,String,String,i64,i64) = c.query_row("SELECT task_id,state,reason,revision,template,template_version,options,usage,created_at,updated_at FROM teams WHERE id=?1", [team], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)))?;
+    let default_model: Option<String> =
+        c.query_row("SELECT default_model FROM teams WHERE id=?1", [team], |r| {
+            r.get(0)
+        })?;
     let (reserved, uncertain): (i64, i64) = c.query_row("SELECT COALESCE(sum(CASE WHEN state='reserved' THEN input_tokens+output_tokens ELSE 0 END),0),COALESCE(sum(CASE WHEN state='uncertain' THEN input_tokens+output_tokens ELSE 0 END),0) FROM team_reservations WHERE team_id=?1", [team], |r| Ok((r.get(0)?,r.get(1)?)))?;
     let open: i64 = c.query_row("SELECT count(*) FROM team_messages m WHERE m.team_id=?1 AND m.state='accepted' AND m.purpose IN ('question','verification_request') AND m.resolved_at IS NULL AND NOT EXISTS(SELECT 1 FROM team_messages response WHERE response.team_id=m.team_id AND response.reply_to=m.id AND response.purpose='response' AND response.state='accepted')", [team], |r| r.get(0))?;
     let template: TeamTemplate = template.parse()?;
@@ -1805,6 +1848,7 @@ fn team_snapshot(c: &Connection, team: &str) -> Result<TeamSnapshot> {
         reservations: json!({"reserved_tokens":reserved,"uncertain_tokens":uncertain,"estimate_only":true,"provider_billing":false}),
         open_questions: open as u64,
         pending_approvals,
+        default_model,
         last_event_seq: c.query_row("SELECT last_event_seq FROM tasks WHERE id=?1", [&task], |r| r.get(0))?,
         pause_pending: state == "paused" && c.query_row("SELECT EXISTS(SELECT 1 FROM team_activations WHERE team_id=?1 AND state IN ('starting','running') AND pause_boundary=0)", [team], |r| r.get::<_, bool>(0))?,
         created_at: created,
@@ -1813,8 +1857,16 @@ fn team_snapshot(c: &Connection, team: &str) -> Result<TeamSnapshot> {
 }
 
 fn members(c: &Connection, team: &str) -> Result<Vec<Value>> {
-    let mut q = c.prepare("SELECT id,name,role,model,session_id,state,reason,work_state,current_work_id,activations,initial_assessment IS NOT NULL,created_at,updated_at,access,access_applied,(SELECT json_group_array(p.path) FROM team_path_claims p WHERE p.team_id=m.team_id AND p.member_id=m.id) FROM team_members m WHERE team_id=?1 ORDER BY created_at,rowid")?;
-    let rows = q.query_map([team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"reason":r.get::<_,Option<String>>(6)?,"work_state":r.get::<_,String>(7)?,"current_work_id":r.get::<_,Option<String>>(8)?,"activations":r.get::<_,i64>(9)?,"initial_assessment_recorded":r.get::<_,bool>(10)?,"created_at":r.get::<_,i64>(11)?,"updated_at":r.get::<_,i64>(12)?,"access":r.get::<_,String>(13)?,"access_applied":r.get::<_,String>(14)?,"claimed_paths":serde_json::from_str::<Value>(&r.get::<_,String>(15)?).unwrap_or(json!([]))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut q = c.prepare("SELECT id,name,role,model,session_id,state,reason,work_state,current_work_id,activations,initial_assessment IS NOT NULL,created_at,updated_at,access,access_applied,(SELECT json_group_array(p.path) FROM team_path_claims p WHERE p.team_id=m.team_id AND p.member_id=m.id),(SELECT a.model FROM team_activations a WHERE a.member_id=m.id AND a.model IS NOT NULL ORDER BY a.started_at DESC,a.rowid DESC LIMIT 1),consult_asker,consult_question,consult_budget,consult_outcome FROM team_members m WHERE team_id=?1 ORDER BY created_at,rowid")?;
+    let mut rows = q.query_map([team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"reason":r.get::<_,Option<String>>(6)?,"work_state":r.get::<_,String>(7)?,"current_work_id":r.get::<_,Option<String>>(8)?,"activations":r.get::<_,i64>(9)?,"initial_assessment_recorded":r.get::<_,bool>(10)?,"created_at":r.get::<_,i64>(11)?,"updated_at":r.get::<_,i64>(12)?,"access":r.get::<_,String>(13)?,"access_applied":r.get::<_,String>(14)?,"claimed_paths":serde_json::from_str::<Value>(&r.get::<_,String>(15)?).unwrap_or(json!([])),"last_model":r.get::<_,Option<String>>(16)?,"consult":r.get::<_,Option<String>>(17)?.map(|asker| json!({"asker":asker,"question_id":r.get::<_,Option<String>>(18).ok().flatten(),"budget_tokens":r.get::<_,Option<i64>>(19).ok().flatten(),"outcome":r.get::<_,Option<String>>(20).ok().flatten()}))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(q);
+    for row in &mut rows {
+        if row["role"] == "consultant"
+            && let Some(id) = row["id"].as_str().map(str::to_string)
+        {
+            row["consult"]["tokens_used"] = json!(consult::tokens_used(c, &id)?);
+        }
+    }
     Ok(rows)
 }
 
@@ -1873,6 +1925,12 @@ fn send_message(
     }
     if input.purpose == MessagePurpose::Handoff {
         ensure!(sender_kind == "member", "only a member can hand off work");
+        if let Some(recipient) = &input.recipient {
+            ensure!(
+                member_team(c, team, recipient)? != TeamRole::Consultant,
+                "work cannot be handed to a consultant; ask it with team_consult"
+            );
+        }
         ensure!(
             input.recipient.is_some() && input.work_id.is_some(),
             "a handoff requires a recipient and a work_id"
@@ -1957,7 +2015,9 @@ fn send_message(
         );
         vec![recipient.clone()]
     } else {
-        let mut q = c.prepare("SELECT id FROM team_members WHERE team_id=?1 AND state NOT IN ('terminated','failed') AND (?2 IS NULL OR id<>?2)")?;
+        // A consultant only receives what is addressed to it: a broadcast
+        // would spend its budget on work it was not brought in for.
+        let mut q = c.prepare("SELECT id FROM team_members WHERE team_id=?1 AND state NOT IN ('terminated','failed') AND role<>'consultant' AND (?2 IS NULL OR id<>?2)")?;
         q.query_map(params![team, sender], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -2191,7 +2251,32 @@ fn markdown_export(
         team.template_version,
         team.state
     );
-    out.push_str("Cost and token figures are estimates, not provider invoices. Incorporated context does not attest model comprehension.\n\n## Work\n");
+    out.push_str("Cost and token figures are estimates, not provider invoices. Incorporated context does not attest model comprehension.\n\n## Members\n");
+    for member in &team.members {
+        let model = member["model"]
+            .as_str()
+            .or(member["last_model"].as_str())
+            .or(team.default_model.as_deref())
+            .unwrap_or("unknown");
+        let consult = if member["role"] == "consultant" {
+            format!(
+                "; consultation {}, {} of {} tokens",
+                member["consult"]["outcome"].as_str().unwrap_or("open"),
+                member["consult"]["tokens_used"].as_i64().unwrap_or(0),
+                member["consult"]["budget_tokens"].as_i64().unwrap_or(0)
+            )
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "- {} ({}), model {}{}\n",
+            inline(&member["name"]),
+            member["role"].as_str().unwrap_or(""),
+            inline(&json!(model)),
+            consult
+        ));
+    }
+    out.push_str("\n## Work\n");
     for row in work {
         out.push_str(&format!(
             "- `{}` {} — {} ({})\n",
@@ -3700,13 +3785,13 @@ mod tests {
 
         assert!(
             f.store
-                .team_review_precheck(&f.team, &analyst, &patch)
+                .team_review_precheck(&f.team, &analyst, &patch, true)
                 .await
                 .is_err()
         );
         let (meta, body) = f
             .store
-            .team_review_precheck(&f.team, &reviewer, &patch)
+            .team_review_precheck(&f.team, &reviewer, &patch, true)
             .await?;
         assert_eq!(meta["files"], json!(["src/lib.rs"]));
         assert!(body.starts_with(b"diff --git"));
@@ -4596,5 +4681,486 @@ mod tests {
             wait_cycle(&[edge("a", "b"), edge("b", "a")]).map(|c| c.len()),
             Some(2)
         );
+    }
+
+    impl Fixture {
+        /// An activation recorded as running `identity`, like the supervisor
+        /// starts one.
+        async fn activation_on(&self, member: &str, identity: &str) -> Result<(String, String)> {
+            let activation = self
+                .store
+                .team_start_activation_with_model(
+                    &self.team,
+                    member,
+                    "fixture",
+                    Some(identity),
+                    Some(identity),
+                )
+                .await?;
+            let id = activation["id"].as_str().context("id")?.to_string();
+            let session = self
+                .store
+                .create_session(&self.scope.principal, self._dir.path())
+                .await?;
+            self.store
+                .team_bind_member_session(
+                    &self.team,
+                    member,
+                    &id,
+                    activation["generation"].as_i64().context("generation")?,
+                    &session.id,
+                )
+                .await?;
+            Ok((id, session.id))
+        }
+
+        async fn finish(&self, activation: &str, member: &str, state: &str) -> Result<()> {
+            let generation = self
+                .store
+                .team_members(&self.team)
+                .await?
+                .iter()
+                .find(|m| m["id"] == member)
+                .and_then(|m| m["activations"].as_i64())
+                .context("generation")?;
+            self.store
+                .team_finish_activation(activation, member, generation, state, None, &json!({}))
+                .await?;
+            Ok(())
+        }
+
+        async fn consult(
+            &self,
+            asker: &str,
+            key: &str,
+            max_tokens: Option<u64>,
+            patch: Option<&str>,
+        ) -> Result<Value> {
+            self.store
+                .team_consult(
+                    &self.team,
+                    asker,
+                    layeragent_protocol::TeamConsultInput {
+                        idempotency_key: key.into(),
+                        expected_revision: self.revision().await?,
+                        question: format!("second opinion {key}: is the parser safe?"),
+                        model: Some("deepseek".into()),
+                        name: None,
+                        max_tokens,
+                        work_id: None,
+                        patch_id: patch.map(str::to_string),
+                    },
+                )
+                .await
+        }
+
+        async fn member_row(&self, id: &str) -> Result<Value> {
+            self.store
+                .team_members(&self.team)
+                .await?
+                .into_iter()
+                .find(|m| m["id"] == id)
+                .context("member row")
+        }
+
+        async fn deliveries_to(&self, member: &str) -> Result<Vec<Value>> {
+            let (rows, _) = self
+                .store
+                .team_resource(&self.scope, &self.task, "deliveries", 0, 200)
+                .await?;
+            let messages = self
+                .store
+                .team_resource(&self.scope, &self.task, "messages", 0, 200)
+                .await?
+                .0;
+            Ok(rows
+                .into_iter()
+                .filter(|d| d["recipient_member_id"] == member)
+                .filter_map(|d| {
+                    messages
+                        .iter()
+                        .find(|m| m["id"] == d["message_id"])
+                        .cloned()
+                })
+                .collect())
+        }
+    }
+
+    fn cross_model() -> CooperativeOptions {
+        let mut options = writable();
+        options.cross_model_review = true;
+        options
+    }
+
+    #[tokio::test]
+    async fn cross_model_review_needs_an_approver_on_another_model() -> Result<()> {
+        let f = Fixture::new(cross_model()).await?;
+        let (analyst, reviewer, verifier) = (
+            f.member("analyst").await?,
+            f.member("reviewer").await?,
+            f.member("verifier").await?,
+        );
+        let work = f.owned_work(&analyst, "w").await?;
+        f.write(&analyst, &work, &["src"]).await?;
+        let (author_activation, _) = f.activation_on(&analyst, "claude-opus-5-5").await?;
+        let submitted = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], None),
+            )
+            .await?;
+        let patch = submitted["patch_id"].as_str().context("patch")?.to_string();
+        f.finish(&author_activation, &analyst, "completed").await?;
+
+        // Same model, another member: it may reject, not approve.
+        let (same, _) = f.activation_on(&reviewer, "claude-opus-5-5").await?;
+        let refused = f
+            .store
+            .team_review_precheck(&f.team, &reviewer, &patch, true)
+            .await
+            .expect_err("same model");
+        assert!(
+            refused.to_string().contains("cross-model review"),
+            "{refused}"
+        );
+        f.store
+            .team_review_precheck(&f.team, &reviewer, &patch, false)
+            .await?;
+        let around = f
+            .store
+            .team_review_record(
+                &f.team,
+                &reviewer,
+                &patch,
+                ReviewOutcome::Integrated,
+                "lgtm",
+            )
+            .await;
+        assert!(around.is_err(), "the record repeats the check");
+        f.finish(&same, &reviewer, "completed").await?;
+
+        let (other, _) = f.activation_on(&verifier, "deepseek-chat").await?;
+        f.store
+            .team_review_precheck(&f.team, &verifier, &patch, true)
+            .await?;
+        let review = f
+            .store
+            .team_review_record(
+                &f.team,
+                &verifier,
+                &patch,
+                ReviewOutcome::Integrated,
+                "checked",
+            )
+            .await?;
+        assert_eq!(review["state"], "integrated");
+        f.finish(&other, &verifier, "completed").await?;
+        let (meta, _) = f.store.team_patch(&f.team, &patch).await?;
+        assert_eq!(meta["author_model"], "claude-opus-5-5");
+        assert_eq!(meta["reviewer_model"], "deepseek-chat");
+        assert_eq!(
+            f.member_row(&analyst).await?["last_model"],
+            "claude-opus-5-5"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_consultant_answers_once_without_taking_a_member_place() -> Result<()> {
+        let mut options = CooperativeOptions::default();
+        options.limits.max_members = 4;
+        let f = Fixture::new(options).await?;
+        let coordinator = f.member("coordinator").await?;
+        let full = f
+            .store
+            .team_add_member(
+                &f.team,
+                &coordinator,
+                TeamMemberInput {
+                    idempotency_key: "add".into(),
+                    expected_revision: f.revision().await?,
+                    name: "extra".into(),
+                    role: TeamRole::Analyst,
+                    justification: "more hands".into(),
+                    model: None,
+                },
+            )
+            .await;
+        assert!(full.expect_err("full").to_string().contains("member limit"));
+        let joined = f.consult(&coordinator, "c1", None, None).await?;
+        let consultant = joined["consultant_id"].as_str().context("id")?.to_string();
+        let question = joined["question_id"].as_str().context("q")?.to_string();
+        assert_eq!(joined["budget_tokens"], 150_000);
+        assert_eq!(joined["model"], "deepseek");
+        let row = f.member_row(&consultant).await?;
+        assert_eq!(row["role"], "consultant");
+        assert_eq!(row["consult"]["question_id"], question.as_str());
+        assert_eq!(row["consult"]["tokens_used"], 0);
+        assert!(
+            f.store
+                .team_candidates(&f.team)
+                .await?
+                .iter()
+                .any(|c| c["id"] == consultant.as_str()
+                    && c["consult"]["asker"] == coordinator.as_str())
+        );
+
+        // Broadcasts, work and member roles are not for consultants.
+        let broadcast = f
+            .store
+            .team_member_message(
+                &f.team,
+                &coordinator,
+                f.message("all", MessagePurpose::Observation, None, "plan is up")
+                    .await?,
+            )
+            .await?;
+        assert_eq!(broadcast["deliveries"], 3);
+        let work = f
+            .store
+            .team_create_work(
+                &f.team,
+                &coordinator,
+                TeamWorkInput {
+                    idempotency_key: "w".into(),
+                    expected_revision: f.revision().await?,
+                    title: "t".into(),
+                    deliverable: "d".into(),
+                    assignee: None,
+                    dependencies: vec![],
+                    priority: 1,
+                    close_conditions: "c".into(),
+                },
+            )
+            .await?;
+        let work = work["id"].as_str().context("work")?.to_string();
+        assert!(
+            f.store
+                .team_claim_work(&f.team, &consultant, &work, 1)
+                .await
+                .is_err()
+        );
+        assert!(f.consult(&consultant, "nested", None, None).await.is_err());
+        let analyst_role = f
+            .store
+            .team_add_member(
+                &f.team,
+                &coordinator,
+                TeamMemberInput {
+                    idempotency_key: "add-consultant".into(),
+                    expected_revision: f.revision().await?,
+                    name: "c".into(),
+                    role: TeamRole::Consultant,
+                    justification: "x".into(),
+                    model: None,
+                },
+            )
+            .await;
+        assert!(
+            analyst_role
+                .expect_err("role")
+                .to_string()
+                .contains("team_consult")
+        );
+
+        let (activation, _) = f.activation_on(&consultant, "deepseek-chat").await?;
+        let incorporated = f
+            .store
+            .team_incorporate(&f.team, &consultant, &activation, 1)
+            .await?;
+        assert_eq!(incorporated.len(), 1, "only the question reaches it");
+        assert_eq!(incorporated[0]["id"], question.as_str());
+        let mut answer = f
+            .message(
+                "answer",
+                MessagePurpose::Response,
+                Some(coordinator.clone()),
+                "it is safe",
+            )
+            .await?;
+        answer.reply_to = Some(question.clone());
+        f.store
+            .team_member_message(&f.team, &consultant, answer)
+            .await?;
+        f.finish(&activation, &consultant, "completed").await?;
+        let row = f.member_row(&consultant).await?;
+        assert_eq!(row["state"], "terminated");
+        assert_eq!(row["consult"]["outcome"], "answered");
+        assert!(
+            f.deliveries_to(&coordinator)
+                .await?
+                .iter()
+                .any(|m| m["body"] == "it is safe")
+        );
+        let late = f
+            .store
+            .team_member_message(
+                &f.team,
+                &coordinator,
+                f.message(
+                    "late",
+                    MessagePurpose::Question,
+                    Some(consultant.clone()),
+                    "one more?",
+                )
+                .await?,
+            )
+            .await;
+        assert!(late.is_err(), "a retired consultant receives nothing");
+        assert_eq!(
+            f.store.team_snapshot_by_id(&f.team).await?.open_questions,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_consultation_that_overspends_or_goes_quiet_is_reported_to_the_asker() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let analyst = f.member("analyst").await?;
+        let first = f.consult(&analyst, "spend", Some(5_000), None).await?;
+        let second = f.consult(&analyst, "quiet", None, None).await?;
+        let third = f.consult(&analyst, "third", None, None).await;
+        assert!(
+            third
+                .expect_err("two at once")
+                .to_string()
+                .contains("already running")
+        );
+        let small = f
+            .store
+            .team_consult(
+                &f.team,
+                &analyst,
+                layeragent_protocol::TeamConsultInput {
+                    idempotency_key: "tiny".into(),
+                    expected_revision: f.revision().await?,
+                    question: "q".into(),
+                    model: None,
+                    name: None,
+                    max_tokens: Some(10),
+                    work_id: None,
+                    patch_id: None,
+                },
+            )
+            .await;
+        assert!(small.is_err());
+
+        let spender = first["consultant_id"].as_str().context("id")?.to_string();
+        let (activation, _) = f.activation_on(&spender, "deepseek-chat").await?;
+        let reservation = f
+            .store
+            .team_reserve(&f.team, &activation, 1, "consultation", 100, 100, 0.0)
+            .await?;
+        f.store
+            .team_settle_reservation(
+                &reservation,
+                &activation,
+                Some(&layeragent_protocol::Usage {
+                    input_tokens: 4_000,
+                    output_tokens: 1_500,
+                }),
+                0.0,
+                false,
+            )
+            .await?;
+        let over = f
+            .store
+            .team_reserve(&f.team, &activation, 1, "consultation", 100, 100, 0.0)
+            .await
+            .expect_err("budget");
+        assert!(over.to_string().contains("budget exhausted"), "{over}");
+        f.finish(&activation, &spender, "failed").await?;
+        let row = f.member_row(&spender).await?;
+        assert_eq!(row["state"], "terminated");
+        assert_eq!(row["consult"]["outcome"], "budget_exhausted");
+        assert_eq!(row["consult"]["tokens_used"], 5_500);
+
+        let quiet = second["consultant_id"].as_str().context("id")?.to_string();
+        let (activation, _) = f.activation_on(&quiet, "deepseek-chat").await?;
+        f.finish(&activation, &quiet, "completed").await?;
+        assert_eq!(
+            f.member_row(&quiet).await?["consult"]["outcome"],
+            "unanswered"
+        );
+        let notices: Vec<Value> = f
+            .deliveries_to(&analyst)
+            .await?
+            .into_iter()
+            .filter(|m| m["sender_kind"] == "runtime")
+            .collect();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices.iter().any(|m| {
+            m["body"]
+                .as_str()
+                .is_some_and(|b| b.contains("budget exhausted"))
+        }));
+        assert_eq!(
+            f.store.team_snapshot_by_id(&f.team).await?.open_questions,
+            0,
+            "both questions are resolved"
+        );
+        // Retired consultations free a running place, not the lifetime count.
+        f.consult(&analyst, "after", None, None).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_consultant_on_another_model_reviews_a_patch_and_that_answers_it() -> Result<()> {
+        let f = Fixture::new(cross_model()).await?;
+        let (coordinator, analyst) = (f.member("coordinator").await?, f.member("analyst").await?);
+        let work = f.owned_work(&analyst, "w").await?;
+        f.write(&analyst, &work, &["src"]).await?;
+        let (author, _) = f.activation_on(&analyst, "claude-opus-5-5").await?;
+        let submitted = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], None),
+            )
+            .await?;
+        let patch = submitted["patch_id"].as_str().context("patch")?.to_string();
+        f.finish(&author, &analyst, "completed").await?;
+        let joined = f
+            .consult(&coordinator, "review", None, Some(&patch))
+            .await?;
+        let consultant = joined["consultant_id"].as_str().context("id")?.to_string();
+        let question = joined["question_id"].as_str().context("q")?.to_string();
+        let (activation, _) = f.activation_on(&consultant, "deepseek-chat").await?;
+        f.store
+            .team_review_precheck(&f.team, &consultant, &patch, true)
+            .await?;
+        f.store
+            .team_review_record(
+                &f.team,
+                &consultant,
+                &patch,
+                ReviewOutcome::Integrated,
+                "safe rename",
+            )
+            .await?;
+        f.finish(&activation, &consultant, "completed").await?;
+        assert_eq!(
+            f.member_row(&consultant).await?["consult"]["outcome"],
+            "answered"
+        );
+        let to_coordinator = f.deliveries_to(&coordinator).await?;
+        assert!(
+            to_coordinator
+                .iter()
+                .any(|m| m["purpose"] == "response" && m["reply_to"] == question.as_str()),
+            "the decision answers the consultation"
+        );
+        assert!(
+            f.deliveries_to(&analyst)
+                .await?
+                .iter()
+                .any(|m| m["purpose"] == "observation"
+                    && m["body"].as_str().is_some_and(|b| b.contains("approved")))
+        );
+        Ok(())
     }
 }

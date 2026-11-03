@@ -334,6 +334,8 @@ impl Client {
                     | "finding_revisions"
                     | "objections"
                     | "evidence"
+                    | "patches"
+                    | "claims"
             ),
             "unknown team resource"
         );

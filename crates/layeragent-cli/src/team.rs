@@ -17,6 +17,10 @@ pub struct ExecutionOptions {
     pub max_seconds: Option<u64>,
     #[arg(long)]
     pub max_cost_usd: Option<f64>,
+    /// Let members switch to writing: each writes in its own worktree, and a
+    /// change reaches the project only when another member approves it.
+    #[arg(long)]
+    pub allow_write: bool,
 }
 impl ExecutionOptions {
     pub fn body(&self) -> Result<Value> {
@@ -29,7 +33,8 @@ impl ExecutionOptions {
         let configured = self.template.is_some()
             || self.max_tokens.is_some()
             || self.max_seconds.is_some()
-            || self.max_cost_usd.is_some();
+            || self.max_cost_usd.is_some()
+            || self.allow_write;
         ensure!(
             mode == ExecutionMode::Cooperative || !configured,
             "team options require --execution cooperative"
@@ -54,6 +59,7 @@ impl ExecutionOptions {
         if let Some(value) = self.max_cost_usd {
             options.limits.max_cost_usd = Some(value);
         }
+        options.scope.allow_write = self.allow_write;
         let options = options.normalized(None)?;
         Ok(json!({"execution":mode,"cooperative":options}))
     }
@@ -68,6 +74,8 @@ pub enum TeamCommand {
     Findings(Inspect),
     Objections(Inspect),
     Evidence(Inspect),
+    /// Patches members submitted, handed over or left unsubmitted.
+    Patches(Inspect),
     Message {
         task: String,
         #[arg(long)]
@@ -198,12 +206,26 @@ pub fn summary(value: &Value) -> String {
     }
     if let Some(members) = team["members"].as_array() {
         for member in members {
+            let paths: Vec<&str> = member["claimed_paths"]
+                .as_array()
+                .map(|paths| paths.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
             out.push_str(&format!(
-                "{} ({}) · {} · {}{}\n",
+                "{} ({}) · {} · {}{}{}{}\n",
                 member["name"].as_str().unwrap_or("?"),
                 member["id"].as_str().unwrap_or("?"),
                 member["role"].as_str().unwrap_or("?"),
                 member["state"].as_str().unwrap_or("?"),
+                if member["access"] == "write" {
+                    " · escribe"
+                } else {
+                    ""
+                },
+                if paths.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · reserva: {}", paths.join(", "))
+                },
                 member["reason"]
                     .as_str()
                     .map(|s| format!(" · {s}"))
@@ -246,6 +268,7 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
         TeamCommand::Findings(args) => client.team_resource(&args.task, "findings").await?,
         TeamCommand::Objections(args) => client.team_resource(&args.task, "objections").await?,
         TeamCommand::Evidence(args) => client.team_resource(&args.task, "evidence").await?,
+        TeamCommand::Patches(args) => client.team_resource(&args.task, "patches").await?,
         TeamCommand::Message {
             task,
             to,
@@ -358,9 +381,11 @@ struct StartArgs {
     max_seconds: Option<u64>,
     #[arg(long)]
     max_cost_usd: Option<f64>,
+    #[arg(long)]
+    allow_write: bool,
 }
 pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
-    let (options, objective) = text.split_once(" -- ").context("Uso: /team start audit|debug|review [--max-tokens N] [--max-seconds N] [--max-cost-usd N] -- objetivo")?;
+    let (options, objective) = text.split_once(" -- ").context("Uso: /team start audit|debug|review [--max-tokens N] [--max-seconds N] [--max-cost-usd N] [--allow-write] -- objetivo")?;
     ensure!(!objective.trim().is_empty(), "objective is required");
     let args =
         StartArgs::try_parse_from(std::iter::once("start").chain(options.split_whitespace()))?;
@@ -370,6 +395,7 @@ pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
         max_tokens: args.max_tokens,
         max_seconds: args.max_seconds,
         max_cost_usd: args.max_cost_usd,
+        allow_write: args.allow_write,
     };
     options.body()?;
     Ok((options, objective.trim().into()))
@@ -388,6 +414,21 @@ mod tests {
         assert_eq!(body["cooperative"]["limits"]["max_tokens"], 10000);
         assert_eq!(body["cooperative"]["limits"]["max_active_seconds"], 50);
         assert!(parse_start("audit --max-tokens 0 -- x").is_err());
+        assert_eq!(body["cooperative"]["scope"]["allow_write"], false);
+        let (writable, _) = parse_start("debug --allow-write -- fix it")?;
+        assert_eq!(
+            writable.body()?["cooperative"]["scope"]["allow_write"],
+            true
+        );
+        assert!(
+            ExecutionOptions {
+                allow_write: true,
+                ..Default::default()
+            }
+            .body()
+            .is_err(),
+            "write scope needs --execution cooperative"
+        );
         assert!(
             ExecutionOptions {
                 template: Some("audit".into()),

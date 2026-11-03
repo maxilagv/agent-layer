@@ -2,9 +2,10 @@
 
 LayerAgent can run an individual agent, independent delegated agents, or a
 cooperative team whose members exchange durable messages. The terminal exposes
-the team's work, questions, decisions and evidence. The current cooperative
-milestone is read-only: writer roles and writable scope are refused until their
-isolated workspaces and integration flow are implemented.
+the team's work, questions, decisions and evidence. Members read the shared
+workspace; with `--allow-write`, any member can switch to writing in its own
+worktree, and its changes reach the workspace only when another member approves
+them (see [Writing members](#writing-members)).
 
 ## First reproducible run
 
@@ -83,6 +84,39 @@ operator instructions and still cannot expand the task's permissions.
 instruction before its next tool call; without it, the instruction is read at the
 start of the member's next round.
 
+## Writing members
+
+```bash
+layeragent run "Rename the session helper and update its callers" --workspace . \
+  --execution cooperative --template debug --allow-write
+layeragent team show TASK_ID      # who writes and which paths each reserves
+layeragent team patches TASK_ID   # submitted, handed-over and retained patches
+```
+
+`--allow-write` needs a task policy that allows writes and a Git repository with
+at least one commit. Without it the team only reads. With it:
+
+1. A member claims a work item and calls `team_access` with `mode=write`, the
+   work id and the files or directories it will change. Overlapping reservations
+   of another member are refused, naming who holds them.
+2. Its next activation runs in its own worktree, which starts from the workspace
+   as it is (including uncommitted and untracked files, except secret-looking
+   ones). Only writing activations get write tools.
+3. `team_patch_submit` records its changes as a patch with a runtime receipt and
+   can send the review request. Changes outside its reservations are refused.
+4. Another member reads it with `team_patch_show` and decides with
+   `team_patch_review`. Approving applies the patch to the workspace's working
+   tree whole or not at all, one approval at a time; nothing is committed.
+   A rejected or no-longer-applicable patch goes back to its author.
+5. When the workspace changes, worktrees are moved onto it and their own changes
+   are re-applied; conflicts are left marked for the member to resolve.
+
+`team_access` with `mode=read` switches a member back. A handoff from a writing
+member carries its unsubmitted changes to the recipient's worktree. When the team
+ends, worktrees are removed and unsubmitted changes are kept as retained patches.
+Your own uncommitted work in the workspace is preserved: integration only applies
+the approved patch.
+
 Other commands are `team messages`, `team work`, `team objections`,
 `team priority TASK_ID WORK_ID VALUE`, `team close TASK_ID` and
 `team cancel TASK_ID`. Query commands support JSON. Member targets accept an
@@ -104,7 +138,7 @@ conflicts are displayed instead of silently applying the action to changed state
 ```
 
 `/execution` selects the mode for subsequent prompts. `/team start` explicitly
-creates a cooperative task. `/team attach` only observes an existing task;
+creates a cooperative task; add `--allow-write` before `--` to let members write. `/team attach` only observes an existing task;
 resuming blocked execution requires `/team resume`. The panel opens automatically,
 uses a side view in wide terminals and a switchable view in compact terminals,
 and remains available after completion. Approvals take visual priority and name
@@ -136,8 +170,9 @@ an already paused team stays paused.
 Members exchange questions, observations, objections, verification requests,
 responses, claims and handoffs. A claim without an evidence receipt reaches its
 recipient marked as unsupported. A handoff moves the sender's in-progress work
-item to the recipient. A member can wait in place for an answer to its own open
-question instead of ending its activation, when a slot is free for the answer.
+item, its reserved paths and its unsubmitted changes to the recipient. A member
+can wait in place for an answer to its own open question instead of ending its
+activation, when a slot is free for the answer.
 
 Message acceptance, incorporation into context, response and resolution are
 different observations. Incorporation and the canonical history entry commit
@@ -151,8 +186,9 @@ The existing task creation endpoint accepts `execution` and `cooperative` option
 `GET /v1/tasks/{id}/team` returns the snapshot with `last_event_seq`,
 `pause_pending` and pending approvals. The existing task event stream includes
 `team_member_event` envelopes identifying the member and activation. Team resource
-queries include `deliveries` and `finding_revisions`; JSON exports also include
-attributed events. `GET /v1/tasks/{id}/team/{resource}?tail=N` returns the most
+queries include `deliveries`, `finding_revisions`, `patches` and `claims`; JSON
+exports also include attributed events and patches. Creating a task with
+`cooperative.scope.allow_write` requires a task policy that allows writes. `GET /v1/tasks/{id}/team/{resource}?tail=N` returns the most
 recent rows of a resource (at most 200), and
 `GET /v1/tasks/{id}/team/threads/{message}` returns the reply chain containing a
 message. A task-level correction on a cooperative task is refused; send an
@@ -160,6 +196,6 @@ operator instruction as a team message instead. Reads and writes retain task, pr
 
 Read the [implementation status](10-implementation-status.md) and current
 fingerprinted [verification report](verification.json) for executed checks and
-blocked qualification. Web/desktop team interfaces, cooperative writers,
-investigation memory, cross-mode quality evaluation and live-provider effectiveness
+blocked qualification. Web/desktop team interfaces, native confinement checks of
+worktree writers, investigation memory, cross-mode quality evaluation and live-provider effectiveness
 remain separate work.

@@ -2,7 +2,7 @@
 use crate::client::Client;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
-use layeragent_protocol::{CooperativeOptions, ExecutionMode, TeamTemplate};
+use layeragent_protocol::{CooperativeOptions, ExecutionMode, TeamRole, TeamTemplate};
 use serde_json::{Value, json};
 
 #[derive(Args, Clone, Debug, Default)]
@@ -21,6 +21,14 @@ pub struct ExecutionOptions {
     /// change reaches the project only when another member approves it.
     #[arg(long)]
     pub allow_write: bool,
+    /// Approve a patch only from a member or consultant on a different model
+    /// than the one that wrote it. Needs --allow-write.
+    #[arg(long)]
+    pub cross_model_review: bool,
+    /// Configured model alias consultants run when the member asking names
+    /// none.
+    #[arg(long)]
+    pub consultant_model: Option<String>,
 }
 impl ExecutionOptions {
     pub fn body(&self) -> Result<Value> {
@@ -34,7 +42,9 @@ impl ExecutionOptions {
             || self.max_tokens.is_some()
             || self.max_seconds.is_some()
             || self.max_cost_usd.is_some()
-            || self.allow_write;
+            || self.allow_write
+            || self.cross_model_review
+            || self.consultant_model.is_some();
         ensure!(
             mode == ExecutionMode::Cooperative || !configured,
             "team options require --execution cooperative"
@@ -60,6 +70,12 @@ impl ExecutionOptions {
             options.limits.max_cost_usd = Some(value);
         }
         options.scope.allow_write = self.allow_write;
+        options.cross_model_review = self.cross_model_review;
+        if let Some(model) = &self.consultant_model {
+            options
+                .role_models
+                .insert(TeamRole::Consultant, model.clone());
+        }
         let options = options.normalized(None)?;
         Ok(json!({"execution":mode,"cooperative":options}))
     }
@@ -201,6 +217,9 @@ pub fn summary(value: &Value) -> String {
     if let Some(reason) = team["reason"].as_str() {
         out.push_str(&format!("Motivo: {reason}\n"));
     }
+    if team["options"]["cross_model_review"] == true {
+        out.push_str("Revisión cruzada: un parche se aprueba solo desde otro modelo.\n");
+    }
     if team["pause_pending"] == true {
         out.push_str("Pausa pendiente: las operaciones activas están terminando.\n");
     }
@@ -210,11 +229,34 @@ pub fn summary(value: &Value) -> String {
                 .as_array()
                 .map(|paths| paths.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
+            let model = member["model"]
+                .as_str()
+                .or(member["last_model"].as_str())
+                .or(team["default_model"].as_str());
+            let consult = &member["consult"];
+            let consulting = if member["role"] == "consultant" {
+                let outcome = match consult["outcome"].as_str() {
+                    Some("answered") => "respondió",
+                    Some("unanswered") => "se retiró sin responder",
+                    Some("budget_exhausted") => "presupuesto agotado",
+                    Some("failed") => "falló",
+                    _ => "consultando",
+                };
+                format!(
+                    " · {outcome} · {}/{} tokens",
+                    consult["tokens_used"].as_i64().unwrap_or(0),
+                    consult["budget_tokens"].as_i64().unwrap_or(0)
+                )
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "{} ({}) · {} · {}{}{}{}\n",
+                "{} ({}) · {}{}{} · {}{}{}{}\n",
                 member["name"].as_str().unwrap_or("?"),
                 member["id"].as_str().unwrap_or("?"),
                 member["role"].as_str().unwrap_or("?"),
+                model.map(|m| format!(" · {m}")).unwrap_or_default(),
+                consulting,
                 member["state"].as_str().unwrap_or("?"),
                 if member["access"] == "write" {
                     " · escribe"
@@ -383,9 +425,13 @@ struct StartArgs {
     max_cost_usd: Option<f64>,
     #[arg(long)]
     allow_write: bool,
+    #[arg(long)]
+    cross_model_review: bool,
+    #[arg(long)]
+    consultant_model: Option<String>,
 }
 pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
-    let (options, objective) = text.split_once(" -- ").context("Uso: /team start audit|debug|review [--max-tokens N] [--max-seconds N] [--max-cost-usd N] [--allow-write] -- objetivo")?;
+    let (options, objective) = text.split_once(" -- ").context("Uso: /team start audit|debug|review [--max-tokens N] [--max-seconds N] [--max-cost-usd N] [--allow-write] [--cross-model-review] [--consultant-model ALIAS] -- objetivo")?;
     ensure!(!objective.trim().is_empty(), "objective is required");
     let args =
         StartArgs::try_parse_from(std::iter::once("start").chain(options.split_whitespace()))?;
@@ -396,6 +442,8 @@ pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
         max_seconds: args.max_seconds,
         max_cost_usd: args.max_cost_usd,
         allow_write: args.allow_write,
+        cross_model_review: args.cross_model_review,
+        consultant_model: args.consultant_model,
     };
     options.body()?;
     Ok((options, objective.trim().into()))
@@ -429,6 +477,19 @@ mod tests {
             .is_err(),
             "write scope needs --execution cooperative"
         );
+        let (cross, _) = parse_start(
+            "review --allow-write --cross-model-review --consultant-model deepseek -- check it",
+        )?;
+        let cross = cross.body()?;
+        assert_eq!(cross["cooperative"]["cross_model_review"], true);
+        assert_eq!(
+            cross["cooperative"]["role_models"]["consultant"],
+            "deepseek"
+        );
+        assert!(
+            parse_start("review --cross-model-review -- check it").is_err(),
+            "cross-model review needs a team that writes"
+        );
         assert!(
             ExecutionOptions {
                 template: Some("audit".into()),
@@ -443,6 +504,21 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn summary_shows_models_and_consultations() {
+        let snapshot = json!({"team":{"task_id":"t","state":"active","template":"review","default_model":"opus","options":{"cross_model_review":true},"members":[
+            {"id":"a","name":"analyst","role":"analyst","state":"inactive","access":"read","claimed_paths":[]},
+            {"id":"c","name":"consultant-1","role":"consultant","model":"deepseek","state":"terminated","claimed_paths":[],"consult":{"outcome":"answered","tokens_used":1200,"budget_tokens":150000}}
+        ]}});
+        let text = summary(&snapshot);
+        assert!(
+            text.contains("analyst (a) · analyst · opus · inactive"),
+            "{text}"
+        );
+        assert!(text.contains("consultant-1 (c) · consultant · deepseek · respondió · 1200/150000 tokens · terminated"), "{text}");
+        assert!(text.contains("Revisión cruzada"), "{text}");
+    }
+
     #[test]
     fn names_are_exact_and_ambiguous_names_fail() -> Result<()> {
         let snapshot =

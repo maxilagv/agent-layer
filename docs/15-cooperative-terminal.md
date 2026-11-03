@@ -123,6 +123,53 @@ Other commands are `team messages`, `team work`, `team objections`,
 exact ID or an unambiguous exact name. Commands use the observed team revision;
 conflicts are displayed instead of silently applying the action to changed state.
 
+## Teams on several models
+
+A team can mix models. Each configured model alias (see the annotated
+[example configuration](../examples/config.toml)) can run members: the team's
+own model runs members without one, `team_add_member` accepts `model`, and
+`cooperative.role_models` sets a model per role. `team_members` shows every
+member's model and the configured aliases, with their model ids and prices,
+never endpoints or credentials. `team show` and exports list each member's model.
+
+```bash
+layeragent run "Review and fix the parser" --workspace . \
+  --execution cooperative --template review --allow-write \
+  --cross-model-review --consultant-model second
+```
+
+- **Consultants.** Any member can call `team_consult` with a question and,
+  optionally, a model alias, a token budget (`max_tokens`, 5 000 to 600 000;
+  150 000 by default), a work item or a patch. The runtime brings in a
+  consultant: a read-only member on that model (by default the team's
+  `consultant` role model, then the team's model) that receives the question as
+  its first message. It answers the member that asked, and is then retired by
+  the runtime. It can ask that member one clarifying question and wait for the
+  reply. It never takes work, switches to writing, adds members, consults
+  others or closes the team, never receives broadcasts, and does not count
+  against `max_members`. Up to two consultations run at once and eight over the
+  life of a team. The model must be configured, able to call tools, allowed by
+  the privacy settings (`allowed_providers`, `local_models_only`) and priced when
+  the team has a cost ceiling. A consultant that ends without answering, fails or spends its
+  budget is retired too, its question is resolved, and the member that asked
+  gets a runtime notice; the team carries on.
+- **Cross-model review.** `--cross-model-review` (`cooperative.cross_model_review`
+  in the API) needs `--allow-write` and at least two configured models with
+  different model ids. A patch is then approved only by a member or consultant
+  whose activation runs a different model than the one whose activation
+  submitted it; anyone may still reject it. The model of every activation is
+  recorded when it starts, and each patch records its author's and reviewer's
+  model. Models are compared by id, lowercase and without a vendor prefix, so
+  two aliases or providers serving the same model id count as the same model.
+  `team_consult` with a `patch_id` brings in a reviewer on another model whose
+  decision answers the consultation.
+
+A consultation's budget is checked against actual consumption before each of
+its model calls, so the call that crosses the budget completes: a consultation
+can exceed its budget by at most one call. Calls whose consumption is unknown
+count at their reserved estimate. The team's token, cost and time limits still
+apply to every consultation.
+
 ## Interactive terminal
 
 ```text
@@ -188,7 +235,11 @@ The existing task creation endpoint accepts `execution` and `cooperative` option
 `team_member_event` envelopes identifying the member and activation. Team resource
 queries include `deliveries`, `finding_revisions`, `patches` and `claims`; JSON
 exports also include attributed events and patches. Creating a task with
-`cooperative.scope.allow_write` requires a task policy that allows writes. `GET /v1/tasks/{id}/team/{resource}?tail=N` returns the most
+`cooperative.scope.allow_write` requires a task policy that allows writes, and
+`cooperative.cross_model_review` requires write scope and two configured models
+with different model ids. Member rows carry `last_model` and, for consultants,
+`consult` (who asked, the question, budget, tokens used and outcome); the
+snapshot carries `default_model`. `GET /v1/tasks/{id}/team/{resource}?tail=N` returns the most
 recent rows of a resource (at most 200), and
 `GET /v1/tasks/{id}/team/threads/{message}` returns the reply chain containing a
 message. A task-level correction on a cooperative task is refused; send an
@@ -197,5 +248,5 @@ operator instruction as a team message instead. Reads and writes retain task, pr
 Read the [implementation status](10-implementation-status.md) and current
 fingerprinted [verification report](verification.json) for executed checks and
 blocked qualification. Web/desktop team interfaces, native confinement checks of
-worktree writers, investigation memory, cross-mode quality evaluation and live-provider effectiveness
-remain separate work.
+worktree writers, investigation memory, cross-mode quality evaluation, live
+teams that mix providers and live-provider effectiveness remain separate work.

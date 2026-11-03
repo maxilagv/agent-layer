@@ -44,7 +44,7 @@ pub trait TeamControl: Send + Sync {
 pub trait SessionControl: Send + Sync {
     async fn execute(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value>;
 }
-pub const TEAM_TOOLS: [&str; 14] = [
+pub const TEAM_TOOLS: [&str; 18] = [
     "team_members",
     "team_message",
     "team_wait",
@@ -59,6 +59,10 @@ pub const TEAM_TOOLS: [&str; 14] = [
     "team_verify",
     "team_close",
     "team_resolve",
+    "team_access",
+    "team_patch_submit",
+    "team_patch_show",
+    "team_patch_review",
 ];
 
 /// Negotiated MCP catalog kept per server.
@@ -462,7 +466,9 @@ pub fn definitions_with_team(config: &Config, cooperative: bool) -> Vec<ToolDefi
     let revision = json!({"type":"integer","minimum":1});
     let mutation = json!({"idempotency_key":key,"expected_revision":revision});
     let purpose = json!({"type":"string","enum":["question","observation","objection","verification_request","response","claim","handoff"]});
-    let role = json!({"type":"string","enum":["analyst","reviewer","verifier","specialist"]});
+    let role =
+        json!({"type":"string","enum":["analyst","reviewer","verifier","specialist","writer"]});
+    let paths = json!({"type":"array","items":{"type":"string","maxLength":4096},"maxItems":64});
     let finding_state = json!({"type":"string","enum":["hypothesis","investigating","reproduced","reviewed","discarded","inconclusive"]});
     let fields = |extra: Value| {
         let mut base = mutation.as_object().cloned().unwrap_or_default();
@@ -487,7 +493,13 @@ pub fn definitions_with_team(config: &Config, cooperative: bool) -> Vec<ToolDefi
         def("team_verify", "Run a confined check and persist a runtime-generated execution receipt", json!({"finding_id":id,"command":text,"expected":text,"expected_exit_code":{"type":"integer"},"negative_control":text,"limitations":{"type":"array","items":text}}), &["command","expected"]),
         def("team_close", "Coordinator only: propose closure after disposing of all unfinished work", json!({"expected_revision":revision,"reason":text}), &["reason"]),
         def("team_resolve", "Record the disposition and reason for a question or verification request", json!({"message_id":id,"reason":text}), &["message_id","reason"]),
+        def("team_access", "Switch between reading the shared team workspace and writing in your own worktree. mode=write needs in-progress work you own (team_work_claim) and the files or directories you will change, which are reserved for you; overlapping reservations of other members are refused. Calling it again adds paths. The switch applies from your next activation: finish this response after it. mode=read releases paths not waiting for review", json!({"mode":{"type":"string","enum":["read","write"]},"work_id":id,"paths":paths,"reason":text}), &["mode","reason"]),
+        def("team_patch_show", "Read a submitted or handed-over patch: its files, summary, state and diff (paged with offset)", json!({"patch_id":id,"offset":{"type":"integer","minimum":0}}), &["patch_id"]),
+        def("team_patch_review", "Review another member's submitted patch. approve applies it to the team workspace (it is refused back to the author if it no longer applies) and completes its work; reject returns it to the author with your reason", json!({"patch_id":id,"verdict":{"type":"string","enum":["approve","reject"]},"reason":text}), &["patch_id","verdict","reason"]),
     ]);
+    if config.policy.write {
+        tools.push(def("team_patch_submit", "Submit the changes in your worktree for work you own as a patch for review; the runtime computes it and records a receipt. Every changed file must be inside paths you reserved for that work. Name a reviewer to send them the review request", json!({"work_id":id,"summary":text,"reviewer":id}), &["work_id","summary"]));
+    }
     tools.retain(|tool| {
         config.policy.allowed_tools.is_empty() || config.policy.allowed_tools.contains(&tool.name)
     });
@@ -495,12 +507,12 @@ pub fn definitions_with_team(config: &Config, cooperative: bool) -> Vec<ToolDefi
 }
 
 pub fn requires_approval(config: &Config, name: &str) -> bool {
-    config
-        .policy
-        .approval_tools
-        .iter()
-        .any(|s| s == name || (name == "team_verify" && s == "shell"))
-        || config.tools.contains_key(name)
+    config.policy.approval_tools.iter().any(|s| {
+        s == name
+                || (name == "team_verify" && s == "shell")
+                // Approving a patch writes the team workspace.
+                || (name == "team_patch_review" && (s == "write_file" || s == "edit_file"))
+    }) || config.tools.contains_key(name)
         || [
             "mcp_call",
             "mcp_list",
@@ -1328,20 +1340,48 @@ mod tests {
         }
     }
     #[test]
-    fn cooperative_verification_inherits_shell_approval_and_does_not_offer_writers() {
+    fn cooperative_tools_follow_each_activations_access_and_inherit_approvals() {
         let mut config = Config::default();
-        config.policy.approval_tools = vec!["shell".into()];
+        config.policy.approval_tools = vec!["shell".into(), "write_file".into()];
         assert!(requires_approval(&config, "team_verify"));
+        // Approving a patch writes the team workspace like a file write does.
+        assert!(requires_approval(&config, "team_patch_review"));
+        let names = |config: &Config| -> Vec<String> {
+            definitions_with_team(config, true)
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect()
+        };
+        let writing = names(&config);
+        for tool in [
+            "team_access",
+            "team_patch_show",
+            "team_patch_review",
+            "team_patch_submit",
+        ] {
+            assert!(writing.contains(&tool.to_string()), "{tool}");
+        }
+        // A reading activation can ask for write access and review, not submit.
+        config.policy.write = false;
+        let reading = names(&config);
+        assert!(reading.contains(&"team_access".to_string()));
+        assert!(!reading.contains(&"team_patch_submit".to_string()));
+        assert!(!reading.contains(&"write_file".to_string()));
         let tools = definitions_with_team(&config, true);
         let add = tools
             .iter()
             .find(|tool| tool.name == "team_add_member")
             .unwrap();
         assert!(
-            !add.parameters["properties"]["role"]["enum"]
+            add.parameters["properties"]["role"]["enum"]
                 .as_array()
                 .unwrap()
                 .contains(&json!("writer"))
+        );
+        assert!(
+            !definitions_with_team(&config, false)
+                .iter()
+                .any(|tool| tool.name.starts_with("team_"))
         );
     }
     #[test]

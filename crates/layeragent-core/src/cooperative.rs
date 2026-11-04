@@ -6,6 +6,9 @@ use layeragent_tools::TeamControl;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
+mod writers;
+pub(crate) use writers::prepare_worktree;
+
 /// Re-check interval when no team change arrives: time budgets, leases and
 /// pause acknowledgement. Messages and commands wake waiters immediately.
 const FALLBACK_POLL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -294,11 +297,16 @@ impl TeamControl for EngineTeamControl {
             "team_members" => Ok(
                 json!({"members":snapshot.members,"revision":snapshot.revision,"state":snapshot.state,"self":{"member_id":member,"role":current.role.as_str()},"open_questions":snapshot.open_questions,"limits":snapshot.options.limits}),
             ),
+            "team_message" if args["purpose"] == "handoff" => self.handoff(args).await,
             "team_message" => {
                 store
                     .team_member_message(team, member, serde_json::from_value(args.clone())?)
                     .await
             }
+            "team_access" => self.access(ctx, args).await,
+            "team_patch_submit" => self.submit(ctx, args).await,
+            "team_patch_show" => self.show(args).await,
+            "team_patch_review" => self.review(ctx, args).await,
             "team_wait" if args.get("reply_timeout_secs").is_some() => {
                 let seconds = args["reply_timeout_secs"]
                     .as_u64()
@@ -464,10 +472,15 @@ impl EngineTeamControl {
         let snapshot = workspace_receipt(&self.tracker, &ctx.cancel).await?;
         let snapshot_sha256 = required(&snapshot, "snapshot_sha256")?;
         let team = &self.runtime.context.team_id;
-        self.runtime
-            .store
-            .team_snapshot_changed(team, snapshot_sha256)
-            .await?;
+        let in_worktree = self.runtime.context.access == layeragent_protocol::TeamAccess::Write;
+        // A check in a member's own worktree says nothing about the shared
+        // team workspace, so it does not move the team snapshot.
+        if !in_worktree {
+            self.runtime
+                .store
+                .team_snapshot_changed(team, snapshot_sha256)
+                .await?;
+        }
         let evidence = self.runtime.store.team_record_evidence(
             team,
             &self.runtime.context.member_id,
@@ -476,7 +489,7 @@ impl EngineTeamControl {
                 snapshot: snapshot_sha256.to_string(),
                 files: snapshot["files"].clone(),
                 exclusions: json!([snapshot["coverage"]["excludes"]]),
-                configuration: json!({"model":ctx.config.primary,"role":self.runtime.context.role.as_str(),"write":ctx.config.policy.write,"network":ctx.config.policy.network,"coverage":snapshot["coverage"]}),
+                configuration: json!({"model":ctx.config.primary,"role":self.runtime.context.role.as_str(),"write":ctx.config.policy.write,"network":ctx.config.policy.network,"coverage":snapshot["coverage"],"workspace":if in_worktree {"member worktree"} else {"team workspace"}}),
                 tool: "shell".into(),
                 tool_version: Some(env!("CARGO_PKG_VERSION").into()),
                 invocation: command.into(),
@@ -519,9 +532,11 @@ pub(crate) fn effective_config(
     if let Some(team) = team {
         config.agents.enabled = false;
         config.fallbacks.clear();
+        // Writing is per member and per activation: only an activation that
+        // runs in the member's own worktree gets write tools.
         config.policy.write = config.policy.write
             && team.context.options.scope.allow_write
-            && !team.context.role.read_only();
+            && team.context.access == layeragent_protocol::TeamAccess::Write;
         config.auto_skills = false;
     }
     if ctl.tree.execution == ExecutionMode::Individual {
@@ -552,15 +567,6 @@ impl Engine {
             "task is not cooperative"
         );
         let team = task.team_id.clone().context("cooperative team missing")?;
-        let snapshot = store.team_snapshot_by_id(&team).await?;
-        ensure!(
-            !snapshot.options.scope.allow_write
-                && snapshot
-                    .members
-                    .iter()
-                    .all(|member| member["role"] != "writer"),
-            "cooperative writers require isolated worktrees and are not enabled"
-        );
         let run_cancel = cancel.child_token();
         store.team_supervisor_started(&team).await?;
         self.active
@@ -615,6 +621,15 @@ impl Engine {
                     .await?;
             }
         }
+        // An ended team no longer needs its worktrees; a paused or blocked
+        // one keeps them for resume.
+        if matches!(
+            store.team_snapshot_by_id(&team).await?.state.as_str(),
+            "cancelled" | "terminated" | "failed"
+        ) {
+            self.retire_team_worktrees(&store, &team, Path::new(&task.project))
+                .await;
+        }
         result
     }
 
@@ -666,7 +681,6 @@ impl Engine {
                         let mut admitted = false;
                         for candidate in candidates.into_iter().take(capacity) {
                             let member = candidate["id"].as_str().context("member id")?.to_string();
-                            ensure!(candidate["role"] != "writer", "cooperative writers require isolated worktrees and are not enabled");
                             let started =
                                 match store.team_start_activation(&team, &member, &owner).await {
                                     Ok(started) => started,
@@ -815,6 +829,18 @@ fn activation_prompt(
         snapshot.options.scope.allow_write,
     );
     prompt.push_str(template_instructions(snapshot.template));
+    let writing = snapshot
+        .members
+        .iter()
+        .find(|m| m["id"] == member["id"])
+        .is_some_and(|m| m["access"] == "write");
+    prompt.push_str(if !snapshot.options.scope.allow_write {
+        " Access: read; this team cannot change files."
+    } else if writing {
+        " Access: write. You work in your own worktree of the team workspace; nobody sees your changes until another member approves your patch. Change only paths you reserved, submit with team_patch_submit naming a reviewer, and switch back with team_access mode=read when you no longer need to write."
+    } else {
+        " Access: read. When your work needs file changes, claim the work item, then call team_access with mode=write, its work_id and the paths you will change; your next activation runs in your own worktree. Review other members' patches with team_patch_show and team_patch_review."
+    });
     if initial {
         prompt.push_str(" This is your first activation. Establish your own assessment before relying on peer conclusions. Coordinator: plan and assign distinct work, then propose close only after disposition of open work. Specialist: report useful conclusions and evidence to the coordinator or requesting peer with team_message.");
     } else {

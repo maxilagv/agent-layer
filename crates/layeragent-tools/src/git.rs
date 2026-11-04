@@ -16,6 +16,8 @@ use tokio::io::AsyncReadExt;
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const MAX_PATHS: usize = 256;
+
+pub mod team;
 const MAX_MESSAGE: usize = 8 * 1024;
 
 fn git_dir(workspace: &Path) -> Result<PathBuf> {
@@ -63,6 +65,15 @@ fn git_arg(path: &Path) -> String {
 }
 
 async fn run(workspace: &Path, args: &[&str]) -> Result<(i32, String)> {
+    run_with(workspace, args, &[]).await
+}
+
+/// `run` with extra environment, such as a private index file.
+async fn run_with(
+    workspace: &Path,
+    args: &[&str],
+    env: &[(&str, String)],
+) -> Result<(i32, String)> {
     let mut command = tokio::process::Command::new("git");
     command
         .args([
@@ -89,6 +100,7 @@ async fn run(workspace: &Path, args: &[&str]) -> Result<(i32, String)> {
         .env("GIT_EDITOR", "true")
         .env("GIT_ASKPASS", "true")
         .env("LANG", "C.UTF-8")
+        .envs(env.iter().map(|(key, value)| (*key, value.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -191,13 +203,35 @@ pub async fn worktree_add(repo: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Everything the child changed relative to HEAD, as a binary-safe patch (bounded).
+/// Everything the child changed relative to HEAD, as a binary-safe patch. The
+/// diff goes through a file: captured output is bounded, and a truncated patch
+/// would silently drop changes.
 pub async fn worktree_patch(worktree: &Path) -> Result<String> {
     let (code, output) = run(worktree, &["add", "-A"]).await?;
     ensure!(code == 0, "git add failed: {output}");
-    let (code, patch) = run(worktree, &["diff", "--cached", "--binary", "HEAD"]).await?;
-    ensure!(code == 0, "git diff failed: {patch}");
-    Ok(patch)
+    let file = sibling(worktree, "patch");
+    let result = async {
+        let output_arg = format!("--output={}", git_arg(&file));
+        let (code, error) = run(
+            worktree,
+            &["diff", "--cached", "--binary", &output_arg, "HEAD"],
+        )
+        .await?;
+        ensure!(code == 0, "git diff failed: {error}");
+        Ok(String::from_utf8_lossy(&std::fs::read(&file)?).into_owned())
+    }
+    .await;
+    let _ = std::fs::remove_file(&file);
+    result
+}
+
+/// A scratch path next to `dir`, outside the tree Git is looking at.
+fn sibling(dir: &Path, extension: &str) -> PathBuf {
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "worktree".into());
+    dir.with_file_name(format!(".{name}.{}.{extension}", std::process::id()))
 }
 
 pub async fn worktree_remove(repo: &Path, dest: &Path) {
@@ -301,6 +335,12 @@ mod tests {
             std::fs::read_to_string(repo.join("a.txt")).unwrap(),
             "one\n"
         );
+        // Larger than the captured-output bound: nothing may be cut off.
+        let big: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(wt.join("big.txt"), &big).unwrap();
+        let patch = worktree_patch(&wt).await.unwrap();
+        assert!(patch.len() > OUTPUT_LIMIT, "{}", patch.len());
+        assert!(patch.contains("+line 19999"));
         worktree_remove(&repo, &wt).await;
         assert!(!wt.exists());
     }

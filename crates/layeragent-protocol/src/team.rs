@@ -88,9 +88,6 @@ impl TeamRole {
             Self::Writer => "writer",
         }
     }
-    pub fn read_only(self) -> bool {
-        !matches!(self, Self::Writer)
-    }
 }
 impl std::str::FromStr for TeamRole {
     type Err = anyhow::Error;
@@ -228,14 +225,6 @@ impl CooperativeOptions {
         result.scope.deliverables.sort();
         result.scope.deliverables.dedup();
         result.limits.validate()?;
-        ensure!(
-            !result.scope.allow_write,
-            "cooperative writers are not supported; use read-only scope"
-        );
-        ensure!(
-            !result.role_models.contains_key(&TeamRole::Writer),
-            "cooperative writer roles are not supported"
-        );
         ensure!(
             result.scope.resources.len() <= 256,
             "too many authorized resources"
@@ -477,6 +466,36 @@ pub struct TeamCommand {
     pub priority: Option<i64>,
 }
 
+/// What one member may do in its next activation. Every member starts reading
+/// the shared workspace; a member switches to writing (in its own worktree)
+/// when its work needs it, and back when it is done. Writing is only possible
+/// in a team whose scope allows it.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamAccess {
+    #[default]
+    Read,
+    Write,
+}
+impl TeamAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+impl std::str::FromStr for TeamAccess {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "read" => Ok(Self::Read),
+            "write" => Ok(Self::Write),
+            _ => anyhow::bail!("unknown team access {value}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct TeamActivationContext {
     pub activation_id: String,
@@ -490,6 +509,12 @@ pub struct TeamActivationContext {
     pub template: TeamTemplate,
     pub template_version: u32,
     pub options: CooperativeOptions,
+    /// Access this activation runs with, fixed when it starts.
+    #[serde(default)]
+    pub access: TeamAccess,
+    /// The member's own worktree when it writes.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -532,6 +557,8 @@ pub struct TeamExport {
     pub findings: Vec<Value>,
     pub objections: Vec<Value>,
     pub evidence: Vec<Value>,
+    #[serde(default)]
+    pub patches: Vec<Value>,
     pub markdown: String,
 }
 

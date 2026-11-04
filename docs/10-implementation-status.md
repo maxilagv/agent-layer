@@ -4,7 +4,10 @@
 
 ## Cooperative terminal execution
 
-`execution: cooperative` exposes read-only teams through CLI/TUI and the task API.
+`execution: cooperative` exposes teams through CLI/TUI and the task API. Members
+read the shared team workspace; when the operator creates the task with write
+scope, a member can switch to writing in its own worktree (see
+[cooperative writers](#godeye-cooperative-writers)).
 The [terminal guide](15-cooperative-terminal.md) includes a local scripted demo,
 controls and an optional native check. Actual outcomes for the maintained source
 fingerprint belong to `verification.json`; fixture success does not establish
@@ -58,8 +61,10 @@ Terminal milestone additions and their verification boundaries:
 - Snapshots include an event cursor and pending approvals. Exports read one
   consistent transaction and retain delivery receipts, finding revisions and
   attributed tool events, with recursive supported-pattern redaction.
-- Cooperative writers and writable scope are refused at creation and activation.
-  Traditional delegated writer worktrees remain a distinct execution path.
+- Writable scope is accepted at creation only when the task policy allows writes;
+  writing itself is per member and per activation (see
+  [cooperative writers](#godeye-cooperative-writers)). Traditional delegated
+  writer worktrees remain a distinct execution path.
 - `tests/cooperative_smoke.py` exercises the actual daemon and CLI with a scripted
   loopback provider; `tests/cooperative_tui_smoke.py` exercises the panel and commands
   in a PTY. The default finding is inconclusive because it does not execute a
@@ -72,8 +77,7 @@ declared window, plus the requested output ceiling); no adapter provides an exac
 count. Interrupted in-flight requests retain uncertain reservations until their
 consumption is explicitly reconciled; cancellation does not release that capacity.
 
-Pending: cooperative writer worktrees and explicit patch integration, private
-investigation memory and `MUERTOS.md` export, web/desktop team interfaces, the
+Pending: private investigation memory and `MUERTOS.md` export, web/desktop team interfaces, the
 cross-mode evaluator, live-provider evaluation and the complete P0/P1 traceability
 table. An initial assessment is recorded but is not an isolation guarantee against
 seeing peer conclusions; review checks a different reviewer and linked current
@@ -122,8 +126,83 @@ claim support flags, block rendering against forged fields, urgent interruption
 (the test fails with the interruption disabled), change signalling and the
 in-place wait with and without a free slot. All of it uses scripted models; it
 shows that the mechanisms work, not that a real model chooses well when to
-claim, hand off, mark a message urgent or wait. Cooperative writers remain
-disabled, so a handoff transfers read-only investigation work.
+claim, hand off, mark a message urgent or wait. Since the writers increment
+below, a handoff from a writing member also carries its unsubmitted changes.
+
+## Godeye cooperative writers
+
+Second godeye increment: team members can change files, one worktree each, and a
+change reaches the team workspace only after another member approves it.
+
+- **Read or write, per member.** Every member starts reading the shared team
+  workspace. `team_access` with `mode=write`, a `work_id` the member is doing and
+  the paths it will change switches it to writing; `mode=read` switches it back.
+  Any role can do this, but only in a team created with write scope
+  (`--allow-write`, or `scope.allow_write` in the task API), which the gateway
+  accepts only when the task policy allows writes. The switch applies from the
+  member's next activation, which the supervisor starts for that reason alone;
+  an activation keeps the access it started with. Write tools and
+  `team_patch_submit` are offered only to writing activations.
+- **Own worktree.** The first switch to writing creates a linked Git worktree
+  under the runtime state directory whose base commit is the team workspace as it
+  is at that moment: HEAD plus uncommitted and untracked, non-ignored changes,
+  captured with a private index so the operator's staging area is never touched.
+  Secret-looking files are not copied. Writing activations run there; they never
+  write the team workspace. A check run with `team_verify` in a worktree does not
+  move the team snapshot. The team workspace must be a Git repository with at
+  least one commit.
+- **Path reservations.** Writing reserves files or directory prefixes for one
+  work item. A reservation that overlaps another member's is refused with the
+  holder's name and work. Reservations are released when the work is finished,
+  cancelled or reopened, when the member switches back to reading (unless a patch
+  for that work awaits review), and they move with a handoff.
+- **Patches.** `team_patch_submit` has the runtime compute the member's diff
+  against its base, refuse paths outside its reservations, secrets, Git metadata,
+  symbolic links and leftover conflict markers, and record it with a `patch` evidence receipt
+  that a `claim` can cite. Naming a reviewer sends the review request. A newer
+  submission supersedes an earlier open one; work whose patch awaits review
+  cannot be marked completed around the review. Diffs pass through files, so
+  large patches are not truncated (this also fixes the delegated child patch,
+  which was cut at 64 KiB). Patches are limited to 2 MiB and 256 files.
+- **Review and ordered integration.** `team_patch_show` pages through a redacted
+  diff. `team_patch_review` by any other member rejects (the work stays with its
+  author, who is told why) or approves. Approving applies the patch to the team
+  workspace's working tree, whole or not at all, one integration per team at a
+  time and under the same workspace lease as an ordinary task; nothing is
+  committed. The integration gets its own receipt, completes the work, releases
+  its reservations and marks every worktree as behind. A patch that no longer
+  applies is recorded as conflicted and returned to its author. When the policy
+  requires approval for `write_file` or `edit_file`, it also does for
+  `team_patch_review`.
+- **Keeping up.** A worktree that is behind is moved onto the current team
+  workspace at the member's next activation, or when it submits; its own changes
+  are re-applied with a three-way merge and conflicts are left marked for it,
+  with a notice.
+- **Handoffs carry work.** A handoff from a writing member carries its
+  unsubmitted changes to the work's reserved paths; they leave the sender's
+  worktree and are applied to the recipient's worktree when it writes.
+- **End of a team.** When a team is terminated, cancelled or fails, each worktree
+  is removed and any unsubmitted changes are kept as a `retained` patch. Paused
+  and blocked teams keep their worktrees. `layeragent team patches <task>` and the
+  `patches` resource list patches; exports include them. Migration 010 adds
+  member access, reservations and patches.
+
+Verification: Git helper tests use real repositories (dirty-workspace bases,
+index preservation, secret exclusion, three-way sync after an integration, real
+conflicts, all-or-nothing refusal of a stale patch, handoff transfer, refusal to
+reset anything but a linked worktree). Storage tests cover access rules,
+overlapping reservations, claim coverage, review by another member, superseding,
+conflicts, handoff transfer and retained work. Three runtime tests in
+`crates/layeragent-core/tests/cooperative_writers.rs` drive a scripted team over a
+real repository: a member switches to writing, edits in its worktree and its
+approved patch reaches the team workspace next to the operator's uncommitted
+work; an operator edit makes the first approval conflict and the author resolves
+it; and a handoff carries half-done work into another member's worktree. The
+sandbox in those tests is a test double that writes files directly: it does not
+certify that the native sandbox confines a worktree writer, and the native
+cooperative check was not run for this increment. Scripted models show the
+mechanisms work, not that a real model reserves paths, splits work or reviews
+well.
 
 ## Cooperative bus hardening increment
 

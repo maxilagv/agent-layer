@@ -10,6 +10,9 @@ use layeragent_protocol::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
+mod writers;
+pub use writers::{PatchCarry, PatchSubmission, ReviewOutcome, WriterState};
+
 #[derive(Debug, thiserror::Error)]
 #[error("team revision changed or the requested transition is not allowed")]
 pub struct TeamConflict;
@@ -333,7 +336,6 @@ impl Storage {
             ensure!(revision == input.expected_revision, TeamConflict);
             ensure!(!input.name.trim().is_empty() && input.name.len() <= 64 && !input.justification.trim().is_empty(), "member name and distinct-work justification are required");
             ensure!(input.role != TeamRole::Coordinator, "a team has exactly one coordinator");
-            ensure!(input.role != TeamRole::Writer, "cooperative writers are not supported");
             let count: i64 = tx.query_row("SELECT count(*) FROM team_members WHERE team_id=?1", [&team], |r| r.get(0))?;
             ensure!((count as usize) < opts.limits.max_members, "team member limit reached");
             let id = new_id();
@@ -461,8 +463,17 @@ impl Storage {
             let disposing = role == TeamRole::Coordinator && matches!(state.as_str(), "cancelled" | "inconclusive");
             ensure!(owner.as_deref() == Some(&member) || disposing, TeamConflict);
             ensure!(!reason.trim().is_empty(), "work transition reason required");
+            // Work whose patch awaits review is finished by the review, which
+            // integrates it; completing it now would drop the change.
+            let reviewing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM team_patches WHERE team_id=?1 AND work_id=?2 AND kind='submission' AND state='submitted')", params![team, work], |r| r.get(0))?;
+            ensure!(state != "completed" || !reviewing, "a patch for this work awaits review; it is completed when a reviewer integrates it");
             let at = now_ms();
             tx.execute("UPDATE team_work SET state=?2,revision=revision+1,updated_at=?3 WHERE id=?1", params![work, state, at])?;
+            // Finished, cancelled or reopened work no longer reserves paths,
+            // unless a patch for it still waits for review.
+            if !reviewing {
+                tx.execute("DELETE FROM team_path_claims WHERE team_id=?1 AND work_id=?2", params![team, work])?;
+            }
             if let Some(owner) = &owner {
                 tx.execute("UPDATE team_members SET current_work_id=NULL,work_state=?2,updated_at=?3 WHERE id=?1 AND current_work_id IS ?4", params![owner, state, at, work])?;
             }
@@ -583,53 +594,12 @@ impl Storage {
         member: &str,
         record: EvidenceRecord,
     ) -> Result<Value> {
-        let EvidenceRecord {
-            finding,
-            snapshot,
-            files,
-            exclusions,
-            configuration,
-            tool,
-            tool_version,
-            invocation,
-            exit_code,
-            expected,
-            observed,
-            error,
-            limitations,
-            negative_control,
-            artifacts,
-            expectation_met,
-        } = record;
-        let (team, member, invocation) = (
-            team.to_string(),
-            member.to_string(),
-            layeragent_protocol::redact::redact_text(&invocation),
-        );
-        let array = |value: Value| if value.is_array() { value } else { json!([]) };
-        let (files, exclusions, limitations, artifacts) = (
-            array(files),
-            array(exclusions),
-            array(limitations),
-            array(artifacts),
-        );
+        let (team, member) = (team.to_string(), member.to_string());
         self.write(move |c| {
             let tx = c.transaction()?;
-            member_team(&tx, &team, &member)?;
-            if let Some(finding) = &finding {
-                let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM team_findings WHERE id=?1 AND team_id=?2)", params![finding, team], |r| r.get(0))?;
-                ensure!(exists, "finding is outside this team");
-            }
-            ensure!(snapshot.len() == 64, "workspace snapshot hash required");
-            let id = new_id();
-            let at = now_ms();
-            let expectation_met = expectation_met && error.is_none();
-            let receipt = json!({"runtime_generated":true,"tool":tool,"invocation":invocation,"exit_code":exit_code,"expectation_met":expectation_met,"observed":observed,"error":error,"recorded_at":at});
-            tx.execute("INSERT INTO team_evidence(id,team_id,finding_id,member_id,snapshot_sha256,files,exclusions,configuration,tool,tool_version,invocation,exit_code,expected,observed,error,limitations,negative_control,artifacts,receipt,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)", params![id, team, finding, member, snapshot, files.to_string(), exclusions.to_string(), configuration.to_string(), tool, tool_version, invocation, exit_code, expected, observed, error, limitations.to_string(), negative_control, artifacts.to_string(), receipt.to_string(), at])?;
-            bump(&tx, &team, at)?;
-            event(&tx, &team, "team_evidence_recorded", json!({"evidence_id":id,"finding_id":finding,"tool":tool,"exit_code":exit_code}), at)?;
+            let result = insert_evidence(&tx, &team, &member, record)?;
             tx.commit()?;
-            Ok(json!({"id":id,"receipt":receipt}))
+            Ok(result)
         })
         .await
     }
@@ -771,7 +741,7 @@ impl Storage {
         let (activation, session) = (activation.to_string(), session.to_string());
         self.read(move |c| {
             c.query_row(
-                "SELECT a.id,a.team_id,t.task_id,a.member_id,m.name,m.role,a.generation,COALESCE(m.model,''),t.template,t.template_version,t.options FROM team_activations a JOIN teams t ON t.id=a.team_id JOIN team_members m ON m.id=a.member_id AND m.team_id=t.id WHERE a.id=?1 AND m.session_id=?2 AND a.state='running' AND a.lease_expires_at>?3",
+                "SELECT a.id,a.team_id,t.task_id,a.member_id,m.name,m.role,a.generation,COALESCE(m.model,''),t.template,t.template_version,t.options,m.access_applied,m.worktree FROM team_activations a JOIN teams t ON t.id=a.team_id JOIN team_members m ON m.id=a.member_id AND m.team_id=t.id WHERE a.id=?1 AND m.session_id=?2 AND a.state='running' AND a.lease_expires_at>?3",
                 params![activation, session, now_ms()],
                 |row| {
                     let model: String = row.get(7)?;
@@ -781,6 +751,8 @@ impl Storage {
                         generation: row.get(6)?, model: (!model.is_empty()).then_some(model),
                         template: row.get::<_,String>(8)?.parse().map_err(|error: anyhow::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))))?,
                         template_version: row.get(9)?, options: serde_json::from_str(&row.get::<_,String>(10)?).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))))?,
+                        access: row.get::<_,String>(11)?.parse().map_err(|error: anyhow::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))))?,
+                        worktree: row.get(12)?,
                     })
                 },
             ).context("activation is stale, expired or outside the member session")
@@ -851,7 +823,7 @@ impl Storage {
     pub async fn team_candidates(&self, team: &str) -> Result<Vec<Value>> {
         let team = team.to_string();
         self.read(move |c| {
-            let mut q = c.prepare("SELECT m.id,m.name,m.role,m.model,m.session_id,m.activations FROM team_members m WHERE m.team_id=?1 AND m.state IN ('inactive','waiting_response') AND NOT EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=m.id AND a.state IN ('starting','running')) AND (m.activations=0 OR EXISTS(SELECT 1 FROM team_deliveries d WHERE d.recipient_member_id=m.id AND d.state='accepted') OR EXISTS(SELECT 1 FROM team_work w WHERE w.assignee=m.id AND w.state IN ('pending','assigned'))) ORDER BY m.role='coordinator' DESC,m.created_at,m.rowid")?;
+            let mut q = c.prepare("SELECT m.id,m.name,m.role,m.model,m.session_id,m.activations FROM team_members m WHERE m.team_id=?1 AND m.state IN ('inactive','waiting_response') AND NOT EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=m.id AND a.state IN ('starting','running')) AND (m.activations=0 OR EXISTS(SELECT 1 FROM team_deliveries d WHERE d.recipient_member_id=m.id AND d.state='accepted') OR EXISTS(SELECT 1 FROM team_work w WHERE w.assignee=m.id AND w.state IN ('pending','assigned')) OR (m.access='write' AND m.access_applied='read')) ORDER BY m.role='coordinator' DESC,m.created_at,m.rowid")?;
             let rows = q.query_map([&team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"activations":r.get::<_,i64>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         }).await
@@ -909,9 +881,10 @@ impl Storage {
             ensure!(!member_live, "member already has a live activation");
             let id = new_id();
             tx.execute("INSERT INTO team_activations(id,team_id,member_id,generation,lease_owner,lease_expires_at,state,started_at) VALUES(?1,?2,?3,?4,?5,?6,'running',?7)", params![id, team, member, used + 1, lease_owner, at + 300_000, at])?;
-            tx.execute("UPDATE team_members SET activations=activations+1,state='working',reason=NULL,updated_at=?2 WHERE id=?1", params![member, at])?;
+            tx.execute("UPDATE team_members SET activations=activations+1,state='working',reason=NULL,access_applied=access,updated_at=?2 WHERE id=?1", params![member, at])?;
             tx.execute("UPDATE teams SET active_since=COALESCE(active_since,?2),updated_at=?2 WHERE id=?1", params![team, at])?;
-            event(&tx, &team, "team_activation_started", json!({"activation_id":id,"member_id":member,"generation":used+1}), at)?;
+            let access: String = tx.query_row("SELECT access FROM team_members WHERE id=?1", [&member], |r| r.get(0))?;
+            event(&tx, &team, "team_activation_started", json!({"activation_id":id,"member_id":member,"generation":used+1,"access":access}), at)?;
             tx.commit()?;
             Ok(json!({"id":id,"team_id":team,"member_id":member,"generation":used+1}))
         })
@@ -1503,6 +1476,7 @@ impl Storage {
                 "findings",
                 "objections",
                 "evidence",
+                "patches",
             ] {
                 all.push(resource_rows(&tx, &team, resource, 0, i64::MAX)?.0);
             }
@@ -1515,6 +1489,7 @@ impl Storage {
                 findings,
                 objections,
                 evidence,
+                patches,
             ] = all
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("export assembly failed"))?;
@@ -1528,6 +1503,7 @@ impl Storage {
                 findings,
                 objections,
                 evidence,
+                patches,
                 markdown: String::new(),
             };
             // Model text and runtime tool output share one sanitization boundary.
@@ -1551,6 +1527,7 @@ impl Storage {
                 ("Messages", &export.messages),
                 ("Delivery receipts", &export.deliveries),
                 ("Finding history", &export.finding_revisions),
+                ("Patches", &export.patches),
                 ("Runtime events (observed actions)", &export.events),
             ] {
                 export.markdown.push_str(&format!("\n## {title}\n\n"));
@@ -1563,6 +1540,65 @@ impl Storage {
         })
         .await
     }
+}
+
+/// Persists one runtime-observed receipt inside the caller's transaction.
+fn insert_evidence(
+    c: &Connection,
+    team: &str,
+    member: &str,
+    record: EvidenceRecord,
+) -> Result<Value> {
+    let EvidenceRecord {
+        finding,
+        snapshot,
+        files,
+        exclusions,
+        configuration,
+        tool,
+        tool_version,
+        invocation,
+        exit_code,
+        expected,
+        observed,
+        error,
+        limitations,
+        negative_control,
+        artifacts,
+        expectation_met,
+    } = record;
+    let invocation = layeragent_protocol::redact::redact_text(&invocation);
+    let array = |value: Value| if value.is_array() { value } else { json!([]) };
+    let (files, exclusions, limitations, artifacts) = (
+        array(files),
+        array(exclusions),
+        array(limitations),
+        array(artifacts),
+    );
+    member_team(c, team, member)?;
+    if let Some(finding) = &finding {
+        let exists: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM team_findings WHERE id=?1 AND team_id=?2)",
+            params![finding, team],
+            |r| r.get(0),
+        )?;
+        ensure!(exists, "finding is outside this team");
+    }
+    ensure!(snapshot.len() == 64, "workspace snapshot hash required");
+    let id = new_id();
+    let at = now_ms();
+    let expectation_met = expectation_met && error.is_none();
+    let receipt = json!({"runtime_generated":true,"tool":tool,"invocation":invocation,"exit_code":exit_code,"expectation_met":expectation_met,"observed":observed,"error":error,"recorded_at":at});
+    c.execute("INSERT INTO team_evidence(id,team_id,finding_id,member_id,snapshot_sha256,files,exclusions,configuration,tool,tool_version,invocation,exit_code,expected,observed,error,limitations,negative_control,artifacts,receipt,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)", params![id, team, finding, member, snapshot, files.to_string(), exclusions.to_string(), configuration.to_string(), tool, tool_version, invocation, exit_code, expected, observed, error, limitations.to_string(), negative_control, artifacts.to_string(), receipt.to_string(), at])?;
+    bump(c, team, at)?;
+    event(
+        c,
+        team,
+        "team_evidence_recorded",
+        json!({"evidence_id":id,"finding_id":finding,"tool":tool,"exit_code":exit_code}),
+        at,
+    )?;
+    Ok(json!({"id":id,"receipt":receipt}))
 }
 
 /// The whitelist prevents dynamic SQL identifiers from being caller controlled.
@@ -1652,6 +1688,8 @@ fn resource_table(resource: &str) -> Result<(&'static str, &'static str)> {
         "findings" => "team_findings",
         "objections" => "team_objections",
         "evidence" => "team_evidence",
+        "patches" => "team_patches",
+        "claims" => "team_path_claims",
         "events" => "task_events",
         _ => anyhow::bail!("unknown team resource"),
     };
@@ -1775,8 +1813,8 @@ fn team_snapshot(c: &Connection, team: &str) -> Result<TeamSnapshot> {
 }
 
 fn members(c: &Connection, team: &str) -> Result<Vec<Value>> {
-    let mut q = c.prepare("SELECT id,name,role,model,session_id,state,reason,work_state,current_work_id,activations,initial_assessment IS NOT NULL,created_at,updated_at FROM team_members WHERE team_id=?1 ORDER BY created_at,rowid")?;
-    let rows = q.query_map([team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"reason":r.get::<_,Option<String>>(6)?,"work_state":r.get::<_,String>(7)?,"current_work_id":r.get::<_,Option<String>>(8)?,"activations":r.get::<_,i64>(9)?,"initial_assessment_recorded":r.get::<_,bool>(10)?,"created_at":r.get::<_,i64>(11)?,"updated_at":r.get::<_,i64>(12)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut q = c.prepare("SELECT id,name,role,model,session_id,state,reason,work_state,current_work_id,activations,initial_assessment IS NOT NULL,created_at,updated_at,access,access_applied,(SELECT json_group_array(p.path) FROM team_path_claims p WHERE p.team_id=m.team_id AND p.member_id=m.id) FROM team_members m WHERE team_id=?1 ORDER BY created_at,rowid")?;
+    let rows = q.query_map([team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"reason":r.get::<_,Option<String>>(6)?,"work_state":r.get::<_,String>(7)?,"current_work_id":r.get::<_,Option<String>>(8)?,"activations":r.get::<_,i64>(9)?,"initial_assessment_recorded":r.get::<_,bool>(10)?,"created_at":r.get::<_,i64>(11)?,"updated_at":r.get::<_,i64>(12)?,"access":r.get::<_,String>(13)?,"access_applied":r.get::<_,String>(14)?,"claimed_paths":serde_json::from_str::<Value>(&r.get::<_,String>(15)?).unwrap_or(json!([]))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
@@ -2018,11 +2056,16 @@ fn tx_handoff(
         "UPDATE team_members SET current_work_id=NULL,work_state='idle',updated_at=?2 WHERE id=?1 AND current_work_id IS ?3",
         params![sender, at, work],
     )?;
+    // The paths reserved for the work travel with it.
+    let moved = c.execute(
+        "UPDATE team_path_claims SET member_id=?3,created_at=?4 WHERE team_id=?1 AND work_id=?2 AND member_id IS ?5",
+        params![team, work, recipient, at, sender],
+    )?;
     event(
         c,
         team,
         "team_work_handed_off",
-        json!({"work_id":work,"from":sender,"to":recipient,"message_id":message}),
+        json!({"work_id":work,"from":sender,"to":recipient,"message_id":message,"claims_moved":moved}),
         at,
     )
 }
@@ -3418,30 +3461,483 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn unsupported_writers_targeted_controls_and_unsafe_close_are_rejected() -> Result<()> {
+    fn writable() -> CooperativeOptions {
         let mut options = CooperativeOptions::default();
         options.scope.allow_write = true;
-        assert!(Fixture::new(options).await.is_err());
+        options
+    }
+
+    impl Fixture {
+        async fn owned_work(&self, member: &str, key: &str) -> Result<String> {
+            let coordinator = self.member("coordinator").await?;
+            let work = self
+                .store
+                .team_create_work(
+                    &self.team,
+                    &coordinator,
+                    TeamWorkInput {
+                        idempotency_key: key.into(),
+                        expected_revision: self.revision().await?,
+                        title: format!("change {key}"),
+                        deliverable: "patch".into(),
+                        assignee: None,
+                        dependencies: vec![],
+                        priority: 1,
+                        close_conditions: "integrated".into(),
+                    },
+                )
+                .await?;
+            let id = work["id"].as_str().context("id")?.to_string();
+            self.store
+                .team_claim_work(&self.team, member, &id, 1)
+                .await?;
+            Ok(id)
+        }
+
+        async fn write(&self, member: &str, work: &str, paths: &[&str]) -> Result<Value> {
+            let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+            self.store
+                .team_request_write(
+                    &self.team,
+                    member,
+                    work,
+                    &paths,
+                    Some((format!("/teams/{member}"), "b".repeat(40))),
+                )
+                .await
+        }
+
+        fn submission(
+            &self,
+            work: &str,
+            files: &[&str],
+            reviewer: Option<&str>,
+        ) -> PatchSubmission {
+            PatchSubmission {
+                work_id: work.into(),
+                summary: "rename the helper".into(),
+                base: "b".repeat(40),
+                files: files.iter().map(|f| f.to_string()).collect(),
+                body: b"diff --git a/src/lib.rs b/src/lib.rs\n".to_vec(),
+                reviewer: reviewer.map(str::to_string),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_access_needs_a_writable_team_and_work_the_member_is_doing() -> Result<()> {
         let f = Fixture::new(CooperativeOptions::default()).await?;
-        let coordinator = f.member("coordinator").await?;
+        let analyst = f.member("analyst").await?;
+        let work = f.owned_work(&analyst, "w").await?;
+        let refused = f.write(&analyst, &work, &["src"]).await;
+        assert!(
+            refused
+                .expect_err("read-only team")
+                .to_string()
+                .contains("read-only")
+        );
+
+        let f = Fixture::new(writable()).await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let work = f.owned_work(&analyst, "w").await?;
+        let foreign = f.write(&reviewer, &work, &["src"]).await;
+        assert!(
+            foreign
+                .expect_err("not the owner")
+                .to_string()
+                .contains("team_work_claim")
+        );
+        let granted = f.write(&analyst, &work, &["./src/"]).await?;
+        assert_eq!(granted["access"], "write");
+        assert_eq!(granted["applies"], "next_activation");
+        assert_eq!(granted["claimed_paths"][0]["path"], "src");
+        let state = f.store.team_writer_state(&f.team, &analyst).await?;
+        assert_eq!(state.access, layeragent_protocol::TeamAccess::Write);
+        assert_eq!(state.applied, layeragent_protocol::TeamAccess::Read);
+        // The changed access is itself a reason to activate the member again.
         assert!(
             f.store
-                .team_add_member(
-                    &f.team,
-                    &coordinator,
-                    TeamMemberInput {
-                        idempotency_key: "writer".into(),
-                        expected_revision: f.revision().await?,
-                        name: "writer".into(),
-                        role: TeamRole::Writer,
-                        justification: "edit".into(),
-                        model: None
-                    }
-                )
+                .team_candidates(&f.team)
+                .await?
+                .iter()
+                .any(|candidate| candidate["id"] == analyst.as_str())
+        );
+        let (activation, session) = f.activation(&analyst).await?;
+        let context = f
+            .store
+            .team_activation_context(&activation, &session)
+            .await?;
+        assert_eq!(context.access, layeragent_protocol::TeamAccess::Write);
+        assert_eq!(
+            context.worktree.as_deref(),
+            Some(format!("/teams/{analyst}").as_str())
+        );
+
+        // Back to reading keeps nothing reserved without a pending patch, and
+        // is not by itself a reason to spend an activation.
+        f.store
+            .team_finish_activation(&activation, &analyst, 1, "completed", None, &json!({}))
+            .await?;
+        let released = f.store.team_release_write(&f.team, &analyst).await?;
+        assert_eq!(released["access"], "read");
+        assert_eq!(released["applies"], "next_activation");
+        assert!(
+            f.store
+                .team_writer_state(&f.team, &analyst)
+                .await?
+                .claims
+                .is_empty()
+        );
+        assert!(
+            !f.store
+                .team_candidates(&f.team)
+                .await?
+                .iter()
+                .any(|candidate| candidate["id"] == analyst.as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn members_cannot_reserve_overlapping_paths() -> Result<()> {
+        let f = Fixture::new(writable()).await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let first = f.owned_work(&analyst, "a").await?;
+        let second = f.owned_work(&reviewer, "b").await?;
+        f.write(&analyst, &first, &["src/api"]).await?;
+        for path in ["src", "src/api/routes.rs", "src/api"] {
+            let refused = f.write(&reviewer, &second, &[path]).await;
+            let error = refused.expect_err("overlap").to_string();
+            assert!(
+                error.contains("overlaps src/api") && error.contains("analyst"),
+                "{error}"
+            );
+        }
+        f.write(&reviewer, &second, &["src/apix", "docs"]).await?;
+        assert!(f.write(&analyst, &first, &[".git/config"]).await.is_err());
+        assert!(f.write(&analyst, &first, &["../outside"]).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_patch_stays_inside_its_claims_and_another_member_integrates_it() -> Result<()> {
+        let f = Fixture::new(writable()).await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let work = f.owned_work(&analyst, "w").await?;
+        f.write(&analyst, &work, &["src"]).await?;
+        // Submitting needs an activation that runs with write access.
+        let early = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], None),
+            )
+            .await;
+        assert!(
+            early
+                .expect_err("read activation")
+                .to_string()
+                .contains("read-only")
+        );
+        f.activation(&analyst).await?;
+        let outside = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs", "Cargo.toml"], None),
+            )
+            .await;
+        assert!(
+            outside
+                .expect_err("unclaimed")
+                .to_string()
+                .contains("Cargo.toml")
+        );
+        let submitted = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], Some(&reviewer)),
+            )
+            .await?;
+        let patch = submitted["patch_id"].as_str().context("patch")?.to_string();
+        assert_eq!(submitted["review_request"]["state"], "accepted");
+        let evidence = f
+            .store
+            .team_resource(&f.scope, &f.task, "evidence", 0, 50)
+            .await?
+            .0;
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e["id"] == submitted["evidence_id"] && e["tool"] == "patch")
+        );
+
+        // The work cannot be completed around its review.
+        let revision = f
+            .store
+            .team_resource(&f.scope, &f.task, "work", 0, 10)
+            .await?
+            .0[0]["revision"]
+            .as_i64()
+            .context("revision")?;
+        let early = f
+            .store
+            .team_set_work_state(&f.team, &analyst, &work, "completed", revision, "done")
+            .await;
+        assert!(
+            early
+                .expect_err("awaiting review")
+                .to_string()
+                .contains("awaits review")
+        );
+        // Back to reading keeps the paths of the patch under review.
+        let released = f.store.team_release_write(&f.team, &analyst).await?;
+        assert_eq!(released["kept_paths"][0]["path"], "src");
+
+        assert!(
+            f.store
+                .team_review_precheck(&f.team, &analyst, &patch)
                 .await
                 .is_err()
         );
+        let (meta, body) = f
+            .store
+            .team_review_precheck(&f.team, &reviewer, &patch)
+            .await?;
+        assert_eq!(meta["files"], json!(["src/lib.rs"]));
+        assert!(body.starts_with(b"diff --git"));
+        let review = f
+            .store
+            .team_review_record(
+                &f.team,
+                &reviewer,
+                &patch,
+                ReviewOutcome::Integrated,
+                "names are clearer",
+            )
+            .await?;
+        assert_eq!(review["state"], "integrated");
+        assert_eq!(review["author_notified"], true);
+        let again = f
+            .store
+            .team_review_record(
+                &f.team,
+                &reviewer,
+                &patch,
+                ReviewOutcome::Integrated,
+                "twice",
+            )
+            .await;
+        assert!(again.is_err(), "a patch is integrated once");
+
+        let rows = f
+            .store
+            .team_resource(&f.scope, &f.task, "work", 0, 10)
+            .await?
+            .0;
+        assert_eq!(rows[0]["state"], "completed");
+        assert!(
+            f.store
+                .team_writer_state(&f.team, &analyst)
+                .await?
+                .claims
+                .is_empty()
+        );
+        assert!(f.store.team_writer_state(&f.team, &analyst).await?.stale);
+        let messages = f
+            .store
+            .team_resource(&f.scope, &f.task, "messages", 0, 50)
+            .await?
+            .0;
+        let answer = messages
+            .iter()
+            .find(|m| m["purpose"] == "response" && m["recipient_member_id"] == analyst.as_str())
+            .context("author is told")?;
+        assert_eq!(answer["reply_to"], submitted["review_request"]["id"]);
+        assert!(answer["body"].as_str().unwrap_or("").contains("applied"));
+        let export = f.store.team_export(&f.scope, &f.task).await?;
+        assert!(
+            export
+                .patches
+                .iter()
+                .any(|p| p["id"] == patch.as_str() && p["state"] == "integrated")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_and_conflicted_patches_go_back_to_their_author() -> Result<()> {
+        let f = Fixture::new(writable()).await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let work = f.owned_work(&analyst, "w").await?;
+        f.write(&analyst, &work, &["src"]).await?;
+        f.activation(&analyst).await?;
+        let first = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], None),
+            )
+            .await?;
+        let first = first["patch_id"].as_str().context("patch")?.to_string();
+        let rejected = f
+            .store
+            .team_review_record(
+                &f.team,
+                &reviewer,
+                &first,
+                ReviewOutcome::Rejected,
+                "missing tests",
+            )
+            .await?;
+        assert_eq!(rejected["state"], "rejected");
+        let rows = f
+            .store
+            .team_resource(&f.scope, &f.task, "work", 0, 10)
+            .await?
+            .0;
+        assert_eq!(
+            rows[0]["state"], "in_progress",
+            "rejected work stays with its author"
+        );
+        let second = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], None),
+            )
+            .await?;
+        let second = second["patch_id"].as_str().context("patch")?.to_string();
+        let (meta, _) = f.store.team_patch(&f.team, &first).await?;
+        assert_eq!(meta["state"], "superseded");
+        f.store
+            .team_review_record(
+                &f.team,
+                &reviewer,
+                &second,
+                ReviewOutcome::Conflicted,
+                "src/lib.rs changed",
+            )
+            .await?;
+        let state = f.store.team_writer_state(&f.team, &analyst).await?;
+        assert!(state.stale, "a conflicted author syncs before resubmitting");
+        let stale = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], None),
+            )
+            .await;
+        assert!(stale.expect_err("behind").to_string().contains("behind"));
+        f.store
+            .team_worktree_synced(&f.team, &analyst, &"c".repeat(40))
+            .await?;
+        let mut fresh = f.submission(&work, &["src/lib.rs"], None);
+        fresh.base = "c".repeat(40);
+        f.store.team_submit_patch(&f.team, &analyst, fresh).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_handoff_moves_reserved_paths_and_carries_unsubmitted_work() -> Result<()> {
+        let f = Fixture::new(writable()).await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let work = f.owned_work(&analyst, "w").await?;
+        f.write(&analyst, &work, &["src"]).await?;
+        let carry = PatchCarry {
+            base: "b".repeat(40),
+            files: vec!["src/lib.rs".into()],
+            body: b"half done".to_vec(),
+        };
+        let sent = f
+            .store
+            .team_member_handoff(
+                &f.team,
+                &analyst,
+                f.handoff("h", Some(work.clone()), &reviewer).await?,
+                Some(carry),
+            )
+            .await?;
+        let carried = sent["carried_patch"]
+            .as_str()
+            .context("carried")?
+            .to_string();
+        assert!(
+            f.store
+                .team_writer_state(&f.team, &analyst)
+                .await?
+                .claims
+                .is_empty()
+        );
+        assert_eq!(
+            f.store.team_writer_state(&f.team, &reviewer).await?.claims,
+            [("src".to_string(), work.clone())]
+        );
+        let pending = f.store.team_pending_carries(&f.team, &reviewer).await?;
+        assert_eq!(pending, [(carried.clone(), b"half done".to_vec())]);
+        f.store
+            .team_carry_received(&f.team, &reviewer, &carried, &[])
+            .await?;
+        assert!(
+            f.store
+                .team_pending_carries(&f.team, &reviewer)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            f.store
+                .team_carry_received(&f.team, &reviewer, &carried, &[])
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_retired_worktree_keeps_unsubmitted_work() -> Result<()> {
+        let f = Fixture::new(writable()).await?;
+        let analyst = f.member("analyst").await?;
+        let work = f.owned_work(&analyst, "w").await?;
+        f.write(&analyst, &work, &["src"]).await?;
+        assert_eq!(f.store.team_worktrees(&f.team).await?.len(), 1);
+        let kept = f
+            .store
+            .team_retire_worktree(
+                &f.team,
+                &analyst,
+                Some(PatchCarry {
+                    base: "b".repeat(40),
+                    files: vec!["src/x".into()],
+                    body: b"x".to_vec(),
+                }),
+            )
+            .await?
+            .context("retained")?;
+        let (meta, body) = f.store.team_patch(&f.team, &kept).await?;
+        assert_eq!(
+            (meta["kind"].as_str(), meta["state"].as_str()),
+            (Some("retained"), Some("retained"))
+        );
+        assert_eq!(body, b"x");
+        assert!(f.store.team_worktrees(&f.team).await?.is_empty());
+        assert_eq!(
+            f.store.team_writer_state(&f.team, &analyst).await?.access,
+            layeragent_protocol::TeamAccess::Read
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn targeted_controls_and_unsafe_close_are_rejected() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let coordinator = f.member("coordinator").await?;
         for action in ["pause", "resume", "cancel", "close", "priority"] {
             assert!(
                 f.store

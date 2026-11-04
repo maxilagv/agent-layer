@@ -614,8 +614,9 @@ impl Engine {
         let team = if request.execution == ExecutionMode::Cooperative {
             let context = store.team_activation_context(&turn_id, &session.id).await?;
             ensure!(
-                context.role.read_only() && !context.options.scope.allow_write,
-                "cooperative writers require isolated worktrees and are not enabled"
+                context.access == layeragent_protocol::TeamAccess::Read
+                    || (context.options.scope.allow_write && context.worktree.is_some()),
+                "write access requires a writable team and the member's own worktree"
             );
             Some(Arc::new(cooperative::TeamRuntime::new(
                 context,
@@ -636,6 +637,20 @@ impl Engine {
             )
         };
         store.reconcile_history(&session.id).await?;
+        // A writing member runs in its own worktree, never in the team workspace.
+        let workspace = match &team {
+            Some(team) if team.context.access == layeragent_protocol::TeamAccess::Write => {
+                let (worktree, notices) =
+                    cooperative::prepare_worktree(self, &store, &team.context, &workspace).await?;
+                for notice in notices {
+                    store
+                        .message(&session.id, &Message::text("user", notice))
+                        .await?;
+                }
+                worktree
+            }
+            _ => workspace,
+        };
         let config = self.config().await;
         let selected = request.model.unwrap_or_else(|| config.primary.clone());
         ensure!(

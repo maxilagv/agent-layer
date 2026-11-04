@@ -304,6 +304,10 @@ fn step_provider(
         .base_url
         .clone()
         .unwrap_or_else(|| default_base_url(&wire).to_string());
+    // Anthropic's own endpoint caches the marked request prefix; other
+    // Anthropic-compatible endpoints may not accept the marks.
+    let prompt_cache =
+        wire == Wire::Anthropic && base_url.starts_with("https://api.anthropic.com/");
     let mut config = Config::load(home, profile).unwrap_or_default();
     config.providers.insert(
         provider_name.clone(),
@@ -328,6 +332,9 @@ fn step_provider(
             parameters: Default::default(),
             notes: None,
             team_access: Default::default(),
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+            prompt_cache,
         },
     );
     config.primary = provider_name.clone();

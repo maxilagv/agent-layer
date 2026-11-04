@@ -49,6 +49,12 @@ provider = "anthropic"
 id = "YOUR_ANTHROPIC_MODEL"
 context_window = 32768
 tools = true
+# Mark the reusable request prefix for Anthropic's prompt cache. Other
+# providers cache on their own; their cached tokens are counted either way.
+prompt_cache = true
+# Prices of cached input (the input price when unset):
+# cache_read_per_million = 0.3
+# cache_write_per_million = 3.75
 
 [providers.gemini]
 wire = "gemini"

@@ -36,6 +36,9 @@ async fn transient_failure_uses_only_authorized_fallback() -> Result<()> {
                 parameters: Default::default(),
                 notes: None,
                 team_access: Default::default(),
+                cache_read_per_million: None,
+                cache_write_per_million: None,
+                prompt_cache: false,
             },
         );
     }

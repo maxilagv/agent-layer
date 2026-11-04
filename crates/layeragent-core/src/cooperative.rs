@@ -862,7 +862,7 @@ impl Engine {
                                     Ok(_) => None,
                                 };
                                 let (state, reason, usage) = match &result {
-                                    Ok(result) => (if token.is_cancelled() { "interrupted" } else { "completed" }, None, json!({"input_tokens":result.usage.input_tokens,"output_tokens":result.usage.output_tokens,"cost_usd":result.cost_usd})),
+                                    Ok(result) => (if token.is_cancelled() { "interrupted" } else { "completed" }, None, usage_json(&result.usage, result.cost_usd)),
                                     Err(error) => (if token.is_cancelled() || held.is_some() { "interrupted" } else { "failed" }, Some(error.to_string()), json!({})),
                                 };
                                 let _ = store.team_finish_activation(&activation, &member, generation, state, reason.as_deref(), &usage).await;

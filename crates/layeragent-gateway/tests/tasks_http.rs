@@ -216,6 +216,9 @@ fn team_models_app(
                 parameters: Default::default(),
                 notes: None,
                 team_access: *access,
+                cache_read_per_million: None,
+                cache_write_per_million: None,
+                prompt_cache: false,
             },
         );
     }

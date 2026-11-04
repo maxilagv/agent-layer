@@ -35,6 +35,9 @@ fn model(id: &str) -> Model {
         parameters: Default::default(),
         notes: None,
         team_access: Default::default(),
+        cache_read_per_million: None,
+        cache_write_per_million: None,
+        prompt_cache: false,
     }
 }
 

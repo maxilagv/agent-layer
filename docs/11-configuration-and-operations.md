@@ -27,6 +27,8 @@ Use [examples/config.toml](../examples/config.toml) as an annotated reference. K
 | `privacy.allowed_providers` | Restrict eligible providers and fallbacks |
 | `models.NAME.team_access` | What the model may do in a cooperative team: `write` (default), `read` or `none` |
 | `models.NAME.notes` | One line on the model's strengths, shown to team members choosing a model |
+| `models.NAME.prompt_cache` | Mark the reusable request prefix for Anthropic's prompt cache |
+| `models.NAME.cache_read_per_million` / `cache_write_per_million` | Prices of cached input; the input price when unset |
 | `browser.enabled` / `allow_domains` | Separate browser network policy |
 
 Default process ceilings include 120 CPU seconds, a 256 MiB individual-file limit and 256 open files. Memory/pid/cgroup quotas need workload-specific configuration and a supporting host. The service template additionally provides aggregate limits.

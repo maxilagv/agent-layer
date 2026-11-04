@@ -239,6 +239,53 @@ pub struct Model {
     /// The most this model may do in a cooperative team.
     #[serde(default)]
     pub team_access: ModelTeamAccess,
+    /// Price of input tokens read from the provider's prompt cache; the
+    /// input price when unset.
+    #[serde(default)]
+    pub cache_read_per_million: Option<f64>,
+    /// Price of input tokens written to the provider's prompt cache; the
+    /// input price when unset.
+    #[serde(default)]
+    pub cache_write_per_million: Option<f64>,
+    /// Mark the stable prefix of each request (tools, instructions, the
+    /// conversation so far) for the provider's prompt cache. Only the
+    /// Anthropic wire needs the marks; OpenAI, DeepSeek and Gemini cache
+    /// automatically and their cached tokens are counted either way.
+    #[serde(default)]
+    pub prompt_cache: bool,
+}
+
+impl Model {
+    /// Estimated cost of `usage` at the configured prices. Unpriced tokens
+    /// cost nothing; cached tokens cost the cache price when one is set.
+    pub fn cost(&self, usage: &layeragent_protocol::Usage) -> f64 {
+        let input = self.input_per_million.unwrap_or(0.0);
+        let read = self.cache_read_per_million.unwrap_or(input);
+        let write = self.cache_write_per_million.unwrap_or(input);
+        let uncached = usage.input_tokens.saturating_sub(
+            usage
+                .cache_read_tokens
+                .saturating_add(usage.cache_write_tokens),
+        );
+        (uncached as f64 * input
+            + usage.cache_read_tokens as f64 * read
+            + usage.cache_write_tokens as f64 * write
+            + usage.output_tokens as f64 * self.output_per_million.unwrap_or(0.0))
+            / 1_000_000.0
+    }
+
+    /// Most a request with `input` and `output` tokens can cost: with prompt
+    /// caching every input token may be a cache write.
+    pub fn reserve_cost(&self, input: u64, output: u64) -> f64 {
+        let price = self.input_per_million.unwrap_or(0.0);
+        let input_price = if self.prompt_cache {
+            self.cache_write_per_million.unwrap_or(price).max(price)
+        } else {
+            price
+        };
+        (input as f64 * input_price + output as f64 * self.output_per_million.unwrap_or(0.0))
+            / 1_000_000.0
+    }
 }
 fn yes() -> bool {
     true
@@ -681,9 +728,14 @@ impl Config {
                 m.context_window >= 1024 && !m.id.is_empty(),
                 "model {name}: invalid model descriptor"
             );
-            for price in [m.input_per_million, m.output_per_million]
-                .into_iter()
-                .flatten()
+            for price in [
+                m.input_per_million,
+                m.output_per_million,
+                m.cache_read_per_million,
+                m.cache_write_per_million,
+            ]
+            .into_iter()
+            .flatten()
             {
                 ensure!(price.is_finite() && price >= 0.0, "invalid model price");
             }
@@ -867,6 +919,9 @@ mod tests {
                 parameters: Default::default(),
                 notes: None,
                 team_access: Default::default(),
+                cache_read_per_million: None,
+                cache_write_per_million: None,
+                prompt_cache: false,
             },
         );
         config.privacy.local_models_only = true;
@@ -945,6 +1000,63 @@ team_access = "none"
         noisy.models.get_mut("reader").context("reader")?.notes =
             Some("x".repeat(MAX_MODEL_NOTES + 1));
         assert!(noisy.validate().is_err());
+        Ok(())
+    }
+    #[test]
+    fn cached_tokens_cost_the_cache_price_and_reserves_cover_cache_writes() -> Result<()> {
+        let mut model: Model = toml::from_str(
+            r#"
+provider = "anthropic"
+id = "claude"
+context_window = 200000
+input_per_million = 3.0
+output_per_million = 15.0
+"#,
+        )?;
+        let usage = layeragent_protocol::Usage {
+            input_tokens: 100_000,
+            output_tokens: 1_000,
+            cache_read_tokens: 80_000,
+            cache_write_tokens: 10_000,
+        };
+        // Without cache prices every input token costs the input price.
+        assert!((model.cost(&usage) - (0.3 + 0.015)).abs() < 1e-9);
+        model.cache_read_per_million = Some(0.3);
+        model.cache_write_per_million = Some(3.75);
+        let expected = (10_000.0 * 3.0 + 80_000.0 * 0.3 + 10_000.0 * 3.75 + 1_000.0 * 15.0) / 1e6;
+        assert!((model.cost(&usage) - expected).abs() < 1e-9);
+        // A provider reporting more cached tokens than input never goes negative.
+        let odd = layeragent_protocol::Usage {
+            input_tokens: 10,
+            cache_read_tokens: 20,
+            ..Default::default()
+        };
+        assert!(model.cost(&odd) >= 0.0);
+        assert!(
+            (model.reserve_cost(1_000, 100) - (1_000.0 * 3.0 + 100.0 * 15.0) / 1e6).abs() < 1e-12
+        );
+        model.prompt_cache = true;
+        assert!(
+            (model.reserve_cost(1_000, 100) - (1_000.0 * 3.75 + 100.0 * 15.0) / 1e6).abs() < 1e-12,
+            "every input token may be a cache write"
+        );
+        model.cache_write_per_million = Some(-1.0);
+        let mut config = Config::default();
+        config.providers.insert(
+            "anthropic".into(),
+            Provider {
+                wire: Wire::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                key_env: None,
+                oauth: None,
+                headers: Default::default(),
+            },
+        );
+        config.models.insert("claude".into(), model);
+        assert!(
+            config.validate().is_err(),
+            "negative cache prices are refused"
+        );
         Ok(())
     }
     #[test]

@@ -63,6 +63,8 @@ pub async fn record(
         "cpu_ms": cpu,
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_write_tokens": usage.cache_write_tokens,
         "cost_usd": cost_usd,
     });
     store.record_task_metrics(task_id, &metrics).await?;

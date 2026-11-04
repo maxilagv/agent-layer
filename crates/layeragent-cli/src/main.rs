@@ -279,6 +279,9 @@ async fn entry() -> Result<()> {
                         parameters: Default::default(),
                         notes: None,
                         team_access: Default::default(),
+                        cache_read_per_million: None,
+                        cache_write_per_million: None,
+                        prompt_cache: false,
                     },
                 );
                 c.primary = "primary".into();

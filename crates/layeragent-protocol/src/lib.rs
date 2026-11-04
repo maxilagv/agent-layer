@@ -91,10 +91,35 @@ impl Message {
         }
     }
 }
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Usage {
+    /// Every input token the provider processed, cached ones included.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Input tokens the provider read from its prompt cache (part of
+    /// `input_tokens`), usually billed at a discount.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_tokens: u64,
+    /// Input tokens the provider wrote to its prompt cache (part of
+    /// `input_tokens`), billed at the cache-write price where one applies.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+impl Usage {
+    /// Adds another call's usage to this one.
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+    }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Completion {

@@ -1142,7 +1142,7 @@ impl Storage {
             ensure!(state == "reserved", "reservation already reconciled");
             let at = now_ms();
             let state = if uncertain { "uncertain" } else if usage.is_some() { "settled" } else { "released" };
-            tx.execute("UPDATE team_reservations SET state=?2,actual_usage=?3,settled_at=CASE WHEN ?2='uncertain' THEN NULL ELSE ?4 END WHERE id=?1", params![reservation, state, usage.as_ref().map(|u|json!({"input_tokens":u.input_tokens,"output_tokens":u.output_tokens,"cost_usd":cost}).to_string()), at])?;
+            tx.execute("UPDATE team_reservations SET state=?2,actual_usage=?3,settled_at=CASE WHEN ?2='uncertain' THEN NULL ELSE ?4 END WHERE id=?1", params![reservation, state, usage.as_ref().map(|u|json!({"input_tokens":u.input_tokens,"output_tokens":u.output_tokens,"cache_read_tokens":u.cache_read_tokens,"cache_write_tokens":u.cache_write_tokens,"cost_usd":cost}).to_string()), at])?;
             if let Some(usage) = usage {
                 let mut totals: Value = serde_json::from_str(&tx.query_row("SELECT usage FROM teams WHERE id=?1", [&team], |r| r.get::<_,String>(0))?)?;
                 let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
@@ -1150,6 +1150,11 @@ impl Storage {
                 totals["input_tokens"] = json!(totals["input_tokens"].as_u64().unwrap_or(0).saturating_add(usage.input_tokens));
                 totals["output_tokens"] = json!(totals["output_tokens"].as_u64().unwrap_or(0).saturating_add(usage.output_tokens));
                 totals["cost_usd"] = json!(totals["cost_usd"].as_f64().unwrap_or(0.0) + cost);
+                for (field, tokens) in [("cache_read_tokens", usage.cache_read_tokens), ("cache_write_tokens", usage.cache_write_tokens)] {
+                    if tokens > 0 {
+                        totals[field] = json!(totals[field].as_u64().unwrap_or(0).saturating_add(tokens));
+                    }
+                }
                 totals[category.as_str()] = json!({"input_tokens":totals[category.as_str()]["input_tokens"].as_u64().unwrap_or(0).saturating_add(usage.input_tokens),"output_tokens":totals[category.as_str()]["output_tokens"].as_u64().unwrap_or(0).saturating_add(usage.output_tokens),"cost_usd":totals[category.as_str()]["cost_usd"].as_f64().unwrap_or(0.0)+cost});
                 tx.execute("UPDATE teams SET usage=?2,updated_at=?3 WHERE id=?1", params![team, totals.to_string(), at])?;
             }
@@ -1894,14 +1899,15 @@ fn usage_by_model(c: &Connection, team: &str) -> Result<Vec<Value>> {
         )
     };
     let mut q = c.prepare(&format!(
-        "SELECT a.model,a.model_identity,count(DISTINCT a.id),{},{},{},COALESCE(sum(CASE WHEN r.state='reserved' THEN r.input_tokens+r.output_tokens ELSE 0 END),0),COALESCE(sum(CASE WHEN r.state='uncertain' THEN r.input_tokens+r.output_tokens ELSE 0 END),0),COALESCE(sum(CASE WHEN r.state IN ('reserved','uncertain') THEN r.estimated_cost_usd ELSE 0 END),0) FROM team_activations a LEFT JOIN team_reservations r ON r.activation_id=a.id WHERE a.team_id=?1 GROUP BY a.model,a.model_identity ORDER BY min(a.started_at),min(a.rowid)",
+        "SELECT a.model,a.model_identity,count(DISTINCT a.id),{},{},{},{},COALESCE(sum(CASE WHEN r.state='reserved' THEN r.input_tokens+r.output_tokens ELSE 0 END),0),COALESCE(sum(CASE WHEN r.state='uncertain' THEN r.input_tokens+r.output_tokens ELSE 0 END),0),COALESCE(sum(CASE WHEN r.state IN ('reserved','uncertain') THEN r.estimated_cost_usd ELSE 0 END),0) FROM team_activations a LEFT JOIN team_reservations r ON r.activation_id=a.id WHERE a.team_id=?1 GROUP BY a.model,a.model_identity ORDER BY min(a.started_at),min(a.rowid)",
         settled("input_tokens"),
         settled("output_tokens"),
         settled("cost_usd"),
+        settled("cache_read_tokens"),
     ))?;
     let rows = q
         .query_map([team], |r| {
-            Ok(json!({"model":r.get::<_,Option<String>>(0)?,"model_id":r.get::<_,Option<String>>(1)?,"activations":r.get::<_,i64>(2)?,"input_tokens":r.get::<_,i64>(3)?,"output_tokens":r.get::<_,i64>(4)?,"cost_usd":r.get::<_,f64>(5)?,"reserved_tokens":r.get::<_,i64>(6)?,"uncertain_tokens":r.get::<_,i64>(7)?,"estimated_open_cost_usd":r.get::<_,f64>(8)?}))
+            Ok(json!({"model":r.get::<_,Option<String>>(0)?,"model_id":r.get::<_,Option<String>>(1)?,"activations":r.get::<_,i64>(2)?,"input_tokens":r.get::<_,i64>(3)?,"output_tokens":r.get::<_,i64>(4)?,"cost_usd":r.get::<_,f64>(5)?,"cache_read_tokens":r.get::<_,i64>(6)?,"reserved_tokens":r.get::<_,i64>(7)?,"uncertain_tokens":r.get::<_,i64>(8)?,"estimated_open_cost_usd":r.get::<_,f64>(9)?}))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
@@ -5639,6 +5645,7 @@ mod tests {
                         Some(&layeragent_protocol::Usage {
                             input_tokens: input,
                             output_tokens: output,
+                            ..Default::default()
                         }),
                         cost,
                         false,
@@ -5733,6 +5740,7 @@ mod tests {
                 Some(&layeragent_protocol::Usage {
                     input_tokens: 4_000,
                     output_tokens: 1_500,
+                    ..Default::default()
                 }),
                 0.0,
                 false,

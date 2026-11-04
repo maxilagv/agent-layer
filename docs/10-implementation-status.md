@@ -89,6 +89,36 @@ seeing peer conclusions; review checks a different reviewer and linked current
 evidence, not independence of every evidence producer. These remain qualification
 boundaries rather than claims of a complete independent-audit workflow.
 
+## Prompt caching and cached-token accounting
+
+Agent rounds resend the same prefix, so cached input is now priced and, on
+Anthropic, requested; see
+[prompt caching and cost](07-multi-provider-resilience-and-model-routing.md#prompt-caching-and-cost).
+
+- Usage carries `cache_read_tokens` and `cache_write_tokens` as parts of
+  `input_tokens`, which now always counts every input token (Anthropic's
+  fresh, written and read input together). Turn and task usage, task metrics,
+  team reservations, team totals and `usage_by_model` record them.
+- One cost function prices fresh input, cache reads, cache writes and output
+  (cache prices default to the input price), and the provider reserve uses the
+  upper bound, every input token at the cache-write price when caching. A
+  completion that does not name its model is charged as the selected model.
+- `models.NAME.prompt_cache` marks the last tool, the instructions and the
+  last conversation block for Anthropic; `setup` enables it for the official
+  Anthropic endpoint. Streamed chat requests send
+  `stream_options.include_usage`. No migration is needed: stored usage
+  without the new fields reads as zero cached tokens.
+
+Verification: a configuration test covers pricing with and without cache
+prices, a provider over-reporting cached tokens, the reserve bound and invalid
+prices. Provider tests check the three marks and their absence without
+`prompt_cache`, the usage request on chat streams, and cached-token parsing for
+OpenAI chat, DeepSeek, OpenAI responses, Anthropic streams and documents, and
+Gemini, using payloads shaped like each provider's documented usage. A runtime
+test charges a two-round turn that writes then reads the cache at the cache
+prices. No live provider was called: real cache hit rates depend on each
+provider's minimum cacheable size, cache lifetime and prefix stability.
+
 ## Godeye team bus, first increment
 
 Godeye is the name for the cooperative team bus: the only channel through which

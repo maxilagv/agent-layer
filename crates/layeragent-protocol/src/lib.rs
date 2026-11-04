@@ -236,12 +236,24 @@ pub enum RunMode {
     #[default]
     Normal,
     Illustration,
+    /// Investigate and write the plan under `docs/plan/`, then ask for
+    /// approval; nothing is built.
+    Plan,
 }
 impl RunMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
             Self::Illustration => "illustration",
+            Self::Plan => "plan",
+        }
+    }
+    /// A stored mode; an unknown value reads as normal.
+    pub fn parse_stored(value: &str) -> Self {
+        match value {
+            "illustration" => Self::Illustration,
+            "plan" => Self::Plan,
+            _ => Self::Normal,
         }
     }
 }

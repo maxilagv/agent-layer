@@ -119,6 +119,43 @@ test charges a two-round turn that writes then reads the cache at the cache
 prices. No live provider was called: real cache hit rates depend on each
 provider's minimum cacheable size, cache lifetime and prefix stability.
 
+## Planning first, the operator profile and file search
+
+- **Planning mode.** `RunMode::Plan` (`run --plan`, `/plan` in the TUI, task
+  `mode = "plan"`) is stored with the task and refused for cooperative
+  execution. A planning turn has no shell, terminals, Git writes, MCP calls,
+  custom tools or skill authoring; it keeps reading, search, the agent's own
+  browser, memory, skills, budget and read-only delegation, and write_file and
+  edit_file only under `docs/plan/` (checked by path component before the tool
+  runs). Its instructions name the plan's files (brief, stack, plan,
+  acceptance, costs) and end with a request for approval. `/build [notes]`
+  sends the build prompt for the approved plan. Writing the plan needs the
+  operator policy to allow writes; otherwise the plan comes back as the answer.
+- **Operator profile.** `[operator]` (`technical`, `language`,
+  `default_budget_usd`, `publish`, `notes`, each one line) reaches every
+  turn's instructions; without a technical level the agent is told to ask once
+  and remember it. `layeragent profile` edits only that table. The default
+  budget applies to tasks that set none when the selected model is priced.
+  The stack guidance follows the level: the simplest deliverable for a
+  non-technical operator, low-maintenance stacks for some experience, the
+  requirements' stack for a developer.
+- **Search.** `search_files` takes `regex`, `case_insensitive` and `glob`;
+  `list_files` takes `glob`. Both still run in the confined file script.
+
+Verification: a runtime test in `crates/layeragent-core/tests/planning.rs`
+runs a scripted planning task whose write outside `docs/plan/` is refused,
+whose plan file is written, whose tools exclude shell and terminals and whose
+instructions carry the plan and the profile, then a build turn in the same
+session with the shell back. The file script runs directly in that test's
+sandbox double, which does not certify confinement. Unit tests cover the
+planning restrictions (including a narrowed operator allow-list), the write
+scope by path component and traversal, search by literal, case, regular
+expression and pattern, the profile's validation, `layeragent profile`
+preserving other tables, and the CLI and TUI commands; gateway tests cover a
+refused cooperative plan, a stored plan task and the default budget with and
+without prices. Scripted models do not show that a real model plans well or
+fits its stack to the profile.
+
 ## Spending awareness, task budgets and the usage ledger
 
 The agent can now see and steer its own spending; see

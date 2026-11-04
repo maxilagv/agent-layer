@@ -103,6 +103,9 @@ fn discard_catalog(server: &str) {
 }
 
 pub struct ToolContext<'a> {
+    /// When set, write_file and edit_file may only write under this
+    /// workspace-relative directory (planning mode).
+    pub write_scope: Option<&'a str>,
     pub scope: &'a Scope,
     pub session_id: &'a str,
     pub turn_id: &'a str,
@@ -153,14 +156,14 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
         ),
         def(
             "list_files",
-            "List files below a workspace directory",
-            json!({"path":short}),
+            "List files below a workspace directory; glob limits them (\"*.tsx\" matches file names at any depth, \"src/*\" matches paths)",
+            json!({"path":short,"glob":{"type":"string","maxLength":256}}),
             &[],
         ),
         def(
             "search_files",
-            "Search workspace text for a literal string",
-            json!({"query":short,"path":short}),
+            "Search workspace text, line by line: a literal string by default, a Python regular expression with regex=true. glob limits the files (\"*.rs\" matches file names at any depth, \"src/*.py\" matches paths); at most 200 matches",
+            json!({"query":short,"path":short,"regex":{"type":"boolean"},"case_insensitive":{"type":"boolean"},"glob":{"type":"string","maxLength":256}}),
             &["query"],
         ),
         def(
@@ -538,6 +541,19 @@ pub fn requires_approval(config: &Config, name: &str) -> bool {
         ]
         .contains(&name)
 }
+/// Refuses a write outside `scope`, a workspace-relative directory, as while
+/// planning. Paths are compared by component, so `docs/planning` is outside
+/// `docs/plan`.
+pub fn check_write_scope(workspace: &Path, resolved: &Path, scope: &str) -> Result<()> {
+    let root = workspace.canonicalize()?;
+    let relative = resolved.strip_prefix(&root).unwrap_or(resolved);
+    ensure!(
+        relative.starts_with(scope) && relative != Path::new(scope),
+        "while planning, files can only be written under {scope}/"
+    );
+    Ok(())
+}
+
 pub fn resolve_path(workspace: &Path, value: &str, write: bool) -> Result<PathBuf> {
     let root = workspace.canonicalize()?;
     let path = root.join(value);
@@ -911,11 +927,15 @@ impl Tools {
             .map(str::to_string)
             .collect(),
             "read_file" | "write_file" | "edit_file" | "list_files" | "search_files" => {
-                resolve_path(
+                let writes = ["write_file", "edit_file"].contains(&call.name.as_str());
+                let resolved = resolve_path(
                     ctx.workspace,
                     if s("path").is_empty() { "." } else { s("path") },
-                    ["write_file", "edit_file"].contains(&call.name.as_str()),
+                    writes,
                 )?;
+                if writes && let Some(scope) = ctx.write_scope {
+                    check_write_scope(ctx.workspace, &resolved, scope)?;
+                }
                 vec![
                     "python3".into(),
                     "-I".into(),
@@ -1270,6 +1290,105 @@ fn reject_external_refs(v: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the sandboxed file script directly, as the sandbox would.
+    fn files(dir: &Path, operation: &str, args: Value) -> Value {
+        use std::io::Write;
+        let mut child = std::process::Command::new("python3")
+            .args(["-I", "-c", include_str!("files.py"), operation])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(args.to_string().as_bytes())
+            .expect("write");
+        let output = child.wait_with_output().expect("output");
+        assert!(output.status.success(), "{args}");
+        serde_json::from_slice(&output.stdout).expect("json")
+    }
+
+    #[test]
+    fn search_takes_regular_expressions_case_and_file_patterns() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(dir.path().join("src/deep"))?;
+        std::fs::write(dir.path().join("src/deep/a.rs"), "fn Parse_Token() {}\n")?;
+        std::fs::write(dir.path().join("src/b.py"), "parse_token = 2\n")?;
+        std::fs::write(dir.path().join("README.md"), "Parse_Token in docs\n")?;
+        let paths = |value: Value| -> Vec<String> {
+            value["results"]
+                .as_array()
+                .expect("results")
+                .iter()
+                .map(|r| {
+                    r["path"]
+                        .as_str()
+                        .map_or_else(|| r.as_str().unwrap_or("").to_string(), str::to_string)
+                })
+                .collect()
+        };
+        assert_eq!(
+            paths(files(
+                dir.path(),
+                "search_files",
+                json!({"query":"parse_token"})
+            )),
+            ["src/b.py"]
+        );
+        assert_eq!(
+            paths(files(
+                dir.path(),
+                "search_files",
+                json!({"query":"parse_token","case_insensitive":true})
+            ))
+            .len(),
+            3
+        );
+        assert_eq!(
+            paths(files(
+                dir.path(),
+                "search_files",
+                json!({"query":"Parse_\\w+\\(","regex":true})
+            )),
+            ["src/deep/a.rs"]
+        );
+        assert_eq!(
+            paths(files(
+                dir.path(),
+                "search_files",
+                json!({"query":"parse","case_insensitive":true,"glob":"*.rs"})
+            )),
+            ["src/deep/a.rs"],
+            "a name pattern matches at any depth"
+        );
+        assert_eq!(
+            paths(files(dir.path(), "list_files", json!({"glob":"src/*.py"}))),
+            ["src/b.py"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_planning_turn_writes_only_under_its_plan_directory() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().canonicalize().expect("root");
+        let check = |value: &str| -> Result<()> {
+            let resolved = resolve_path(&root, value, true)?;
+            check_write_scope(&root, &resolved, "docs/plan")
+        };
+        assert!(check("docs/plan/brief.md").is_ok());
+        assert!(check("docs/plan").is_err());
+        assert!(
+            check("docs/planning/brief.md").is_err(),
+            "a sibling with the same prefix"
+        );
+        assert!(check("src/main.rs").is_err());
+        assert!(check("docs/plan/../../src/main.rs").is_err(), "traversal");
+    }
     #[test]
     fn traversal_and_secret_paths_are_rejected() -> Result<()> {
         let d = tempfile::tempdir()?;

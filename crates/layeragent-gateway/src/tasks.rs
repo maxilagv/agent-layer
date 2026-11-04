@@ -129,8 +129,16 @@ pub(super) async fn create(
         )
         .into());
     }
-    if r.mode != layeragent_protocol::RunMode::Normal {
+    if r.mode == layeragent_protocol::RunMode::Illustration {
         return Err(anyhow::anyhow!("illustration is not implemented yet").into());
+    }
+    if r.mode == layeragent_protocol::RunMode::Plan
+        && r.execution == layeragent_protocol::ExecutionMode::Cooperative
+    {
+        return Err(anyhow::anyhow!(
+            "plan mode applies to individual and delegated tasks; plan first, then start the team"
+        )
+        .into());
     }
     if r.execution != layeragent_protocol::ExecutionMode::Cooperative && r.cooperative.is_some() {
         return Err(anyhow::anyhow!("cooperative options require execution=cooperative").into());
@@ -146,6 +154,19 @@ pub(super) async fn create(
     // A revoked or disabled connection must not start new work. Existing work
     // was stopped when the generation changed.
     let config = s.engine.config().await;
+    // The operator's default budget applies when the task sets none and the
+    // selected model has the prices it needs.
+    let mut r = r;
+    if r.budget_usd.is_none()
+        && let Some(default) = config.operator.default_budget_usd
+    {
+        let selected = r.model.clone().unwrap_or_else(|| config.primary.clone());
+        if config.models.get(&selected).is_some_and(|model| {
+            model.input_per_million.is_some() && model.output_per_million.is_some()
+        }) {
+            r.budget_usd = Some(default);
+        }
+    }
     if let Some(budget) = r.budget_usd {
         if !(budget.is_finite() && budget > 0.0) {
             return Err(anyhow::anyhow!("budget_usd must be positive").into());

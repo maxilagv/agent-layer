@@ -76,6 +76,23 @@ enum Command {
         json: bool,
     },
     /// Interactive terminal client.
+    /// Tell the agent who you are: how technical, your language, a default
+    /// budget and where you publish. Without options it shows the profile.
+    Profile {
+        #[arg(long, value_parser = ["none", "some", "expert"])]
+        technical: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        budget_usd: Option<f64>,
+        #[arg(long)]
+        publish: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        /// Remove the profile before applying the options.
+        #[arg(long)]
+        clear: bool,
+    },
     /// What a task spent, per model and agent depth, with hints to spend less.
     Cost {
         task: String,
@@ -455,6 +472,40 @@ async fn entry() -> Result<()> {
         } => {
             let client = client::Client::connect(&home, &profile).await?;
             client.print_turn(&session, &prompt, None, json).await?;
+        }
+        Command::Profile {
+            technical,
+            language,
+            budget_usd,
+            publish,
+            notes,
+            clear,
+        } => {
+            let profile = setup::set_operator(
+                &home,
+                setup::OperatorUpdate {
+                    technical: technical.as_deref().map(str::parse).transpose()?,
+                    language,
+                    default_budget_usd: budget_usd,
+                    publish,
+                    notes,
+                    clear,
+                },
+            )?;
+            println!(
+                "Nivel técnico: {}\nIdioma: {}\nPresupuesto por defecto: {}\nPublicación: {}\nNotas: {}",
+                profile
+                    .technical
+                    .map_or("sin configurar", |level| level.as_str()),
+                profile.language.as_deref().unwrap_or("sin configurar"),
+                profile
+                    .default_budget_usd
+                    .map_or("sin configurar".to_string(), |budget| format!(
+                        "US${budget:.2}"
+                    )),
+                profile.publish.as_deref().unwrap_or("sin configurar"),
+                profile.notes.as_deref().unwrap_or("sin notas"),
+            );
         }
         Command::Cost { task, json } => {
             team::identifier(&task)?;
@@ -855,6 +906,8 @@ mod doctor_tests {
             vec!["team", "export", "task-one", "--format", "dead-ends"],
             vec!["team", "memory", "task-one", "--json"],
             vec!["cost", "task-one", "--json"],
+            vec!["profile", "--technical", "none", "--language", "es"],
+            vec!["run", "plan the shop", "--plan"],
             vec!["run", "build it", "--budget-usd", "3"],
         ] {
             assert!(Args::try_parse_from(std::iter::once("layeragent").chain(command)).is_ok());

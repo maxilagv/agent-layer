@@ -90,6 +90,9 @@ pub enum Action {
     Compact,
     Effort(Option<String>),
     Team(String),
+    /// A prompt to run in planning mode: the plan is written under
+    /// docs/plan/ and nothing is built.
+    Plan(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -318,6 +321,26 @@ impl App {
         if text == "/execution" {
             self.note(&format!("Modo de las próximas tareas: {}", self.execution));
             return Action::None;
+        }
+        if let Some(objective) = text.strip_prefix("/plan ") {
+            let objective = objective.trim();
+            if objective.is_empty() {
+                self.note("Uso: /plan <qué querés construir>");
+                return Action::None;
+            }
+            return Action::Plan(objective.into());
+        }
+        if text == "/plan" {
+            self.note("Uso: /plan <qué querés construir>");
+            return Action::None;
+        }
+        if text == "/build" || text.starts_with("/build ") {
+            let notes = text.strip_prefix("/build").unwrap_or("").trim();
+            let mut prompt = "The operator approved the plan in docs/plan/. Build it as planned, follow its acceptance criteria and checks, and report what was built, how it was checked and anything that changed from the plan.".to_string();
+            if !notes.is_empty() {
+                prompt.push_str(&format!(" The operator adds: {notes}"));
+            }
+            return Action::Send(prompt);
         }
         if text == "/budget" {
             self.note(&match self.budget_usd {
@@ -1299,6 +1322,27 @@ mod tests {
         type_str(&mut a, "/execution individual");
         assert_eq!(a.on_key(Key::Enter), Action::None);
         assert_eq!(a.execution, "individual");
+        type_str(&mut a, "/plan una tienda de bicicletas");
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Action::Plan("una tienda de bicicletas".into())
+        );
+        type_str(&mut a, "/plan");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+        type_str(&mut a, "/build con fotos reales");
+        match a.on_key(Key::Enter) {
+            Action::Send(prompt) => {
+                assert!(
+                    prompt.contains("approved the plan in docs/plan/"),
+                    "{prompt}"
+                );
+                assert!(
+                    prompt.ends_with("The operator adds: con fotos reales"),
+                    "{prompt}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
         type_str(&mut a, "/budget 2.5");
         assert_eq!(a.on_key(Key::Enter), Action::None);
         assert_eq!(a.budget_usd, Some(2.5));

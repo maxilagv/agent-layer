@@ -316,6 +316,10 @@ impl AgentControl for EngineAgents {
             !writable || ctx.config.policy.write,
             "this task is read-only; it cannot create writable children"
         );
+        ensure!(
+            !writable || tree.mode != RunMode::Plan,
+            "while planning, children only read"
+        );
         let model = args["model"].as_str().map(str::to_string);
         if let Some(m) = &model {
             let configured = ctx.config.models.get(m).with_context(|| {

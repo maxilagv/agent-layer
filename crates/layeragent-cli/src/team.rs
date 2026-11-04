@@ -36,6 +36,10 @@ pub struct ExecutionOptions {
     /// child agents and team members included.
     #[arg(long)]
     pub budget_usd: Option<f64>,
+    /// Plan only: investigate and write the plan under docs/plan/, then ask
+    /// for approval. Nothing is built.
+    #[arg(long)]
+    pub plan: bool,
 }
 impl ExecutionOptions {
     pub fn body(&self) -> Result<Value> {
@@ -63,10 +67,17 @@ impl ExecutionOptions {
                 "--budget-usd must be positive"
             );
         }
+        ensure!(
+            !self.plan || mode != ExecutionMode::Cooperative,
+            "--plan applies to individual and delegated tasks; plan first, then start the team"
+        );
         if mode != ExecutionMode::Cooperative {
             let mut body = json!({"execution":mode});
             if let Some(budget) = self.budget_usd {
                 body["budget_usd"] = json!(budget);
+            }
+            if self.plan {
+                body["mode"] = json!("plan");
             }
             return Ok(body);
         }
@@ -664,6 +675,7 @@ pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
         consultant_model: args.consultant_model,
         without_project_memory: args.without_project_memory,
         budget_usd: args.budget_usd,
+        plan: false,
     };
     options.body()?;
     Ok((options, objective.trim().into()))
@@ -724,6 +736,22 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn planning_sends_the_plan_mode_and_never_with_a_team() -> Result<()> {
+        let plan = ExecutionOptions {
+            plan: true,
+            ..Default::default()
+        };
+        assert_eq!(plan.body()?["mode"], "plan");
+        let team = ExecutionOptions {
+            execution: "cooperative".into(),
+            plan: true,
+            ..Default::default()
+        };
+        assert!(team.body().is_err());
+        Ok(())
+    }
+
     #[test]
     fn a_budget_reaches_the_task_in_every_mode() -> Result<()> {
         let individual = ExecutionOptions {

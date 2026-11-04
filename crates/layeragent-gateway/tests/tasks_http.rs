@@ -416,3 +416,73 @@ async fn a_task_budget_needs_prices_and_bounds_the_whole_task() -> Result<()> {
     let _ = home;
     Ok(())
 }
+
+#[tokio::test]
+async fn planning_is_for_single_agents_and_the_operator_default_budget_applies() -> Result<()> {
+    use layeragent_config::ModelTeamAccess::Write;
+    let home = tempfile::tempdir()?;
+    let mut config = Config::default();
+    config.providers.insert(
+        "local".into(),
+        layeragent_config::Provider {
+            wire: layeragent_config::Wire::Ollama,
+            base_url: "http://127.0.0.1:9".into(),
+            key_env: None,
+            oauth: None,
+            headers: Default::default(),
+        },
+    );
+    for (alias, priced) in [("priced", true), ("free", false)] {
+        config.models.insert(
+            alias.into(),
+            layeragent_config::Model {
+                provider: "local".into(),
+                id: format!("{alias}-model"),
+                context_window: 32768,
+                tools: true,
+                emulate_tools: false,
+                input_per_million: priced.then_some(1.0),
+                output_per_million: priced.then_some(2.0),
+                parameters: Default::default(),
+                notes: None,
+                team_access: Write,
+                cache_read_per_million: None,
+                cache_write_per_million: None,
+                prompt_cache: false,
+            },
+        );
+    }
+    config.primary = "priced".into();
+    config.operator.default_budget_usd = Some(4.0);
+    let engine = Engine::with_components(
+        home.path().into(),
+        "default".into(),
+        config,
+        Arc::new(NoopModel),
+        Arc::new(NoopSandbox),
+    )?;
+    let app = router(ApiState::new(engine, true));
+    let directory = tempfile::tempdir()?;
+    let workspace = directory
+        .path()
+        .canonicalize()?
+        .to_string_lossy()
+        .into_owned();
+    let (status, refused) = call(&app, "POST", "/v1/tasks", Some("p1"), json!({"workspace": workspace, "objective": "plan it", "executor": "local", "mode": "plan", "execution": "cooperative"})).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let (status, created) = call(&app, "POST", "/v1/tasks", Some("p2"), json!({"workspace": workspace, "objective": "plan it", "executor": "local", "mode": "plan"})).await?;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["mode"], "plan");
+    assert_eq!(created["budget_usd"], 4.0, "the operator's default budget");
+    let (status, own) = call(&app, "POST", "/v1/tasks", Some("p3"), json!({"workspace": workspace, "objective": "build it", "executor": "local", "budget_usd": 1.0})).await?;
+    assert_eq!(status, StatusCode::CREATED, "{own}");
+    assert_eq!(own["budget_usd"], 1.0, "a task's own budget wins");
+    let (status, free) = call(&app, "POST", "/v1/tasks", Some("p4"), json!({"workspace": workspace, "objective": "build it", "executor": "local", "model": "free"})).await?;
+    assert_eq!(status, StatusCode::CREATED, "{free}");
+    assert!(
+        free.get("budget_usd").is_none_or(Value::is_null),
+        "no default without prices: {free}"
+    );
+    let _ = home;
+    Ok(())
+}

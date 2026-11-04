@@ -50,6 +50,18 @@ pub const COMMANDS: &[Command] = &[
         help: "Consultar o cambiar esfuerzo",
     },
     Command {
+        name: "/plan",
+        aliases: &[],
+        usage: "/plan <qué construir>",
+        help: "Planificar primero: escribe docs/plan/ y pide aprobación",
+    },
+    Command {
+        name: "/build",
+        aliases: &[],
+        usage: "/build [notas]",
+        help: "Construir el plan aprobado de docs/plan/",
+    },
+    Command {
         name: "/budget",
         aliases: &[],
         usage: "/budget [dólares|off]",

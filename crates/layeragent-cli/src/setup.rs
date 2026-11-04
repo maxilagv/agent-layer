@@ -643,6 +643,70 @@ fn default_base_url(wire: &Wire) -> &'static str {
     }
 }
 
+/// Changes to the operator profile; `None` leaves a field as it is.
+#[derive(Debug, Default)]
+pub struct OperatorUpdate {
+    pub technical: Option<layeragent_config::TechnicalLevel>,
+    pub language: Option<String>,
+    pub default_budget_usd: Option<f64>,
+    pub publish: Option<String>,
+    pub notes: Option<String>,
+    /// Remove the whole profile first.
+    pub clear: bool,
+}
+
+/// Updates `[operator]` in the base configuration file and returns the
+/// profile. Every other table is kept as it is; the daemon picks the change
+/// up on its next reload.
+pub fn set_operator(
+    home: &Path,
+    update: OperatorUpdate,
+) -> Result<layeragent_config::OperatorProfile> {
+    let path = home.join("config.toml");
+    let mut table: toml::Table = if path.exists() {
+        toml::from_str(&std::fs::read_to_string(&path)?).context("config.toml is not valid TOML")?
+    } else {
+        toml::Table::new()
+    };
+    let mut profile: layeragent_config::OperatorProfile = match table.get("operator") {
+        Some(value) if !update.clear => value
+            .clone()
+            .try_into()
+            .context("invalid [operator] table")?,
+        _ => Default::default(),
+    };
+    let text = |value: Option<String>| {
+        value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    if update.technical.is_some() {
+        profile.technical = update.technical;
+    }
+    if let Some(language) = text(update.language) {
+        profile.language = Some(language);
+    }
+    if update.default_budget_usd.is_some() {
+        profile.default_budget_usd = update.default_budget_usd;
+    }
+    if let Some(publish) = text(update.publish) {
+        profile.publish = Some(publish);
+    }
+    if let Some(notes) = text(update.notes) {
+        profile.notes = Some(notes);
+    }
+    profile.validate()?;
+    table.insert(
+        "operator".into(),
+        toml::Value::try_from(&profile).context("the profile is not serializable")?,
+    );
+    private_dir(home)?;
+    let temporary = home.join(".config.toml.tmp");
+    std::fs::write(&temporary, toml::to_string_pretty(&table)?)?;
+    std::fs::rename(&temporary, &path)?;
+    Ok(profile)
+}
+
 /// Writes the effective configuration atomically.
 fn write_config(home: &Path, config: &Config) -> Result<()> {
     private_dir(home)?;
@@ -661,6 +725,61 @@ fn write_config(home: &Path, config: &Config) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod setup_tests {
     use super::*;
+
+    #[test]
+    fn the_profile_command_changes_only_the_operator_table() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        std::fs::write(
+            home.path().join("config.toml"),
+            "primary = \"keep\"\n[policy]\nwrite = true\n",
+        )?;
+        let profile = set_operator(
+            home.path(),
+            OperatorUpdate {
+                technical: Some(layeragent_config::TechnicalLevel::None),
+                language: Some("es".into()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(profile.language.as_deref(), Some("es"));
+        let profile = set_operator(
+            home.path(),
+            OperatorUpdate {
+                default_budget_usd: Some(3.0),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            profile.technical,
+            Some(layeragent_config::TechnicalLevel::None),
+            "kept"
+        );
+        let raw: toml::Table =
+            toml::from_str(&std::fs::read_to_string(home.path().join("config.toml"))?)?;
+        assert_eq!(raw["primary"].as_str(), Some("keep"));
+        assert_eq!(raw["policy"]["write"].as_bool(), Some(true));
+        assert_eq!(raw["operator"]["default_budget_usd"].as_float(), Some(3.0));
+        assert!(
+            set_operator(
+                home.path(),
+                OperatorUpdate {
+                    notes: Some("a\nb".into()),
+                    ..Default::default()
+                }
+            )
+            .is_err(),
+            "an invalid profile is not written"
+        );
+        let cleared = set_operator(
+            home.path(),
+            OperatorUpdate {
+                clear: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(cleared, Default::default());
+        Ok(())
+    }
 
     fn selected(provider: &str, model: &str, key_env: Option<&str>) -> SetupOptions {
         SetupOptions {

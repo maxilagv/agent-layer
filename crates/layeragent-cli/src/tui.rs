@@ -219,6 +219,15 @@ async fn interface(
                 let options = crate::team::ExecutionOptions { execution: app.execution.clone(), budget_usd: app.budget_usd, ..Default::default() }.body()?;
                 follower = Some(spawn_follow(client.clone(), session.clone(), Some((prompt, options)), None, tx.clone(), view_generation));
             }
+            Action::Plan(prompt) => {
+                cancel_on_start = false;
+                job = None;
+                if let Some(handle) = follower.take() { handle.abort(); }
+                view_generation += 1;
+                let execution = if app.execution == "cooperative" { "delegated".to_string() } else { app.execution.clone() };
+                let options = crate::team::ExecutionOptions { execution, budget_usd: app.budget_usd, plan: true, ..Default::default() }.body()?;
+                follower = Some(spawn_follow(client.clone(), session.clone(), Some((prompt, options)), None, tx.clone(), view_generation));
+            }
             Action::Team(command) => {
                 if let Some(start) = command.strip_prefix("start ") {
                     match crate::team::parse_start(start) {

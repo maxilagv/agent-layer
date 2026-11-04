@@ -7,7 +7,9 @@
 `execution: cooperative` exposes teams through CLI/TUI and the task API. Members
 read the shared team workspace; when the operator creates the task with write
 scope, a member can switch to writing in its own worktree (see
-[cooperative writers](#godeye-cooperative-writers)).
+[cooperative writers](#godeye-cooperative-writers)). Members can run different
+models, bring in consultants and require cross-model review (see
+[teams on several models](#godeye-teams-on-several-models)).
 The [terminal guide](15-cooperative-terminal.md) includes a local scripted demo,
 controls and an optional native check. Actual outcomes for the maintained source
 fingerprint belong to `verification.json`; fixture success does not establish
@@ -182,7 +184,9 @@ change reaches the team workspace only after another member approves it.
   unsubmitted changes to the work's reserved paths; they leave the sender's
   worktree and are applied to the recipient's worktree when it writes.
 - **End of a team.** When a team is terminated, cancelled or fails, each worktree
-  is removed and any unsubmitted changes are kept as a `retained` patch. Paused
+  is removed and any unsubmitted changes are kept as a `retained` patch. A
+  worktree that is behind the team workspace is synced first, so changes that
+  were already integrated are not kept again. Paused
   and blocked teams keep their worktrees. `layeragent team patches <task>` and the
   `patches` resource list patches; exports include them. Migration 010 adds
   member access, reservations and patches.
@@ -203,6 +207,76 @@ certify that the native sandbox confines a worktree writer, and the native
 cooperative check was not run for this increment. Scripted models show the
 mechanisms work, not that a real model reserves paths, splits work or reviews
 well.
+
+## Godeye teams on several models
+
+Third godeye increment: members of one team can run different models, a member
+can bring in a consultant on another model for one question, and a team can
+require that patches are approved from a different model than the one that
+wrote them. The operator-facing description is in
+[teams on several models](15-cooperative-terminal.md#teams-on-several-models).
+
+- **Recorded models.** The supervisor fixes each activation's model alias when
+  it starts and records it with its model id (lowercase, without a vendor
+  prefix). Members without their own model run the team's, recorded as the
+  team's `default_model`. Patches record the model of the activation that
+  submitted them and of the one that reviewed them. `team_members` shows each
+  member's model and the configured aliases with model ids and prices, without
+  endpoints, credentials or parameters. Exports list members with their models.
+- **Consultants.** `team_consult` adds a `consultant` member with the resolved
+  model alias, a token budget and the question as its only delivery. The alias
+  must be configured, able to call tools, allowed by the privacy settings, and
+  priced when the team has a cost ceiling. Consultants get read tools and the team tools to answer, wait,
+  record findings and evidence, read and review patches; the team tools that
+  create or take work, switch to writing, add members, consult or close are
+  hidden from them and refused by the runtime and by storage. They receive only
+  messages addressed to them and do not count against `max_members`. Two can
+  run at once and eight over a team's life. When a consultant's activation ends,
+  storage retires it if it answered the member that asked, failed, spent its
+  budget, or finished without answering; one waiting on its own clarifying
+  question, or interrupted by the runtime, stays for at most three activations.
+  A retirement resolves the open question and, without an answer, sends the
+  asker a runtime notice. A consultant's failure or exhausted budget ends the
+  consultation, not the team.
+- **Budget.** Before each model call of a consultant, storage compares the
+  tokens it has consumed (settled usage, plus reserved estimates for calls whose
+  consumption is unknown) with its budget and refuses the call once it is spent.
+  A consultation can therefore exceed its budget by at most one call. Team
+  limits apply on top.
+- **Cross-model review.** With `cross_model_review`, storage refuses an approval
+  whose activation model equals the patch author's, both when the review is
+  checked and when it is recorded; rejections are not restricted. A submission
+  that names a reviewer on the author's model is refused before the request is
+  sent. The option needs write scope, and the gateway refuses it unless two
+  configured models have different model ids. `team_consult` with a `patch_id`
+  makes the consultant's decision the answer to the consultation: the review
+  outcome is sent to the member that asked as a response, and to the author.
+- **Interfaces.** `--cross-model-review` and `--consultant-model ALIAS` on
+  `run` and `/team start`; `team show` lists each member's model and each
+  consultation's outcome and token use. Migration 011 adds the recorded models
+  and the consultant columns.
+
+Verification: storage tests cover an approval refused on the author's model and
+accepted on another, the record repeating that check, recorded author and
+reviewer models, a consultant answering and retiring without taking a member
+place, broadcasts and work kept away from consultants, a budget refused after
+it is spent, a silent consultation reported to the asker, the running and
+lifetime consultation limits, and a consultant's patch decision answering its
+consultation. A unit test covers the consultant's tool list, including an
+operator allow-list that would otherwise become empty. Two runtime tests in
+`crates/layeragent-core/tests/cooperative_consult.rs` drive a scripted team on
+two configured models over a real repository: the writer's same-model reviewer
+is refused before the request, the coordinator consults the other model with
+the patch, the consultant reads the real diff and approves it, the patch is
+integrated with both models recorded, and the consultant is retired with its
+consultation answered; and a model outside the provider allowlist is refused
+before it joins, then a consultation that spends its budget on its first call is
+refused its second, retired, and the team still completes. Both
+scripted models run behind one fixture provider: these tests show the
+mechanisms, not that two real providers interoperate in one team, nor that a
+different model reviews better. No live run with two providers was made for
+this increment. The sandbox is the same test double as for writers and does
+not certify confinement.
 
 ## Cooperative bus hardening increment
 

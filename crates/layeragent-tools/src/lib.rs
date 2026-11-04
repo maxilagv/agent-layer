@@ -44,11 +44,12 @@ pub trait TeamControl: Send + Sync {
 pub trait SessionControl: Send + Sync {
     async fn execute(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value>;
 }
-pub const TEAM_TOOLS: [&str; 18] = [
+pub const TEAM_TOOLS: [&str; 19] = [
     "team_members",
     "team_message",
     "team_wait",
     "team_add_member",
+    "team_consult",
     "team_work_create",
     "team_work_claim",
     "team_work_update",
@@ -479,10 +480,11 @@ pub fn definitions_with_team(config: &Config, cooperative: bool) -> Vec<ToolDefi
     // runtime derives a deterministic key per activation and call, and uses the
     // current revision. Supplying a stale revision still yields a conflict.
     tools.extend([
-        def("team_members", "List team identities, roles, states, the current team revision and your own member id; identities come from the runtime", json!({}), &[]),
+        def("team_members", "List team identities, roles, states, the model each member runs, the configured models a consultation can use, the current team revision and your own member id; identities come from the runtime", json!({}), &[]),
         def("team_message", "Persist a direct peer message; accepted is not incorporated, understood or resolved. A claim without evidence_id reaches peers marked unsupported. A handoff transfers your in-progress work_id to the recipient. urgent delivers between the recipient's tool calls instead of at its next round", fields(json!({"recipient":id,"purpose":purpose,"body":text,"work_id":id,"finding_id":id,"evidence_id":id,"reply_to":id,"provenance":{"type":"array","items":text,"maxItems":32},"urgent":{"type":"boolean"}})), &["purpose","body"]),
         def("team_wait", "Without reply_timeout_secs: mark this response as waiting, then finish it to release the concurrency slot. With reply_timeout_secs (1..120): wait in this activation for an answer to your open question or verification request; returns waited=true when a message arrives, which you read next", json!({"reason":text,"reply_timeout_secs":{"type":"integer","minimum":1,"maximum":120}}), &["reason"]),
         def("team_add_member", "Coordinator only: add a specialist for distinct justified work", fields(json!({"name":text,"role":role,"justification":text,"model":id})), &["name","role","justification"]),
+        def("team_consult", "Bring in a consultant for one question: a read-only member on a configured model (another model gives an independent opinion), with a token budget. It receives your question, answers you, and is then retired; it takes no work and no member place. With patch_id it reviews that submitted patch and its decision is the answer", fields(json!({"question":text,"model":id,"name":{"type":"string","maxLength":64},"max_tokens":{"type":"integer","minimum":layeragent_protocol::CONSULT_MIN_TOKENS,"maximum":layeragent_protocol::CONSULT_MAX_TOKENS},"work_id":id,"patch_id":id})), &["question"]),
         def("team_work_create", "Create shared work with an explicit deliverable and close conditions", fields(json!({"title":text,"deliverable":text,"assignee":id,"dependencies":{"type":"array","items":id,"maxItems":64},"priority":{"type":"integer"},"close_conditions":text})), &["title","deliverable","close_conditions"]),
         def("team_work_claim", "Atomically claim available shared work", json!({"work_id":id,"expected_revision":revision}), &["work_id","expected_revision"]),
         def("team_work_update", "Finish, cancel or reopen owned work with a reason", json!({"work_id":id,"state":{"type":"string","enum":["completed","cancelled","inconclusive","pending"]},"expected_revision":revision,"reason":text}), &["work_id","state","expected_revision","reason"]),
@@ -1358,6 +1360,7 @@ mod tests {
             "team_patch_show",
             "team_patch_review",
             "team_patch_submit",
+            "team_consult",
         ] {
             assert!(writing.contains(&tool.to_string()), "{tool}");
         }

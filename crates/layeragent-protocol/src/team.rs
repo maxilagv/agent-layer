@@ -76,6 +76,9 @@ pub enum TeamRole {
     Verifier,
     Specialist,
     Writer,
+    /// Brought in by a member to answer one question, read-only and on a
+    /// token budget, then retired by the runtime. Never a permanent member.
+    Consultant,
 }
 impl TeamRole {
     pub fn as_str(self) -> &'static str {
@@ -86,6 +89,7 @@ impl TeamRole {
             Self::Verifier => "verifier",
             Self::Specialist => "specialist",
             Self::Writer => "writer",
+            Self::Consultant => "consultant",
         }
     }
 }
@@ -99,6 +103,7 @@ impl std::str::FromStr for TeamRole {
             "verifier" => Self::Verifier,
             "specialist" => Self::Specialist,
             "writer" => Self::Writer,
+            "consultant" => Self::Consultant,
             other => anyhow::bail!("unknown team role {other}"),
         })
     }
@@ -213,6 +218,9 @@ pub struct CooperativeOptions {
     pub scope: CooperativeScope,
     pub limits: TeamLimits,
     pub role_models: BTreeMap<TeamRole, String>,
+    /// A patch is approved only by a member running a different model than
+    /// the one that wrote it. Rejections are not restricted.
+    pub cross_model_review: bool,
 }
 impl CooperativeOptions {
     pub fn normalized(&self, token_ceiling: Option<u64>) -> Result<Self> {
@@ -234,8 +242,12 @@ impl CooperativeOptions {
             "too many deliverables"
         );
         ensure!(
-            result.role_models.len() <= 6,
+            result.role_models.len() <= 7,
             "too many role model overrides"
+        );
+        ensure!(
+            !result.cross_model_review || result.scope.allow_write,
+            "cross-model review applies to patches; it needs a team that allows writing"
         );
         Ok(result)
     }
@@ -401,6 +413,52 @@ pub struct TeamMemberInput {
     pub model: Option<String>,
 }
 
+/// Consultations a team can have running at once.
+pub const MAX_ACTIVE_CONSULTANTS: usize = 2;
+/// Consultations over the life of a team.
+pub const MAX_CONSULTATIONS: usize = 8;
+/// Activations one consultant gets: its first, plus replies to its own
+/// clarifying questions.
+pub const MAX_CONSULT_ACTIVATIONS: i64 = 3;
+pub const CONSULT_DEFAULT_TOKENS: u64 = 150_000;
+pub const CONSULT_MIN_TOKENS: u64 = 5_000;
+pub const CONSULT_MAX_TOKENS: u64 = 600_000;
+
+/// Brings a consultant into the team for one question.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TeamConsultInput {
+    pub idempotency_key: String,
+    pub expected_revision: i64,
+    pub question: String,
+    /// Configured model alias. Defaults to the team's consultant role model,
+    /// then to the team's model.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Token budget for the whole consultation.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub work_id: Option<String>,
+    /// A submitted patch the consultant reviews; its decision answers the
+    /// question.
+    #[serde(default)]
+    pub patch_id: Option<String>,
+}
+
+/// What a model is, independent of the alias and the service that serves
+/// it: two aliases or providers serving the same model id are the same model
+/// for cross-model review. Lowercase, without a vendor prefix such as
+/// `anthropic/` or `deepseek/`.
+pub fn model_identity(id: &str) -> String {
+    id.trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct TeamWorkInput {
     pub idempotency_key: String,
@@ -515,6 +573,12 @@ pub struct TeamActivationContext {
     /// The member's own worktree when it writes.
     #[serde(default)]
     pub worktree: Option<String>,
+    /// The model alias this activation runs with, recorded when it starts.
+    #[serde(default)]
+    pub activation_model: Option<String>,
+    /// [`model_identity`] of that model.
+    #[serde(default)]
+    pub model_identity: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -539,6 +603,9 @@ pub struct TeamSnapshot {
     pub pause_pending: bool,
     #[serde(default)]
     pub pending_approvals: Vec<Value>,
+    /// Model alias of members without their own, as the supervisor last ran it.
+    #[serde(default)]
+    pub default_model: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -593,6 +660,34 @@ mod tests {
         assert_eq!(
             "review".parse::<TeamTemplate>().ok(),
             Some(TeamTemplate::Review)
+        );
+    }
+
+    #[test]
+    fn model_identity_ignores_alias_provider_prefix_and_case() {
+        assert_eq!(
+            model_identity("anthropic/Claude-Opus-5-5"),
+            "claude-opus-5-5"
+        );
+        assert_eq!(model_identity("claude-opus-5-5"), "claude-opus-5-5");
+        assert_ne!(
+            model_identity("deepseek/deepseek-chat"),
+            model_identity("claude-opus-5-5")
+        );
+    }
+
+    #[test]
+    fn cross_model_review_needs_a_writing_team() {
+        let mut options = CooperativeOptions {
+            cross_model_review: true,
+            ..Default::default()
+        };
+        assert!(options.normalized(None).is_err());
+        options.scope.allow_write = true;
+        assert!(options.normalized(None).is_ok());
+        assert_eq!(
+            "consultant".parse::<TeamRole>().ok(),
+            Some(TeamRole::Consultant)
         );
     }
 }

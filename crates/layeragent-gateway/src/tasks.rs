@@ -174,6 +174,20 @@ pub(super) async fn create(
         if options.scope.allow_write && !config.policy.write {
             return Err(anyhow::anyhow!("cooperative write scope exceeds task policy").into());
         }
+        if options.cross_model_review {
+            // Without a second model nothing could ever be approved.
+            let distinct: std::collections::BTreeSet<String> = config
+                .models
+                .values()
+                .map(|model| layeragent_protocol::model_identity(&model.id))
+                .collect();
+            if distinct.len() < 2 {
+                return Err(anyhow::anyhow!(
+                    "cross-model review needs at least two configured models with different model ids"
+                )
+                .into());
+            }
+        }
         Some(options)
     } else {
         None

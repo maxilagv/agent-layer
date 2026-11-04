@@ -309,6 +309,20 @@ impl EngineTeamControl {
             !git_team::conflict_markers(&body),
             "the patch still contains conflict markers; resolve them first"
         );
+        let reviewer = args["reviewer"].as_str().map(str::to_string);
+        if let Some(reviewer) = &reviewer {
+            // Catch a reviewer that could never approve before asking it.
+            let snapshot = store.team_snapshot_by_id(team).await?;
+            if snapshot.options.cross_model_review
+                && let Some(own) = &context.model_identity
+                && super::consult::member_identity(ctx.config, &snapshot, reviewer).as_ref()
+                    == Some(own)
+            {
+                bail!(
+                    "this team requires cross-model review and {reviewer} runs {own}, the model you run; name a member on another model, or submit without a reviewer and consult one with team_consult and the patch_id"
+                );
+            }
+        }
         store
             .team_submit_patch(
                 team,
@@ -319,7 +333,7 @@ impl EngineTeamControl {
                     base,
                     files,
                     body,
-                    reviewer: args["reviewer"].as_str().map(str::to_string),
+                    reviewer,
                 },
             )
             .await
@@ -353,7 +367,9 @@ impl EngineTeamControl {
         let reason = required(args, "reason")?;
         match required(args, "verdict")? {
             "reject" => {
-                store.team_review_precheck(team, reviewer, patch).await?;
+                store
+                    .team_review_precheck(team, reviewer, patch, false)
+                    .await?;
                 store
                     .team_review_record(team, reviewer, patch, ReviewOutcome::Rejected, reason)
                     .await
@@ -361,7 +377,9 @@ impl EngineTeamControl {
             "approve" => {
                 let gate = integration_gate(team)?;
                 let _order = gate.lock().await;
-                let (_, body) = store.team_review_precheck(team, reviewer, patch).await?;
+                let (_, body) = store
+                    .team_review_precheck(team, reviewer, patch, true)
+                    .await?;
                 let project = self.project(ctx).await?;
                 // Never apply under a task that is writing the same workspace.
                 let lease = self.engine.lease(&project.to_string_lossy())?;
@@ -499,6 +517,26 @@ impl Engine {
         for (member, worktree, base) in worktrees {
             let path = PathBuf::from(&worktree);
             let mut retained = None;
+            let mut base = base;
+            // A worktree behind the team workspace still holds changes that
+            // were already integrated; bring it up to date first so only work
+            // that never reached the team workspace is kept.
+            let stale = store
+                .team_writer_state(team, &member)
+                .await
+                .is_ok_and(|state| state.stale);
+            if stale
+                && path.exists()
+                && let Some(old) = base.clone()
+                && let Ok(area) = team_area(self, team)
+            {
+                match git_team::sync(project, &path, &old, &area.join("tmp")).await {
+                    Ok((synced, _)) => base = Some(synced),
+                    Err(error) => {
+                        tracing::warn!(%error, team, member, "stale worktree could not be synced before retiring; its changes are kept against the old base");
+                    }
+                }
+            }
             if let Some(base) = base
                 && path.exists()
             {

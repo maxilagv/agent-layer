@@ -207,6 +207,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/sessions/{id}/ws", get(websocket))
         .route("/v1/tasks", get(tasks::list).post(tasks::create))
         .route("/v1/tasks/{id}", get(tasks::get))
+        .route("/v1/tasks/{id}/usage", get(tasks::task_usage))
         .route("/v1/tasks/{id}/events", get(tasks::events))
         .route("/v1/tasks/{id}/events/stream", get(tasks::stream))
         .route("/v1/tasks/{id}/cancel", post(tasks::cancel))
@@ -574,6 +575,7 @@ async fn run(
                     mode: r.mode,
                     execution: r.execution,
                     cooperative: r.cooperative,
+                    budget_usd: None,
                 },
                 cancel,
             )
@@ -974,6 +976,7 @@ pub fn start_channel_workers(engine: Arc<Engine>) {
                                     mode: Default::default(),
                                     execution: Default::default(),
                                     cooperative: None,
+                                    budget_usd: None,
                                 },
                                 e.shutdown.child_token(),
                             )

@@ -148,6 +148,7 @@ async fn repository_instructions_cannot_grant_revoked_write_authority() -> Resul
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -221,6 +222,7 @@ async fn authorized_execution_keeps_original_arguments_while_durable_copies_are_
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -264,6 +266,7 @@ async fn permission_reload_cancels_active_and_queued_turns() -> Result<()> {
         mode: Default::default(),
         execution: Default::default(),
         cooperative: None,
+        budget_usd: None,
     };
     let mut events = engine.events.subscribe();
     let first_engine = engine.clone();
@@ -351,6 +354,7 @@ async fn complete_turn_persists_replays_and_preserves_user_changes() -> Result<(
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -394,6 +398,7 @@ async fn complete_turn_persists_replays_and_preserves_user_changes() -> Result<(
                     mode: Default::default(),
                     execution: Default::default(),
                     cooperative: None,
+                    budget_usd: None,
                 },
                 CancellationToken::new()
             )
@@ -433,6 +438,7 @@ async fn cancellation_seals_turn_and_keeps_history() -> Result<()> {
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             token,
         )
@@ -559,6 +565,7 @@ async fn tool_output_secrets_never_reach_history_or_events() -> Result<()> {
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -652,6 +659,7 @@ async fn shell_output_streams_as_redacted_events_before_completion() -> Result<(
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -818,6 +826,7 @@ fn delegate(workspace: &tempfile::TempDir, prompt: &str) -> RunRequest {
         mode: Default::default(),
         execution: Default::default(),
         cooperative: None,
+        budget_usd: None,
     }
 }
 
@@ -1114,6 +1123,7 @@ fn delegate_ws(workspace: &tempfile::TempDir, prompt: &str) -> RunRequest {
         mode: Default::default(),
         execution: Default::default(),
         cooperative: None,
+        budget_usd: None,
     }
 }
 
@@ -1207,6 +1217,7 @@ async fn session_controls_are_audited_and_auto_compaction_preserves_canonical_hi
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -1302,6 +1313,7 @@ async fn auto_effort_does_not_stop_a_turn_below_the_configured_output_ceiling() 
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -1392,6 +1404,7 @@ async fn a_turn_is_charged_the_cache_prices_of_its_cached_tokens() -> Result<()>
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )

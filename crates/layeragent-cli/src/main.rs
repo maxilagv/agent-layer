@@ -76,6 +76,12 @@ enum Command {
         json: bool,
     },
     /// Interactive terminal client.
+    /// What a task spent, per model and agent depth, with hints to spend less.
+    Cost {
+        task: String,
+        #[arg(long)]
+        json: bool,
+    },
     Tui {
         #[arg(short, long, default_value = ".")]
         workspace: PathBuf,
@@ -449,6 +455,16 @@ async fn entry() -> Result<()> {
         } => {
             let client = client::Client::connect(&home, &profile).await?;
             client.print_turn(&session, &prompt, None, json).await?;
+        }
+        Command::Cost { task, json } => {
+            team::identifier(&task)?;
+            let client = client::Client::connect(&home, &profile).await?;
+            let report = client.get(&format!("/v1/tasks/{task}/usage")).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", team::cost_summary(&report));
+            }
         }
         Command::Tui { workspace, session } => {
             let client = client::Client::connect(&home, &profile).await?;
@@ -838,6 +854,8 @@ mod doctor_tests {
             vec!["team", "export", "task-one", "--format", "json"],
             vec!["team", "export", "task-one", "--format", "dead-ends"],
             vec!["team", "memory", "task-one", "--json"],
+            vec!["cost", "task-one", "--json"],
+            vec!["run", "build it", "--budget-usd", "3"],
         ] {
             assert!(Args::try_parse_from(std::iter::once("layeragent").chain(command)).is_ok());
         }

@@ -107,3 +107,41 @@ prices and a budget. The credential is never written into the report: only
 the model, the prices and the resulting costs are recorded. The MiniMax route
 through the Vercel AI Gateway is exercised by `tests/live_provider.py`, which
 is opt-in and consumes real usage.
+
+## Spending controls
+
+A task can carry its own budget, which covers every child agent it starts
+and, for a team, becomes the team's cost ceiling unless that is lower:
+
+```bash
+layeragent run "Build the landing page" --workspace . --budget-usd 3
+layeragent cost TASK_ID          # what it spent, per model and agent level
+layeragent cost TASK_ID --json
+```
+
+In the interactive terminal, `/budget 3` applies to the next prompts and
+`/budget off` removes it. A budget needs input and output prices for the
+selected model. It can only narrow `agents.tree_max_cost_usd`, never widen it.
+
+- **Before each request** the provider reserve may not exceed what is left of
+  the budget, so the request that would overspend is refused.
+- **While it works** the agent is told when the task crosses 50%, 80% and 95%
+  of its budget, once each. The token ceiling of the agent tree counts too,
+  so a task without a money budget is still told as it nears
+  `agents.tree_max_tokens`.
+- **`budget_status`** shows the turn's tokens, cached share and cost, the
+  task's spend against its budget and token ceiling, the team's usage for a
+  member, and the configured models it may delegate to, cheapest first, with
+  their prices and notes.
+- **`spawn_agent` with `model`** gives a child a cheaper model. The operator's
+  rules hold: a model must be allowed by the privacy settings, may not be
+  `team_access = "none"`, must be `"write"` for a writable child, and must be
+  priced when the task has a cost limit.
+
+Every provider call is recorded in a usage ledger with its model, agent
+depth, tokens (cached ones apart) and estimated cost.
+`GET /v1/tasks/{id}/usage` and `layeragent cost` add it up per model and per
+depth, including every member activation of a team, and list hints such as
+enabling `prompt_cache` for an uncached Anthropic model, delegating many short
+calls of an expensive model to a cheaper one, or narrowing children that spent
+most of the task. Hints are suggestions; nothing is changed automatically.

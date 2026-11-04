@@ -319,3 +319,100 @@ async fn a_team_runs_only_the_models_the_operator_allows() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_task_budget_needs_prices_and_bounds_the_whole_task() -> Result<()> {
+    use layeragent_config::ModelTeamAccess::Write;
+    let (app, _home) = team_models_app(&[("unpriced", "model-a", Write)])?;
+    let directory = tempfile::tempdir()?;
+    let workspace = directory
+        .path()
+        .canonicalize()?
+        .to_string_lossy()
+        .into_owned();
+    let body = json!({"workspace": workspace, "objective": "build it", "executor": "local", "budget_usd": 2.0});
+    let (status, refused) = call(&app, "POST", "/v1/tasks", Some("b1"), body.clone()).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains("prices"),
+        "{refused}"
+    );
+
+    let home = tempfile::tempdir()?;
+    let mut config = Config::default();
+    config.providers.insert(
+        "local".into(),
+        layeragent_config::Provider {
+            wire: layeragent_config::Wire::Ollama,
+            base_url: "http://127.0.0.1:9".into(),
+            key_env: None,
+            oauth: None,
+            headers: Default::default(),
+        },
+    );
+    config.models.insert(
+        "priced".into(),
+        layeragent_config::Model {
+            provider: "local".into(),
+            id: "priced-model".into(),
+            context_window: 32768,
+            tools: true,
+            emulate_tools: false,
+            input_per_million: Some(1.0),
+            output_per_million: Some(2.0),
+            parameters: Default::default(),
+            notes: None,
+            team_access: Write,
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+            prompt_cache: false,
+        },
+    );
+    config.primary = "priced".into();
+    let engine = Engine::with_components(
+        home.path().into(),
+        "default".into(),
+        config,
+        Arc::new(NoopModel),
+        Arc::new(NoopSandbox),
+    )?;
+    let app = router(ApiState::new(engine, true));
+    let (status, bad) = call(&app, "POST", "/v1/tasks", Some("b2"), json!({"workspace": workspace, "objective": "build it", "executor": "local", "budget_usd": -1.0})).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    let (status, created) = call(&app, "POST", "/v1/tasks", Some("b3"), body).await?;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["budget_usd"], 2.0);
+    let id = created["id"].as_str().unwrap();
+    let (status, report) = call(
+        &app,
+        "GET",
+        &format!("/v1/tasks/{id}/usage"),
+        None,
+        json!({}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["budget_usd"], 2.0);
+    assert!(
+        report["by_model"].is_array() && report["hints"].is_array(),
+        "{report}"
+    );
+
+    // For a team, the budget is its cost ceiling unless that is lower.
+    let team = json!({"workspace": workspace, "objective": "review it", "executor": "local", "execution": "cooperative", "cooperative": {"limits": {"max_cost_usd": 5.0}}, "budget_usd": 1.5});
+    let (status, created) = call(&app, "POST", "/v1/tasks", Some("b4"), team).await?;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap();
+    let (status, snapshot) = call(
+        &app,
+        "GET",
+        &format!("/v1/tasks/{id}/team"),
+        None,
+        json!({}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+    assert_eq!(snapshot["team"]["options"]["limits"]["max_cost_usd"], 1.5);
+    let _ = home;
+    Ok(())
+}

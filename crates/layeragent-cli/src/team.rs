@@ -32,6 +32,10 @@ pub struct ExecutionOptions {
     /// Start without what earlier teams on this workspace concluded.
     #[arg(long)]
     pub without_project_memory: bool,
+    /// Most the task may spend in US dollars at the configured prices,
+    /// child agents and team members included.
+    #[arg(long)]
+    pub budget_usd: Option<f64>,
 }
 impl ExecutionOptions {
     pub fn body(&self) -> Result<Value> {
@@ -53,8 +57,18 @@ impl ExecutionOptions {
             mode == ExecutionMode::Cooperative || !configured,
             "team options require --execution cooperative"
         );
+        if let Some(budget) = self.budget_usd {
+            ensure!(
+                budget.is_finite() && budget > 0.0,
+                "--budget-usd must be positive"
+            );
+        }
         if mode != ExecutionMode::Cooperative {
-            return Ok(json!({"execution":mode}));
+            let mut body = json!({"execution":mode});
+            if let Some(budget) = self.budget_usd {
+                body["budget_usd"] = json!(budget);
+            }
+            return Ok(body);
         }
         let mut options = CooperativeOptions {
             template: self
@@ -82,7 +96,11 @@ impl ExecutionOptions {
                 .insert(TeamRole::Consultant, model.clone());
         }
         let options = options.normalized(None)?;
-        Ok(json!({"execution":mode,"cooperative":options}))
+        let mut body = json!({"execution":mode,"cooperative":options});
+        if let Some(budget) = self.budget_usd {
+            body["budget_usd"] = json!(budget);
+        }
+        Ok(body)
     }
 }
 
@@ -353,6 +371,69 @@ pub fn summary(value: &Value) -> String {
     terminal_text(&out)
 }
 
+/// A task's spending, per model and agent depth, with the hints.
+pub fn cost_summary(value: &Value) -> String {
+    let total = &value["total"];
+    let money = |v: &Value| format!("US${:.4}", v.as_f64().unwrap_or(0.0));
+    let percent = |v: &Value| format!("{:.0}%", v.as_f64().unwrap_or(0.0) * 100.0);
+    let mut out = format!(
+        "Tarea {} · {} · {} llamadas en {} turnos · caché {}{}\n",
+        value["task_id"].as_str().unwrap_or("?"),
+        money(&total["cost_usd"]),
+        total["calls"].as_i64().unwrap_or(0),
+        total["turns"].as_i64().unwrap_or(0),
+        percent(&total["cache_read_ratio"]),
+        value["budget_usd"]
+            .as_f64()
+            .map(|budget| format!(" · presupuesto US${budget:.2}"))
+            .unwrap_or_default(),
+    );
+    out.push_str("Por modelo:\n");
+    for row in value["by_model"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "  {} · {} · {} llamadas · {} entrada / {} salida tokens · caché {}\n",
+            row["model"].as_str().unwrap_or("?"),
+            money(&row["cost_usd"]),
+            row["calls"].as_i64().unwrap_or(0),
+            row["input_tokens"].as_i64().unwrap_or(0),
+            row["output_tokens"].as_i64().unwrap_or(0),
+            percent(&row["cache_read_ratio"]),
+        ));
+    }
+    let depths = value["by_depth"].as_array().cloned().unwrap_or_default();
+    if depths.len() > 1 {
+        out.push_str("Por nivel:\n");
+        for row in &depths {
+            let depth = row["depth"].as_i64().unwrap_or(0);
+            out.push_str(&format!(
+                "  {} · {}\n",
+                if depth == 0 {
+                    "tarea principal".to_string()
+                } else {
+                    format!("subagentes nivel {depth}")
+                },
+                money(&row["cost_usd"]),
+            ));
+        }
+    }
+    let hints: Vec<&str> = value["hints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !hints.is_empty() {
+        out.push_str("Para gastar menos:\n");
+        for hint in hints {
+            out.push_str(&format!("  - {hint}\n"));
+        }
+    }
+    out.push_str(
+        "Costos estimados con los precios configurados; no son la factura del proveedor.\n",
+    );
+    terminal_text(&out)
+}
+
 /// Earlier conclusions on the workspace, one line each.
 pub fn memory_summary(value: &Value) -> String {
     let items = value["items"].as_array().cloned().unwrap_or_default();
@@ -564,9 +645,11 @@ struct StartArgs {
     consultant_model: Option<String>,
     #[arg(long)]
     without_project_memory: bool,
+    #[arg(long)]
+    budget_usd: Option<f64>,
 }
 pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
-    let (options, objective) = text.split_once(" -- ").context("Uso: /team start audit|debug|review [--max-tokens N] [--max-seconds N] [--max-cost-usd N] [--allow-write] [--cross-model-review] [--consultant-model ALIAS] [--without-project-memory] -- objetivo")?;
+    let (options, objective) = text.split_once(" -- ").context("Uso: /team start audit|debug|review [--max-tokens N] [--max-seconds N] [--max-cost-usd N] [--allow-write] [--cross-model-review] [--consultant-model ALIAS] [--without-project-memory] [--budget-usd N] -- objetivo")?;
     ensure!(!objective.trim().is_empty(), "objective is required");
     let args =
         StartArgs::try_parse_from(std::iter::once("start").chain(options.split_whitespace()))?;
@@ -580,6 +663,7 @@ pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
         cross_model_review: args.cross_model_review,
         consultant_model: args.consultant_model,
         without_project_memory: args.without_project_memory,
+        budget_usd: args.budget_usd,
     };
     options.body()?;
     Ok((options, objective.trim().into()))
@@ -640,6 +724,48 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn a_budget_reaches_the_task_in_every_mode() -> Result<()> {
+        let individual = ExecutionOptions {
+            execution: "individual".into(),
+            budget_usd: Some(3.0),
+            ..Default::default()
+        };
+        assert_eq!(individual.body()?["budget_usd"], 3.0);
+        let (team, _) = parse_start("audit --budget-usd 4 -- inspect")?;
+        assert_eq!(team.body()?["budget_usd"], 4.0);
+        let invalid = ExecutionOptions {
+            budget_usd: Some(0.0),
+            ..Default::default()
+        };
+        assert!(invalid.body().is_err());
+        let text = cost_summary(&json!({
+            "task_id":"t1","budget_usd":2.0,
+            "total":{"cost_usd":1.2345,"calls":6,"turns":2,"cache_read_ratio":0.4},
+            "by_model":[{"model":"opus","cost_usd":1.2,"calls":5,"input_tokens":90000,"output_tokens":3000,"cache_read_ratio":0.45}],
+            "by_depth":[{"depth":0,"cost_usd":1.0},{"depth":1,"cost_usd":0.2345}],
+            "hints":["Child agents spent 19% of the task."]
+        }));
+        assert!(
+            text.contains(
+                "Tarea t1 · US$1.2345 · 6 llamadas en 2 turnos · caché 40% · presupuesto US$2.00"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  opus · US$1.2000 · 5 llamadas · 90000 entrada / 3000 salida tokens · caché 45%"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("subagentes nivel 1 · US$0.2345"), "{text}");
+        assert!(
+            text.contains("Para gastar menos:\n  - Child agents spent 19% of the task."),
+            "{text}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn project_memory_is_on_unless_the_operator_starts_fresh() -> Result<()> {
         let (options, _) = parse_start("audit -- inspect")?;

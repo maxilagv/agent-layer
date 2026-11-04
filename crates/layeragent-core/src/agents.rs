@@ -24,7 +24,17 @@ pub(crate) struct Budget {
     tokens: AtomicI64,
     cost_micro: AtomicI64,
     exhausted: AtomicBool,
+    token_limit: Option<u64>,
+    cost_limit: Option<f64>,
+    spent_tokens: AtomicI64,
+    spent_micro: AtomicI64,
+    /// How many of [`NOTICE_SHARES`] have been announced to the tree.
+    announced: AtomicUsize,
 }
+
+/// Shares of a tree's budget at which the turn that crosses one is told.
+pub(crate) const NOTICE_SHARES: [f64; 3] = [0.5, 0.8, 0.95];
+
 impl Budget {
     pub(crate) fn new(tokens: Option<u64>, cost_usd: Option<f64>) -> Self {
         Self {
@@ -33,10 +43,18 @@ impl Budget {
             ),
             cost_micro: AtomicI64::new(cost_usd.map_or(i64::MAX / 2, |c| (c * 1e6) as i64)),
             exhausted: AtomicBool::new(false),
+            token_limit: tokens,
+            cost_limit: cost_usd,
+            spent_tokens: AtomicI64::new(0),
+            spent_micro: AtomicI64::new(0),
+            announced: AtomicUsize::new(0),
         }
     }
     /// Records consumption; returns false once the tree is out of budget.
     pub(crate) fn charge(&self, tokens: u64, cost_usd: f64) -> bool {
+        self.spent_tokens.fetch_add(tokens as i64, Ordering::SeqCst);
+        self.spent_micro
+            .fetch_add((cost_usd * 1e6) as i64, Ordering::SeqCst);
         let tokens_left = self.tokens.fetch_sub(tokens as i64, Ordering::SeqCst) - tokens as i64;
         let cost_left = self
             .cost_micro
@@ -50,10 +68,47 @@ impl Budget {
     pub(crate) fn exhausted(&self) -> bool {
         self.exhausted.load(Ordering::SeqCst)
     }
+    pub(crate) fn spent_tokens(&self) -> u64 {
+        self.spent_tokens.load(Ordering::SeqCst).max(0) as u64
+    }
+    pub(crate) fn spent_usd(&self) -> f64 {
+        self.spent_micro.load(Ordering::SeqCst).max(0) as f64 / 1e6
+    }
+    pub(crate) fn token_limit(&self) -> Option<u64> {
+        self.token_limit
+    }
+    pub(crate) fn cost_limit(&self) -> Option<f64> {
+        self.cost_limit
+    }
+    /// Money left in the tree, when it has a cost limit.
+    pub(crate) fn remaining_usd(&self) -> Option<f64> {
+        self.cost_limit
+            .map(|limit| (limit - self.spent_usd()).max(0.0))
+    }
+    /// The larger of the spent shares of the token and cost limits.
+    pub(crate) fn share(&self) -> f64 {
+        let tokens = self.token_limit.map_or(0.0, |limit| {
+            self.spent_tokens() as f64 / limit.max(1) as f64
+        });
+        let cost = self
+            .cost_limit
+            .map_or(0.0, |limit| self.spent_usd() / limit);
+        tokens.max(cost)
+    }
+    /// The highest notice share just crossed, announced once per tree.
+    pub(crate) fn crossed(&self) -> Option<f64> {
+        let share = self.share();
+        let reached = NOTICE_SHARES.iter().filter(|s| share >= **s).count();
+        let before = self.announced.fetch_max(reached, Ordering::SeqCst);
+        (reached > before).then(|| NOTICE_SHARES[reached - 1])
+    }
 }
 
 pub(crate) struct AgentTree {
     pub(crate) budget: Budget,
+    /// The turn the tree started from; every call in the tree is recorded
+    /// against it.
+    pub(crate) root: OnceLock<String>,
     pub(crate) bridge_enabled: bool,
     pub(crate) effort: EffortLevel,
     pub(crate) mode: RunMode,
@@ -71,9 +126,16 @@ impl AgentTree {
         effort: EffortLevel,
         mode: RunMode,
         execution: ExecutionMode,
+        budget_usd: Option<f64>,
     ) -> Arc<Self> {
+        // A run's own budget can only narrow the operator's tree ceiling.
+        let cost = match (cfg.tree_max_cost_usd, budget_usd) {
+            (Some(ceiling), Some(budget)) => Some(ceiling.min(budget)),
+            (ceiling, budget) => ceiling.or(budget),
+        };
         Arc::new(Self {
-            budget: Budget::new(cfg.tree_max_tokens, cfg.tree_max_cost_usd),
+            budget: Budget::new(cfg.tree_max_tokens, cost),
+            root: OnceLock::new(),
             bridge_enabled,
             effort,
             mode,
@@ -150,9 +212,10 @@ impl AgentCtl {
         effort: EffortLevel,
         mode: RunMode,
         execution: ExecutionMode,
+        budget_usd: Option<f64>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            tree: AgentTree::new(cfg, bridge, effort, mode, execution),
+            tree: AgentTree::new(cfg, bridge, effort, mode, execution, budget_usd),
             depth: 0,
             agent_id: None,
             writable: true,
@@ -171,6 +234,9 @@ impl AgentCtl {
         let _ = self
             .bound
             .set((session.into(), turn.into(), cancel.clone()));
+        if self.depth == 0 {
+            let _ = self.tree.root.set(turn.into());
+        }
     }
     fn bound(&self) -> Result<&(String, String, CancellationToken)> {
         self.bound
@@ -252,7 +318,26 @@ impl AgentControl for EngineAgents {
         );
         let model = args["model"].as_str().map(str::to_string);
         if let Some(m) = &model {
-            ensure!(ctx.config.models.contains_key(m), "unknown model {m}");
+            let configured = ctx.config.models.get(m).with_context(|| {
+                format!("unknown model {m}; budget_status lists the configured models")
+            })?;
+            // The operator's rules for a model hold for delegated work too:
+            // where it may send code, and whether it may write.
+            ctx.config
+                .require_model_egress(m)
+                .map_err(|error| anyhow::anyhow!("model {m} cannot be delegated to: {error}"))?;
+            ctx.config.require_team_model(m, writable)?;
+            ensure!(
+                configured.tools || configured.emulate_tools,
+                "model {m} cannot call tools"
+            );
+            // Unpriced usage is charged as zero, which would escape a budget.
+            ensure!(
+                (tree.budget.cost_limit().is_none() && ctx.config.max_cost_usd.is_none())
+                    || (configured.input_per_million.is_some()
+                        && configured.output_per_million.is_some()),
+                "model {m} has no configured prices; this task has a cost limit"
+            );
         }
         ensure!(
             tree.spawned.fetch_add(1, Ordering::SeqCst) < cfg.max_children_per_turn,
@@ -344,6 +429,7 @@ impl AgentControl for EngineAgents {
                 mode: self.ctl.tree.mode,
                 execution: ExecutionMode::Delegated,
                 cooperative: None,
+                budget_usd: None,
             },
             timeout: std::time::Duration::from_secs(cfg.child_timeout_secs),
         };
@@ -664,6 +750,48 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_budget_knows_its_spend_and_announces_each_share_once() {
+        let b = Budget::new(Some(1_000), Some(2.0));
+        assert_eq!(b.crossed(), None);
+        b.charge(100, 0.9);
+        assert_eq!(b.crossed(), None, "45% crosses nothing");
+        b.charge(100, 0.2);
+        assert_eq!(b.crossed(), Some(0.5));
+        assert_eq!(b.crossed(), None, "announced once");
+        // Tokens can cross a share before money does.
+        b.charge(700, 0.0);
+        assert_eq!(b.crossed(), Some(0.8), "900 of 1000 tokens");
+        assert!((b.spent_usd() - 1.1).abs() < 1e-6);
+        assert_eq!(b.spent_tokens(), 900);
+        assert!((b.remaining_usd().expect("limit") - 0.9).abs() < 1e-6);
+        // Jumping past two shares at once announces the highest.
+        let jump = Budget::new(None, Some(1.0));
+        jump.charge(0, 0.97);
+        assert_eq!(jump.crossed(), Some(0.95));
+        assert_eq!(Budget::new(None, None).remaining_usd(), None);
+    }
+
+    #[test]
+    fn a_run_budget_narrows_the_tree_ceiling_but_never_widens_it() {
+        let mut cfg = AgentsConfig::default();
+        let tree = |cfg: &AgentsConfig, budget| {
+            AgentTree::new(
+                cfg,
+                false,
+                EffortLevel::Auto,
+                RunMode::Normal,
+                ExecutionMode::Delegated,
+                budget,
+            )
+        };
+        assert_eq!(tree(&cfg, Some(3.0)).budget.cost_limit(), Some(3.0));
+        cfg.tree_max_cost_usd = Some(2.0);
+        assert_eq!(tree(&cfg, Some(3.0)).budget.cost_limit(), Some(2.0));
+        assert_eq!(tree(&cfg, Some(1.0)).budget.cost_limit(), Some(1.0));
+        assert_eq!(tree(&cfg, None).budget.cost_limit(), Some(2.0));
+    }
+
+    #[test]
     fn children_are_never_wider_than_their_parent() {
         let mut base = Config::default();
         base.policy.write = true;
@@ -676,6 +804,7 @@ mod tests {
             EffortLevel::Auto,
             RunMode::Normal,
             ExecutionMode::Delegated,
+            None,
         );
         assert!(Arc::ptr_eq(&effective_config(base.clone(), &root), &base));
         let child = AgentCtl {

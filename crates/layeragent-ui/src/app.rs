@@ -165,6 +165,8 @@ pub struct App {
     pub(crate) card: usize,
     pub(crate) help: bool,
     pub execution: String,
+    /// Budget in US dollars for the next tasks, when set with /budget.
+    pub budget_usd: Option<f64>,
     pub team: Option<Value>,
     pub team_visible: bool,
     pub team_resource: String,
@@ -196,6 +198,7 @@ impl App {
             card: 0,
             help: false,
             execution: "delegated".into(),
+            budget_usd: None,
             team: None,
             team_visible: false,
             team_resource: "members".into(),
@@ -314,6 +317,33 @@ impl App {
         }
         if text == "/execution" {
             self.note(&format!("Modo de las próximas tareas: {}", self.execution));
+            return Action::None;
+        }
+        if text == "/budget" {
+            self.note(&match self.budget_usd {
+                Some(budget) => format!("Presupuesto de las próximas tareas: US${budget:.2}"),
+                None => "Las próximas tareas no tienen presupuesto propio.".into(),
+            });
+            return Action::None;
+        }
+        if let Some(value) = text.strip_prefix("/budget ") {
+            let value = value.trim();
+            if value == "off" {
+                self.budget_usd = None;
+                self.note("Las próximas tareas no tienen presupuesto propio.");
+            } else {
+                match value
+                    .trim_start_matches("US$")
+                    .trim_start_matches('$')
+                    .parse::<f64>()
+                {
+                    Ok(budget) if budget.is_finite() && budget > 0.0 => {
+                        self.budget_usd = Some(budget);
+                        self.note(&format!("Próximas tareas: hasta US${budget:.2}"));
+                    }
+                    _ => self.note("Uso: /budget <dólares>|off"),
+                }
+            }
             return Action::None;
         }
         if let Some(mode) = text.strip_prefix("/execution ") {
@@ -1269,6 +1299,15 @@ mod tests {
         type_str(&mut a, "/execution individual");
         assert_eq!(a.on_key(Key::Enter), Action::None);
         assert_eq!(a.execution, "individual");
+        type_str(&mut a, "/budget 2.5");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+        assert_eq!(a.budget_usd, Some(2.5));
+        type_str(&mut a, "/budget -3");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+        assert_eq!(a.budget_usd, Some(2.5), "an invalid budget changes nothing");
+        type_str(&mut a, "/budget off");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+        assert_eq!(a.budget_usd, None);
         type_str(&mut a, "/team start audit -- another task");
         assert_eq!(a.on_key(Key::Enter), Action::None);
     }

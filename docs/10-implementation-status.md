@@ -119,6 +119,47 @@ test charges a two-round turn that writes then reads the cache at the cache
 prices. No live provider was called: real cache hit rates depend on each
 provider's minimum cacheable size, cache lifetime and prefix stability.
 
+## Spending awareness, task budgets and the usage ledger
+
+The agent can now see and steer its own spending; see
+[spending controls](16-task-measurement.md#spending-controls).
+
+- **Task budget.** `budget_usd` on task creation (`run --budget-usd`, `/team
+  start --budget-usd`, `/budget` in the TUI) is stored with the task and part
+  of its fingerprint. It requires prices for the selected model, narrows the
+  agent tree's cost ceiling, caps each request's reserve at what is left, and
+  for a team becomes `limits.max_cost_usd` unless that is lower. Migration 013
+  adds the column.
+- **Notices.** The tree budget tracks its spend and announces 50%, 80% and
+  95% of the larger of its token and cost shares once each, as a runtime
+  message entering the conversation between rounds, like a correction.
+- **`budget_status`.** A session tool reporting the turn's usage, cached share
+  and cost, the task's spend and limits, a member's team usage and limits,
+  and the delegable models with prices and notes, cheapest first.
+- **Delegation rules.** `spawn_agent` refuses a model the privacy settings
+  block, a `none` model, a `read` model for a writable child, a model without
+  tool calls, and an unpriced model under a cost limit.
+- **Ledger and report.** Migration 013 adds `usage_ledger`: one row per
+  provider call with the tree's root turn, depth, model, tokens and cost.
+  `GET /v1/tasks/{id}/usage` and `layeragent cost` aggregate it per model and
+  depth, team activations included, with hints computed from the report and
+  the configuration.
+
+Verification: unit tests cover the budget's spend, limits, single
+announcements, a jump past two shares, and a run budget narrowing but never
+widening the operator's ceiling, plus the hint rules. Two runtime tests in
+`crates/layeragent-core/tests/spending.rs` drive a scripted task with a $1
+budget: `budget_status` reports its spend, limits and models cheapest first
+with notes, a child runs on the cheaper model and spends from the same
+budget, the task is told once at 50% and once at 80%, and the report splits
+five premium calls and one cheap call across two depths with the expected
+total; and delegations to an excluded model and a writable child on a
+read-only model are refused before any child runs. A gateway test covers a
+budget refused without prices or when not positive, a stored budget and its
+usage report, and a team ceiling lowered to the budget; CLI and TUI tests
+cover the options, `/budget` and the report rendering. Scripted models do not
+show that a real model reacts well to its notices or delegates sensibly.
+
 ## Godeye team bus, first increment
 
 Godeye is the name for the cooperative team bus: the only channel through which

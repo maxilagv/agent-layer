@@ -278,6 +278,9 @@ pub struct RunRequest {
     pub execution: ExecutionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooperative: Option<CooperativeOptions>,
+    /// Most the run may spend in US dollars, child agents included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunResult {

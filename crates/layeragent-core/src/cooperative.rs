@@ -853,6 +853,7 @@ impl Engine {
                                     session_id: Some(session), workspace: None, prompt, model: Some(selected),
                                     effort: task_effort, bridge: false, mode: RunMode::Normal,
                                     execution: ExecutionMode::Cooperative, cooperative: None,
+                                    budget_usd: None,
                                 }, token.clone(), activation.clone()).await;
                                 // An activation the operator stopped by pausing or
                                 // retiring its member ends that member's turn, not

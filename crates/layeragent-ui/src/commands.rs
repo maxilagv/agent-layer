@@ -50,6 +50,12 @@ pub const COMMANDS: &[Command] = &[
         help: "Consultar o cambiar esfuerzo",
     },
     Command {
+        name: "/budget",
+        aliases: &[],
+        usage: "/budget [dólares|off]",
+        help: "Presupuesto de las próximas tareas",
+    },
+    Command {
         name: "/execution",
         aliases: &[],
         usage: "/execution [individual|delegated|cooperative]",

@@ -140,6 +140,12 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
             &[],
         ),
         def(
+            "budget_status",
+            "What this turn, its whole task (child agents included) and its team have spent so far against their limits, how much of the input was cached, and the configured models you may delegate to with their prices and notes, cheapest first. Costs are estimates from the configured prices",
+            json!({}),
+            &[],
+        ),
+        def(
             "read_file",
             "Read a workspace UTF-8 file with its SHA-256 hash",
             json!({"path":short,"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":65536}}),
@@ -382,7 +388,7 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
         def("browser_close", "Close the browser", json!({}), &[]),
         def(
             "spawn_agent",
-            "Delegate a self-contained task to a child agent that runs in parallel and returns a result. Children are read-only on the shared workspace unless isolation is worktree. Use wait_agent to collect results.",
+            "Delegate a self-contained task to a child agent that runs in parallel and returns a result. Children are read-only on the shared workspace unless isolation is worktree. Use wait_agent to collect results. model picks a configured model for the child (budget_status lists them with prices): give bulk reading, searching or summarizing to a cheaper one. A child spends from this task's budget.",
             json!({
                 "task":{"type":"string","minLength":1,"maxLength":32768},
                 "name":{"type":"string","maxLength":64},
@@ -716,7 +722,7 @@ impl Tools {
             .await?;
         }
         match call.name.as_str() {
-            "context_status" | "compact_context" => {
+            "context_status" | "compact_context" | "budget_status" => {
                 return ctx
                     .session
                     .as_ref()

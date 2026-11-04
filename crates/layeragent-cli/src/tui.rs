@@ -216,7 +216,7 @@ async fn interface(
                 job = None;
                 if let Some(handle) = follower.take() { handle.abort(); }
                 view_generation += 1;
-                let options = crate::team::ExecutionOptions { execution: app.execution.clone(), ..Default::default() }.body()?;
+                let options = crate::team::ExecutionOptions { execution: app.execution.clone(), budget_usd: app.budget_usd, ..Default::default() }.body()?;
                 follower = Some(spawn_follow(client.clone(), session.clone(), Some((prompt, options)), None, tx.clone(), view_generation));
             }
             Action::Team(command) => {

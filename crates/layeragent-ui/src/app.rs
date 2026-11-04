@@ -90,6 +90,9 @@ pub enum Action {
     Compact,
     Effort(Option<String>),
     Team(String),
+    /// A prompt to run in planning mode: the plan is written under
+    /// docs/plan/ and nothing is built.
+    Plan(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -165,6 +168,8 @@ pub struct App {
     pub(crate) card: usize,
     pub(crate) help: bool,
     pub execution: String,
+    /// Budget in US dollars for the next tasks, when set with /budget.
+    pub budget_usd: Option<f64>,
     pub team: Option<Value>,
     pub team_visible: bool,
     pub team_resource: String,
@@ -196,6 +201,7 @@ impl App {
             card: 0,
             help: false,
             execution: "delegated".into(),
+            budget_usd: None,
             team: None,
             team_visible: false,
             team_resource: "members".into(),
@@ -314,6 +320,53 @@ impl App {
         }
         if text == "/execution" {
             self.note(&format!("Modo de las próximas tareas: {}", self.execution));
+            return Action::None;
+        }
+        if let Some(objective) = text.strip_prefix("/plan ") {
+            let objective = objective.trim();
+            if objective.is_empty() {
+                self.note("Uso: /plan <qué querés construir>");
+                return Action::None;
+            }
+            return Action::Plan(objective.into());
+        }
+        if text == "/plan" {
+            self.note("Uso: /plan <qué querés construir>");
+            return Action::None;
+        }
+        if text == "/build" || text.starts_with("/build ") {
+            let notes = text.strip_prefix("/build").unwrap_or("").trim();
+            let mut prompt = "The operator approved the plan in docs/plan/. Build it as planned, follow its acceptance criteria and checks, and report what was built, how it was checked and anything that changed from the plan.".to_string();
+            if !notes.is_empty() {
+                prompt.push_str(&format!(" The operator adds: {notes}"));
+            }
+            return Action::Send(prompt);
+        }
+        if text == "/budget" {
+            self.note(&match self.budget_usd {
+                Some(budget) => format!("Presupuesto de las próximas tareas: US${budget:.2}"),
+                None => "Las próximas tareas no tienen presupuesto propio.".into(),
+            });
+            return Action::None;
+        }
+        if let Some(value) = text.strip_prefix("/budget ") {
+            let value = value.trim();
+            if value == "off" {
+                self.budget_usd = None;
+                self.note("Las próximas tareas no tienen presupuesto propio.");
+            } else {
+                match value
+                    .trim_start_matches("US$")
+                    .trim_start_matches('$')
+                    .parse::<f64>()
+                {
+                    Ok(budget) if budget.is_finite() && budget > 0.0 => {
+                        self.budget_usd = Some(budget);
+                        self.note(&format!("Próximas tareas: hasta US${budget:.2}"));
+                    }
+                    _ => self.note("Uso: /budget <dólares>|off"),
+                }
+            }
             return Action::None;
         }
         if let Some(mode) = text.strip_prefix("/execution ") {
@@ -1269,6 +1322,36 @@ mod tests {
         type_str(&mut a, "/execution individual");
         assert_eq!(a.on_key(Key::Enter), Action::None);
         assert_eq!(a.execution, "individual");
+        type_str(&mut a, "/plan una tienda de bicicletas");
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Action::Plan("una tienda de bicicletas".into())
+        );
+        type_str(&mut a, "/plan");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+        type_str(&mut a, "/build con fotos reales");
+        match a.on_key(Key::Enter) {
+            Action::Send(prompt) => {
+                assert!(
+                    prompt.contains("approved the plan in docs/plan/"),
+                    "{prompt}"
+                );
+                assert!(
+                    prompt.ends_with("The operator adds: con fotos reales"),
+                    "{prompt}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        type_str(&mut a, "/budget 2.5");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+        assert_eq!(a.budget_usd, Some(2.5));
+        type_str(&mut a, "/budget -3");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+        assert_eq!(a.budget_usd, Some(2.5), "an invalid budget changes nothing");
+        type_str(&mut a, "/budget off");
+        assert_eq!(a.on_key(Key::Enter), Action::None);
+        assert_eq!(a.budget_usd, None);
         type_str(&mut a, "/team start audit -- another task");
         assert_eq!(a.on_key(Key::Enter), Action::None);
     }

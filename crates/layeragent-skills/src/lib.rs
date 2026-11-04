@@ -12,6 +12,9 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod sourcing;
+pub use sourcing::{accept, import, quarantined, reject, review, search};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Skill {
     pub name: String,
@@ -19,6 +22,9 @@ pub struct Skill {
     pub path: PathBuf,
     pub hash: String,
     pub verified: bool,
+    /// The operator read and accepted it (a skill without fixtures).
+    #[serde(default)]
+    pub reviewed: bool,
 }
 #[derive(Deserialize)]
 struct Frontmatter {
@@ -64,6 +70,11 @@ pub fn discover(home: &Path, config: &Config) -> Result<Vec<Skill>> {
                     .ok()
                     .and_then(|s| serde_json::from_str::<Verification>(&s).ok())
                     .is_some_and(|v| v.hash == hash && v.tests > 0);
+            let reviewed = trusted
+                && std::fs::read_to_string(path.join(sourcing::REVIEW))
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<sourcing::Review>(&s).ok())
+                    .is_some_and(|r| r.hash == hash);
             ensure!(
                 !found.contains_key(&meta.name),
                 "duplicate skill name {}",
@@ -77,6 +88,7 @@ pub fn discover(home: &Path, config: &Config) -> Result<Vec<Skill>> {
                     path,
                     hash,
                     verified,
+                    reviewed,
                 },
             );
         }
@@ -84,6 +96,8 @@ pub fn discover(home: &Path, config: &Config) -> Result<Vec<Skill>> {
     Ok(found.into_values().collect())
 }
 fn parse_frontmatter(raw: &str) -> Result<Frontmatter> {
+    // Files written or checked out on Windows end their lines with CRLF.
+    let raw = raw.replace("\r\n", "\n");
     let body = raw
         .strip_prefix("---\n")
         .context("skill needs YAML frontmatter")?;
@@ -102,7 +116,10 @@ pub fn tree_hash(root: &Path) -> Result<String> {
     let mut hash = Sha256::new();
     for e in entries {
         ensure!(!e.path_is_symlink(), "skills cannot contain symlinks");
-        if e.file_type().is_file() && e.file_name() != ".verification.json" {
+        // Records about the skill are not part of it.
+        let record = [".verification.json", sourcing::REVIEW, sourcing::PROVENANCE]
+            .contains(&e.file_name().to_string_lossy().as_ref());
+        if e.file_type().is_file() && !record {
             let relative = e.path().strip_prefix(root)?;
             let bytes = std::fs::read(e.path())?;
             hash.update((relative.as_os_str().len() as u64).to_le_bytes());
@@ -130,8 +147,13 @@ pub fn draft(
     validate_name(name)?;
     let parsed = parse_frontmatter(body)?;
     ensure!(parsed.name == name, "skill name mismatch");
-    ensure!(!tests.is_empty(), "verification fixtures are required");
-    let staging = home.join("skill-staging");
+    // Without fixtures a draft is a guide: it cannot verify itself, so it
+    // waits for the operator's review instead of staging for promotion.
+    let staging = home.join(if tests.is_empty() {
+        sourcing::QUARANTINE
+    } else {
+        "skill-staging"
+    });
     private_dir(&staging)?;
     let dest = staging.join(name);
     ensure!(
@@ -159,7 +181,16 @@ pub fn draft(
             }
             std::fs::write(target, data)?;
         }
-        std::fs::write(dest.join("tests.json"), serde_json::to_vec_pretty(tests)?)?;
+        if tests.is_empty() {
+            std::fs::write(
+                dest.join(sourcing::PROVENANCE),
+                serde_json::to_vec_pretty(
+                    &json!({"source":"agent draft","imported_at":layeragent_protocol::now_ms(),"files":files.keys().collect::<Vec<_>>(),"scripts":[]}),
+                )?,
+            )?;
+        } else {
+            std::fs::write(dest.join("tests.json"), serde_json::to_vec_pretty(tests)?)?;
+        }
         Ok(dest.clone())
     })();
     if result.is_err() {
@@ -176,6 +207,11 @@ pub async fn verify_and_promote(
     let _lease = registry_lease(home)?;
     validate_name(name)?;
     let source = home.join("skill-staging").join(name);
+    ensure!(
+        source.is_dir() && !source.is_symlink()
+            || !home.join(sourcing::QUARANTINE).join(name).is_dir(),
+        "skill {name} has no fixtures, so it cannot verify itself; the operator accepts it with layeragent skills accept {name}"
+    );
     ensure!(source.is_dir() && !source.is_symlink(), "draft not found");
     let before = tree_hash(&source)?;
     let cases: Vec<TestCase> = serde_json::from_slice(&std::fs::read(source.join("tests.json"))?)?;
@@ -379,6 +415,216 @@ mod tests {
         );
         Ok(())
     }
+    fn skill_dir(root: &Path, name: &str, extra: &str, body: &str) -> Result<PathBuf> {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Guide for {name}\n{extra}---\n{body}\n"),
+        )?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn imported_skills_wait_for_review_and_only_accepted_ones_are_offered() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = tempfile::tempdir()?;
+        // A catalog in the common SKILL.md format, with extra frontmatter keys.
+        let web = skill_dir(
+            &catalog.path().join("skills"),
+            "frontend-design",
+            "license: Apache-2.0\n",
+            "Design bold pages. See https://example.com/guide for more.",
+        )?;
+        std::fs::write(web.join("build.sh"), "echo build\n")?;
+        let leaky = skill_dir(&catalog.path().join("skills"), "leaky", "", "Use the key.")?;
+        std::fs::write(
+            leaky.join("notes.txt"),
+            "token sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ\n",
+        )?;
+        #[cfg(unix)]
+        {
+            let linked = skill_dir(
+                &catalog.path().join("skills"),
+                "linked",
+                "",
+                "Follow the link.",
+            )?;
+            std::os::unix::fs::symlink("/etc/hostname", linked.join("host"))?;
+        }
+
+        let imported = import(home.path(), catalog.path(), "test catalog")?;
+        let status = |name: &str| {
+            imported
+                .iter()
+                .find(|s| {
+                    s["name"] == name || s["path"].as_str().is_some_and(|p| p.ends_with(name))
+                })
+                .map(|s| s["status"].as_str().unwrap_or("").to_string())
+        };
+        assert_eq!(
+            status("frontend-design").as_deref(),
+            Some("quarantined"),
+            "{imported:?}"
+        );
+        assert_eq!(
+            status("leaky").as_deref(),
+            Some("refused"),
+            "credentials: {imported:?}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            status("linked").as_deref(),
+            Some("refused"),
+            "symlinks: {imported:?}"
+        );
+
+        assert!(
+            discover(home.path(), &Config::default())?.is_empty(),
+            "quarantine is not offered"
+        );
+        let waiting = quarantined(home.path())?;
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0]["scripts"], json!(["build.sh"]));
+        let read = review(home.path(), "frontend-design")?;
+        assert!(
+            read["skill_md"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Design bold pages")
+        );
+        assert_eq!(read["links"], json!(["https://example.com/guide"]));
+        assert!(
+            read["source"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("test catalog:")
+        );
+        let found = search(home.path(), &Config::default(), "frontend design", 5)?;
+        assert_eq!(found[0]["status"], "quarantined");
+
+        accept(home.path(), "frontend-design")?;
+        let active = discover(home.path(), &Config::default())?;
+        assert_eq!(active.len(), 1);
+        assert!(active[0].reviewed && !active[0].verified);
+        assert!(
+            load(&active[0])?.contains("Design bold pages"),
+            "the review record does not change its hash"
+        );
+        assert!(quarantined(home.path())?.is_empty());
+        let found = search(home.path(), &Config::default(), "bold pages", 5)?;
+        assert_eq!(found[0]["status"], "reviewed");
+        assert!(
+            found[0]["snippet"]
+                .as_str()
+                .unwrap_or("")
+                .contains("bold pages")
+        );
+        // A changed skill is no longer the one the operator accepted.
+        std::fs::write(
+            active[0].path.join("SKILL.md"),
+            "---\nname: frontend-design\ndescription: changed\n---\nOther.\n",
+        )?;
+        assert!(!discover(home.path(), &Config::default())?[0].reviewed);
+
+        // A re-import replaces the waiting copy; a reject drops it.
+        skill_dir(
+            &catalog.path().join("skills"),
+            "second",
+            "",
+            "Another guide.",
+        )?;
+        import(home.path(), catalog.path(), "again")?;
+        assert!(
+            quarantined(home.path())?
+                .iter()
+                .any(|s| s["name"] == "second")
+        );
+        reject(home.path(), "second")?;
+        assert!(
+            quarantined(home.path())?
+                .iter()
+                .all(|s| s["name"] != "second")
+        );
+        assert!(review(home.path(), "../skills").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_guide_drafted_without_fixtures_needs_the_operator() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        draft(
+            home.path(),
+            "bike-brand",
+            "---\nname: bike-brand\ndescription: Colors and tone of the bicycle store\n---\nUse deep green and warm grey.",
+            &BTreeMap::new(),
+            &[],
+        )?;
+        assert!(discover(home.path(), &Config::default())?.is_empty());
+        let refused = verify_and_promote(
+            home.path(),
+            "bike-brand",
+            &FixtureSandbox { pass: true },
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("no fixtures");
+        assert!(
+            refused
+                .to_string()
+                .contains("layeragent skills accept bike-brand"),
+            "{refused}"
+        );
+        assert_eq!(quarantined(home.path())?[0]["source"], "agent draft");
+        accept(home.path(), "bike-brand")?;
+        assert!(discover(home.path(), &Config::default())?[0].reviewed);
+        Ok(())
+    }
+
+    #[test]
+    fn a_skill_with_windows_line_endings_is_read_like_any_other() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = tempfile::tempdir()?;
+        let dir = catalog.path().join("crlf-guide");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\r\nname: crlf-guide\r\ndescription: Written on Windows\r\n---\r\nKeep it simple.\r\n",
+        )?;
+        let imported = import(home.path(), catalog.path(), "crlf")?;
+        assert_eq!(imported[0]["status"], "quarantined", "{imported:?}");
+        assert_eq!(imported[0]["description"], "Written on Windows");
+        accept(home.path(), "crlf-guide")?;
+        assert_eq!(
+            discover(home.path(), &Config::default())?[0].name,
+            "crlf-guide"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_shipped_starter_catalog_imports_cleanly() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/skills");
+        let imported = import(home.path(), &catalog, "examples/skills")?;
+        let names: Vec<&str> = imported.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert!(
+            imported.iter().all(|s| s["status"] == "quarantined"),
+            "{imported:?}"
+        );
+        for name in [
+            "cinematic-web",
+            "cost-control",
+            "ecommerce-storefront",
+            "project-kickoff",
+            "stack-choice",
+            "threejs-3d",
+        ] {
+            assert!(names.contains(&name), "{name}: {names:?}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn external_markers_cannot_self_certify() -> Result<()> {
         let home = tempfile::tempdir()?;

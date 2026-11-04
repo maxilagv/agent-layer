@@ -92,6 +92,10 @@ pub(super) struct TaskInput {
     execution: layeragent_protocol::ExecutionMode,
     #[serde(default)]
     cooperative: Option<layeragent_protocol::CooperativeOptions>,
+    /// Most the task may spend in US dollars, child agents and team members
+    /// included.
+    #[serde(default)]
+    budget_usd: Option<f64>,
 }
 
 /// Creates the durable task and returns its identity before execution starts.
@@ -125,8 +129,16 @@ pub(super) async fn create(
         )
         .into());
     }
-    if r.mode != layeragent_protocol::RunMode::Normal {
+    if r.mode == layeragent_protocol::RunMode::Illustration {
         return Err(anyhow::anyhow!("illustration is not implemented yet").into());
+    }
+    if r.mode == layeragent_protocol::RunMode::Plan
+        && r.execution == layeragent_protocol::ExecutionMode::Cooperative
+    {
+        return Err(anyhow::anyhow!(
+            "plan mode applies to individual and delegated tasks; plan first, then start the team"
+        )
+        .into());
     }
     if r.execution != layeragent_protocol::ExecutionMode::Cooperative && r.cooperative.is_some() {
         return Err(anyhow::anyhow!("cooperative options require execution=cooperative").into());
@@ -142,12 +154,48 @@ pub(super) async fn create(
     // A revoked or disabled connection must not start new work. Existing work
     // was stopped when the generation changed.
     let config = s.engine.config().await;
+    // The operator's default budget applies when the task sets none and the
+    // selected model has the prices it needs.
+    let mut r = r;
+    if r.budget_usd.is_none()
+        && let Some(default) = config.operator.default_budget_usd
+    {
+        let selected = r.model.clone().unwrap_or_else(|| config.primary.clone());
+        if config.models.get(&selected).is_some_and(|model| {
+            model.input_per_million.is_some() && model.output_per_million.is_some()
+        }) {
+            r.budget_usd = Some(default);
+        }
+    }
+    if let Some(budget) = r.budget_usd {
+        if !(budget.is_finite() && budget > 0.0) {
+            return Err(anyhow::anyhow!("budget_usd must be positive").into());
+        }
+        // Unpriced usage is charged as zero, which would escape the budget.
+        let selected = r.model.clone().unwrap_or_else(|| config.primary.clone());
+        let model = config
+            .models
+            .get(&selected)
+            .ok_or_else(|| anyhow::anyhow!("model {selected} is not configured"))?;
+        if model.input_per_million.is_none() || model.output_per_million.is_none() {
+            return Err(anyhow::anyhow!(
+                "a budget needs configured input and output prices for model {selected}"
+            )
+            .into());
+        }
+    }
     let cooperative = if r.execution == layeragent_protocol::ExecutionMode::Cooperative {
-        let options = r
-            .cooperative
-            .clone()
-            .unwrap_or_default()
-            .normalized(config.agents.tree_max_tokens)?;
+        let mut options = r.cooperative.clone().unwrap_or_default();
+        // A task budget is the team's cost ceiling unless that is lower.
+        if let Some(budget) = r.budget_usd {
+            options.limits.max_cost_usd = Some(
+                options
+                    .limits
+                    .max_cost_usd
+                    .map_or(budget, |ceiling| ceiling.min(budget)),
+            );
+        }
+        let options = options.normalized(config.agents.tree_max_tokens)?;
         for model in options.role_models.values() {
             if !config.models.contains_key(model) {
                 return Err(anyhow::anyhow!(
@@ -156,8 +204,24 @@ pub(super) async fn create(
                 .into());
             }
         }
+        // The operator decides per model what may run in a team.
+        let selected = r.model.clone().unwrap_or_else(|| config.primary.clone());
+        for alias in std::iter::once(&selected).chain(options.role_models.values()) {
+            config.require_team_model(alias, false)?;
+        }
+        use layeragent_config::ModelTeamAccess;
+        if options.scope.allow_write
+            && !config
+                .models
+                .values()
+                .any(|model| model.team_access == ModelTeamAccess::Write)
+        {
+            return Err(anyhow::anyhow!(
+                "cooperative write scope needs a configured model with team_access = \"write\""
+            )
+            .into());
+        }
         if options.limits.max_cost_usd.is_some() {
-            let selected = r.model.clone().unwrap_or_else(|| config.primary.clone());
             for alias in std::iter::once(&selected).chain(options.role_models.values()) {
                 let model = config
                     .models
@@ -173,6 +237,21 @@ pub(super) async fn create(
         }
         if options.scope.allow_write && !config.policy.write {
             return Err(anyhow::anyhow!("cooperative write scope exceeds task policy").into());
+        }
+        if options.cross_model_review {
+            // Without a second model nothing could ever be approved.
+            let distinct: std::collections::BTreeSet<String> = config
+                .models
+                .values()
+                .filter(|model| model.team_access != ModelTeamAccess::None)
+                .map(|model| layeragent_protocol::model_identity(&model.id))
+                .collect();
+            if distinct.len() < 2 {
+                return Err(anyhow::anyhow!(
+                    "cross-model review needs at least two models allowed in teams with different model ids"
+                )
+                .into());
+            }
         }
         Some(options)
     } else {
@@ -235,10 +314,11 @@ pub(super) async fn create(
         bridge: r.bridge,
         execution: r.execution,
         cooperative: cooperative.clone(),
+        budget_usd: r.budget_usd,
     };
     let fingerprint = request.fingerprint()?;
     let created = store
-        .create_task_with_execution(
+        .create_task_with_budget(
             &i.scope,
             &workspace,
             session_id.as_deref(),
@@ -251,6 +331,7 @@ pub(super) async fn create(
             request.bridge,
             request.execution,
             request.cooperative.clone(),
+            request.budget_usd,
         )
         .await
         .map_err(|error| {
@@ -302,6 +383,7 @@ pub(super) fn start(s: &ApiState, i: &Identity, task: &Task, model: Option<Strin
     let workspace = session.is_none().then_some(task.project.clone());
     let objective = task.objective.clone();
     let (effort, bridge, mode, execution) = (task.effort, task.bridge, task.mode, task.execution);
+    let budget_usd = task.budget_usd;
     tokio::spawn(async move {
         let _registration = JobRegistration {
             jobs: jobs.clone(),
@@ -325,6 +407,7 @@ pub(super) fn start(s: &ApiState, i: &Identity, task: &Task, model: Option<Strin
                         mode,
                         execution,
                         cooperative: None,
+                        budget_usd,
                     },
                     cancel,
                     id.clone(),
@@ -343,6 +426,24 @@ pub(super) fn start(s: &ApiState, i: &Identity, task: &Task, model: Option<Strin
             }
         }
     });
+}
+
+/// What a task spent, broken down by model and agent depth, with hints on
+/// where it could cost less.
+pub(super) async fn task_usage(
+    State(s): State<ApiState>,
+    axum::Extension(i): axum::Extension<Identity>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    if !valid_id(&id) {
+        return Err(not_found());
+    }
+    let store = s.engine.store(&i.scope).await?;
+    authorized_task(&store, &i, &id).await?;
+    let mut report = store.usage_report(&i.scope, &id).await?;
+    let config = s.engine.config().await;
+    report["hints"] = json!(layeragent_core::cost::cost_hints(&report, &config));
+    Ok(Json(report))
 }
 
 pub(super) async fn get(

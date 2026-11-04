@@ -91,10 +91,35 @@ impl Message {
         }
     }
 }
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Usage {
+    /// Every input token the provider processed, cached ones included.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Input tokens the provider read from its prompt cache (part of
+    /// `input_tokens`), usually billed at a discount.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_tokens: u64,
+    /// Input tokens the provider wrote to its prompt cache (part of
+    /// `input_tokens`), billed at the cache-write price where one applies.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+impl Usage {
+    /// Adds another call's usage to this one.
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+    }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Completion {
@@ -211,12 +236,24 @@ pub enum RunMode {
     #[default]
     Normal,
     Illustration,
+    /// Investigate and write the plan under `docs/plan/`, then ask for
+    /// approval; nothing is built.
+    Plan,
 }
 impl RunMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
             Self::Illustration => "illustration",
+            Self::Plan => "plan",
+        }
+    }
+    /// A stored mode; an unknown value reads as normal.
+    pub fn parse_stored(value: &str) -> Self {
+        match value {
+            "illustration" => Self::Illustration,
+            "plan" => Self::Plan,
+            _ => Self::Normal,
         }
     }
 }
@@ -253,6 +290,9 @@ pub struct RunRequest {
     pub execution: ExecutionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooperative: Option<CooperativeOptions>,
+    /// Most the run may spend in US dollars, child agents included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunResult {

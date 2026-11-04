@@ -115,6 +115,7 @@ pub(super) async fn execute_agent(
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             permit.cancel.clone(),
         )

@@ -135,7 +135,10 @@ fn write_checks(
     work: &str,
     paths: &[String],
 ) -> Result<Vec<String>> {
-    member_team(c, team, member)?;
+    ensure!(
+        member_team(c, team, member)? != TeamRole::Consultant,
+        "a consultant only reads; it cannot switch to writing"
+    );
     ensure!(
         team_state(c, team)? == "active",
         "team is not accepting new write access"
@@ -206,9 +209,9 @@ fn write_checks(
     Ok(fresh)
 }
 
-fn patch_meta(c: &Connection, team: &str, patch: &str) -> Result<Value> {
+pub(super) fn patch_meta(c: &Connection, team: &str, patch: &str) -> Result<Value> {
     c.query_row(
-        "SELECT id,kind,work_id,author_member_id,recipient_member_id,state,summary,base,files,sha256,bytes,evidence_id,review_message_id,reviewer_member_id,reason,created_at,updated_at FROM team_patches WHERE id=?1 AND team_id=?2",
+        "SELECT id,kind,work_id,author_member_id,recipient_member_id,state,summary,base,files,sha256,bytes,evidence_id,review_message_id,reviewer_member_id,reason,created_at,updated_at,author_model,reviewer_model FROM team_patches WHERE id=?1 AND team_id=?2",
         params![patch, team],
         |r| {
             Ok(json!({
@@ -219,6 +222,7 @@ fn patch_meta(c: &Connection, team: &str, patch: &str) -> Result<Value> {
                 "sha256":r.get::<_,String>(9)?,"bytes":r.get::<_,i64>(10)?,"evidence_id":r.get::<_,Option<String>>(11)?,
                 "review_message_id":r.get::<_,Option<String>>(12)?,"reviewer_member_id":r.get::<_,Option<String>>(13)?,
                 "reason":r.get::<_,Option<String>>(14)?,"created_at":r.get::<_,i64>(15)?,"updated_at":r.get::<_,i64>(16)?,
+                "author_model":r.get::<_,Option<String>>(17)?,"reviewer_model":r.get::<_,Option<String>>(18)?,
             }))
         },
     )
@@ -269,6 +273,37 @@ fn insert_patch(
         params![id, body],
     )?;
     Ok((id, sha))
+}
+
+/// The model the member's running activation was started with.
+fn running_model(c: &Connection, member: &str) -> Result<Option<String>> {
+    Ok(c
+        .query_row(
+            "SELECT model_identity FROM team_activations WHERE member_id=?1 AND state IN ('starting','running') ORDER BY started_at DESC LIMIT 1",
+            [member],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// With cross-model review, an approval must come from an activation
+/// running a different model than the one that submitted the patch.
+fn cross_model_check(c: &Connection, team: &str, reviewer: &str, meta: &Value) -> Result<()> {
+    if !options(c, team)?.cross_model_review {
+        return Ok(());
+    }
+    let author = meta["author_model"]
+        .as_str()
+        .context("this team requires cross-model review, but the model that wrote the patch was not recorded; reject it and ask for a new submission")?;
+    let own = running_model(c, reviewer)?.context(
+        "this team requires cross-model review, but the model of your activation was not recorded",
+    )?;
+    ensure!(
+        own != author,
+        "this team requires cross-model review: the patch was written by {author}, the model you run; reject it or ask a member or consultant on another model to approve it"
+    );
+    Ok(())
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -522,8 +557,10 @@ impl Storage {
             })?;
             let evidence_id = evidence["id"].as_str().context("evidence id")?.to_string();
             let (id, _) = insert_patch(&tx, &team, "submission", "submitted", Some(&work_id), &member, None, &summary, &base, &files, &body, Some(&evidence_id), at)?;
+            let author_model = running_model(&tx, &member)?;
+            tx.execute("UPDATE team_patches SET author_model=?2 WHERE id=?1", params![id, author_model])?;
             tx.execute("UPDATE team_evidence SET artifacts=?2 WHERE id=?1", params![evidence_id, json!([{"patch_id":id}]).to_string()])?;
-            event(&tx, &team, "team_patch_submitted", json!({"patch_id":id,"work_id":work_id,"author":member,"files":files,"bytes":body.len()}), at)?;
+            event(&tx, &team, "team_patch_submitted", json!({"patch_id":id,"work_id":work_id,"author":member,"author_model":author_model,"files":files,"bytes":body.len()}), at)?;
             let mut request = Value::Null;
             if let Some(reviewer) = &reviewer {
                 let sent = member_notice(
@@ -557,6 +594,7 @@ impl Storage {
         team: &str,
         reviewer: &str,
         patch: &str,
+        approve: bool,
     ) -> Result<(Value, Vec<u8>)> {
         let (team, reviewer, patch) = (team.to_string(), reviewer.to_string(), patch.to_string());
         self.read(move |c| {
@@ -579,6 +617,9 @@ impl Storage {
                 meta["author_member_id"] != reviewer.as_str(),
                 "another member must review this patch"
             );
+            if approve {
+                cross_model_check(c, &team, &reviewer, &meta)?;
+            }
             Ok((meta, patch_body(c, &patch)?))
         })
         .await
@@ -608,12 +649,16 @@ impl Storage {
             ensure!(meta["kind"] == "submission" && meta["state"] == "submitted", TeamConflict);
             let author = meta["author_member_id"].as_str().context("author")?.to_string();
             ensure!(author != reviewer, "another member must review this patch");
+            if outcome != ReviewOutcome::Rejected {
+                cross_model_check(&tx, &team, &reviewer, &meta)?;
+            }
             let work = meta["work_id"].as_str().map(str::to_string);
             let at = now_ms();
             let state = outcome.as_str();
+            let reviewer_model = running_model(&tx, &reviewer)?;
             tx.execute(
-                "UPDATE team_patches SET state=?2,reviewer_member_id=?3,reason=?4,updated_at=?5 WHERE id=?1",
-                params![patch, state, reviewer, reason, at],
+                "UPDATE team_patches SET state=?2,reviewer_member_id=?3,reason=?4,updated_at=?5,reviewer_model=?6 WHERE id=?1",
+                params![patch, state, reviewer, reason, at, reviewer_model],
             )?;
             let mut evidence = meta["evidence_id"].as_str().map(str::to_string);
             match outcome {
@@ -651,21 +696,32 @@ impl Storage {
                 }
                 ReviewOutcome::Rejected => {}
             }
-            event(&tx, &team, &format!("team_patch_{state}"), json!({"patch_id":patch,"work_id":work,"author":author,"reviewer":reviewer,"reason":reason}), at)?;
-            let deliverable: bool = tx.query_row("SELECT state NOT IN ('terminated','failed') FROM team_members WHERE id=?1", [&author], |r| r.get(0))?;
+            event(&tx, &team, &format!("team_patch_{state}"), json!({"patch_id":patch,"work_id":work,"author":author,"reviewer":reviewer,"reason":reason,"author_model":meta["author_model"],"reviewer_model":reviewer_model}), at)?;
+            let deliverable = |member: &str| -> Result<bool> {
+                Ok(tx.query_row("SELECT state NOT IN ('terminated','failed') FROM team_members WHERE id=?1", [member], |r| r.get(0))?)
+            };
+            // The review answers the request when it went to this reviewer:
+            // the author's own request, or a consultation that brought the
+            // reviewer in for this patch.
+            let request = meta["review_message_id"].as_str().map(str::to_string);
+            let requester: Option<String> = match &request {
+                Some(id) => tx.query_row("SELECT m.sender_member_id FROM team_messages m WHERE m.id=?1 AND EXISTS(SELECT 1 FROM team_deliveries d WHERE d.message_id=m.id AND d.recipient_member_id=?2)", params![id, reviewer], |r| r.get(0)).optional()?.flatten(),
+                None => None,
+            };
             let mut notice = Value::Null;
-            if deliverable {
+            if let Some(requester) = requester.as_deref().filter(|id| *id != author && *id != reviewer)
+                && deliverable(requester)?
+            {
+                let body = format!("Your request on patch {patch} was decided: {state}. Reason: {reason}");
+                member_notice(&tx, &team, &reviewer, requester, MessagePurpose::Response, body, work.clone(), evidence.clone(), request.clone(), format!("patch-{state}-{patch}-requester"))?;
+            }
+            if deliverable(&author)? {
                 let body = match outcome {
                     ReviewOutcome::Integrated => format!("Patch {patch} was approved and applied to the team workspace; its work is completed. Reason: {reason}"),
                     ReviewOutcome::Rejected => format!("Patch {patch} was rejected. Reason: {reason}\nYour work stays in progress: change it in your worktree and submit again."),
                     ReviewOutcome::Conflicted => format!("Patch {patch} was approved but no longer applies to the team workspace: {reason}\nSubmit again: your worktree is synced first, and conflicts are left marked for you to resolve."),
                 };
-                // Answer the review request when it went to this reviewer.
-                let request = meta["review_message_id"].as_str().map(str::to_string);
-                let answers: bool = match &request {
-                    Some(id) => tx.query_row("SELECT EXISTS(SELECT 1 FROM team_deliveries WHERE message_id=?1 AND recipient_member_id=?2)", params![id, reviewer], |r| r.get(0))?,
-                    None => false,
-                };
+                let answers = requester.as_deref() == Some(author.as_str());
                 let purpose = if answers { MessagePurpose::Response } else { MessagePurpose::Observation };
                 notice = member_notice(&tx, &team, &reviewer, &author, purpose, body, work.clone(), evidence.clone(), request.filter(|_| answers), format!("patch-{state}-{patch}"))?;
             }
@@ -782,8 +838,13 @@ impl Storage {
             let at = now_ms();
             let mut kept = None;
             if let Some(carry) = retained.filter(|carry| !carry.files.is_empty()) {
-                let work: Option<String> = tx.query_row("SELECT current_work_id FROM team_members WHERE id=?1", [&member], |r| r.get(0))?;
-                let (id, _) = insert_patch(&tx, &team, "retained", "retained", work.as_deref(), &member, None, "unsubmitted work kept when the team ended", &carry.base, &carry.files, &carry.body, None, at)?;
+                let (work, hold): (Option<String>, Option<String>) = tx.query_row("SELECT current_work_id,operator_hold FROM team_members WHERE id=?1", [&member], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                let summary = if hold.as_deref() == Some("retired") {
+                    "unsubmitted work kept when the operator retired the member"
+                } else {
+                    "unsubmitted work kept when the team ended"
+                };
+                let (id, _) = insert_patch(&tx, &team, "retained", "retained", work.as_deref(), &member, None, summary, &carry.base, &carry.files, &carry.body, None, at)?;
                 kept = Some(id);
             }
             tx.execute("DELETE FROM team_path_claims WHERE team_id=?1 AND member_id=?2", params![team, member])?;

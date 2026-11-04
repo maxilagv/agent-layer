@@ -112,19 +112,20 @@ impl Router {
                 continue;
             }
             if let Some(cap) = config.max_cost_usd {
-                let Some(input_price) = m.input_per_million else {
+                if m.input_per_million.is_none() {
                     errors.push(format!("{alias}: input price required for monetary budget"));
                     continue;
-                };
-                let Some(output_price) = m.output_per_million else {
+                }
+                if m.output_per_million.is_none() {
                     errors.push(format!(
                         "{alias}: output price required for monetary budget"
                     ));
                     continue;
-                };
-                let reserve = (estimated as f64 * input_price
-                    + config.max_output_tokens.min(m.context_window / 5) as f64 * output_price)
-                    / 1_000_000.0;
+                }
+                let reserve = m.reserve_cost(
+                    estimated,
+                    config.max_output_tokens.min(m.context_window / 5),
+                );
                 if reserve > cap {
                     errors.push(format!(
                         "{alias}: monetary budget cannot reserve this request"
@@ -183,8 +184,7 @@ impl Router {
                                     admission,
                                 )
                                 .await?;
-                            completion.usage.input_tokens += repaired.usage.input_tokens;
-                            completion.usage.output_tokens += repaired.usage.output_tokens;
+                            completion.usage.add(&repaired.usage);
                             completion.text = repaired.text;
                             value = serde_json::from_str(&completion.text);
                         }
@@ -343,9 +343,7 @@ impl Router {
         // most one token per byte), capped by the declared model window.
         let output = max;
         let input = (serde_json::to_vec(&(messages, tools))?.len() as u64).min(m.context_window);
-        let reserve_cost = (input as f64 * m.input_per_million.unwrap_or(0.0)
-            + output as f64 * m.output_per_million.unwrap_or(0.0))
-            / 1_000_000.0;
+        let reserve_cost = m.reserve_cost(input, output);
         let reservation = admission
             .reserve(alias, input, output, reserve_cost)
             .await?;
@@ -354,10 +352,7 @@ impl Router {
             .await;
         match &result {
             Ok(completion) => {
-                let cost = (completion.usage.input_tokens as f64
-                    * m.input_per_million.unwrap_or(0.0)
-                    + completion.usage.output_tokens as f64 * m.output_per_million.unwrap_or(0.0))
-                    / 1_000_000.0;
+                let cost = m.cost(&completion.usage);
                 admission
                     .settle(&reservation, Some(&completion.usage), cost, false)
                     .await?;
@@ -557,8 +552,9 @@ pub fn format_request(
                 }
                 value
             }).collect::<Vec<_>>();
-            let mut body =
-                json!({"model":m.id,"messages":ms,"stream":true,"max_completion_tokens":max});
+            // Without include_usage a streamed chat response reports no
+            // usage at all, so neither its tokens nor its cached tokens.
+            let mut body = json!({"model":m.id,"messages":ms,"stream":true,"stream_options":{"include_usage":true},"max_completion_tokens":max});
             if !funcs.is_empty() {
                 body["tools"] = json!(funcs);
             }
@@ -637,9 +633,14 @@ pub fn format_request(
                     ms.push(json!({"role":role,"content":content}));
                 }
             }
+            let mut tools: Vec<Value> = tools.iter().map(|t|json!({"name":t.name,"description":t.description,"input_schema":t.parameters})).collect();
+            let mut system = json!(system);
+            if m.prompt_cache {
+                anthropic_cache_marks(&mut system, &mut tools, &mut ms);
+            }
             Ok((
                 format!("{base}/messages"),
-                json!({"model":m.id,"system":system,"messages":ms,"max_tokens":max,"stream":true,"tools":tools.iter().map(|t|json!({"name":t.name,"description":t.description,"input_schema":t.parameters})).collect::<Vec<_>>()}),
+                json!({"model":m.id,"system":system,"messages":ms,"max_tokens":max,"stream":true,"tools":tools}),
             ))
         }
         Wire::Gemini => {
@@ -771,6 +772,35 @@ pub fn format_request(
         }
     }
     Ok((url, body))
+}
+
+/// Anthropic caches a request prefix up to each marked block. The tools, the
+/// instructions and the conversation so far are marked, so the next round of
+/// the same turn reads them from the cache instead of paying for them again.
+/// At most three of Anthropic's four marks are used.
+fn anthropic_cache_marks(system: &mut Value, tools: &mut [Value], messages: &mut [Value]) {
+    let mark = json!({"type":"ephemeral"});
+    if let Some(tool) = tools.last_mut() {
+        tool["cache_control"] = mark.clone();
+    }
+    if system.as_str().is_some_and(|text| !text.is_empty()) {
+        *system = json!([{"type":"text","text":system,"cache_control":mark}]);
+    }
+    // Thinking blocks cannot carry a mark; the last markable block does.
+    if let Some(block) = messages
+        .last_mut()
+        .and_then(|message| message["content"].as_array_mut())
+        .and_then(|blocks| {
+            blocks.iter_mut().rev().find(|block| {
+                matches!(
+                    block["type"].as_str(),
+                    Some("text" | "tool_result" | "tool_use" | "image")
+                )
+            })
+        })
+    {
+        block["cache_control"] = mark;
+    }
 }
 
 fn apply_native_effort(
@@ -915,6 +945,17 @@ struct Accumulator {
     reasoning: String,
 }
 impl Accumulator {
+    /// Anthropic counts uncached input apart from cache writes and reads;
+    /// `input_tokens` here is all three.
+    fn anthropic_input(&mut self, usage: &Value) {
+        let fresh = usage["input_tokens"].as_u64().unwrap_or(0);
+        let written = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        let read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+        self.usage.input_tokens = fresh.saturating_add(written).saturating_add(read);
+        self.usage.cache_write_tokens = written;
+        self.usage.cache_read_tokens = read;
+    }
+
     fn document(&mut self, wire: &Wire, v: &Value) -> Result<String> {
         ensure!(v.get("error").is_none(), "provider returned an error");
         match wire {
@@ -1022,6 +1063,14 @@ impl Accumulator {
                 self.usage.output_tokens = v["usage"]["completion_tokens"]
                     .as_u64()
                     .unwrap_or(self.usage.output_tokens);
+                // OpenAI reports cached prompt tokens in the details; DeepSeek
+                // as its cache hits. Both are part of prompt_tokens.
+                if let Some(cached) = v["usage"]["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .or_else(|| v["usage"]["prompt_cache_hit_tokens"].as_u64())
+                {
+                    self.usage.cache_read_tokens = cached;
+                }
             }
             Wire::OpenaiResponses => match v["type"].as_str().unwrap_or("") {
                 "response.output_text.delta" => text.push_str(v["delta"].as_str().unwrap_or("")),
@@ -1046,6 +1095,10 @@ impl Accumulator {
                     self.usage.output_tokens = v["response"]["usage"]["output_tokens"]
                         .as_u64()
                         .unwrap_or(0);
+                    self.usage.cache_read_tokens =
+                        v["response"]["usage"]["input_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .unwrap_or(0);
                 }
                 "response.failed" | "response.incomplete" => {
                     bail!("provider did not complete the response")
@@ -1055,10 +1108,7 @@ impl Accumulator {
             Wire::Anthropic => {
                 let index = v["index"].as_u64().unwrap_or(0) as usize;
                 match v["type"].as_str().unwrap_or("") {
-                    "message_start" => {
-                        self.usage.input_tokens =
-                            v["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0)
-                    }
+                    "message_start" => self.anthropic_input(&v["message"]["usage"]),
                     "content_block_start" => {
                         let block = &v["content_block"];
                         self.blocks.insert(index, block.clone());
@@ -1098,7 +1148,12 @@ impl Accumulator {
                             v["delta"]["stop_reason"] != "max_tokens",
                             "provider output limit reached"
                         );
-                        self.usage.output_tokens = v["usage"]["output_tokens"].as_u64().unwrap_or(0)
+                        self.usage.output_tokens =
+                            v["usage"]["output_tokens"].as_u64().unwrap_or(0);
+                        // Newer responses repeat the input counts here.
+                        if v["usage"]["input_tokens"].is_u64() {
+                            self.anthropic_input(&v["usage"]);
+                        }
                     }
                     "message_stop" => self.done = true,
                     _ => {}
@@ -1143,6 +1198,9 @@ impl Accumulator {
                 self.usage.output_tokens = v["usageMetadata"]["candidatesTokenCount"]
                     .as_u64()
                     .unwrap_or(self.usage.output_tokens);
+                self.usage.cache_read_tokens = v["usageMetadata"]["cachedContentTokenCount"]
+                    .as_u64()
+                    .unwrap_or(self.usage.cache_read_tokens);
             }
             Wire::Ollama => {
                 if let Some(t) = v["message"]["content"].as_str() {
@@ -1331,6 +1389,149 @@ mod tests {
         assert_eq!(responses.finish()?.text, "finished");
         Ok(())
     }
+    fn cached_model(prompt_cache: bool) -> Model {
+        Model {
+            provider: "fixture".into(),
+            id: "model".into(),
+            context_window: 200_000,
+            tools: true,
+            emulate_tools: false,
+            input_per_million: None,
+            output_per_million: None,
+            parameters: Default::default(),
+            notes: None,
+            team_access: Default::default(),
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+            prompt_cache,
+        }
+    }
+
+    #[test]
+    fn anthropic_requests_mark_their_stable_prefix_only_when_caching() -> Result<()> {
+        let provider = Provider {
+            wire: Wire::Anthropic,
+            base_url: "https://api.example.test".into(),
+            key_env: None,
+            oauth: None,
+            headers: Default::default(),
+        };
+        let tool = |name: &str| ToolDefinition {
+            name: name.into(),
+            description: "a tool".into(),
+            parameters: json!({"type":"object"}),
+        };
+        let mut call = Message::text("assistant", "reading");
+        call.tool_calls = vec![ToolCall {
+            provider_data: Value::Null,
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"a"}),
+        }];
+        let messages = vec![
+            Message::text("system", "You are an agent."),
+            Message::text("user", "Fix the parser"),
+            call.clone(),
+            Message::tool(&call.tool_calls[0], &json!({"content":"fn main() {}"})),
+        ];
+        let tools = [tool("read_file"), tool("write_file")];
+        let (_, plain) = format_request(&provider, &cached_model(false), &messages, &tools, 100)?;
+        assert_eq!(plain["system"], "You are an agent.");
+        assert!(!plain.to_string().contains("cache_control"));
+
+        let (_, body) = format_request(&provider, &cached_model(true), &messages, &tools, 100)?;
+        let mark = json!({"type":"ephemeral"});
+        assert_eq!(body["system"][0]["text"], "You are an agent.");
+        assert_eq!(body["system"][0]["cache_control"], mark);
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"], mark, "the last tool");
+        let last = body["messages"]
+            .as_array()
+            .context("messages")?
+            .last()
+            .context("last")?;
+        let blocks = last["content"].as_array().context("blocks")?;
+        assert_eq!(blocks.last().context("block")?["type"], "tool_result");
+        assert_eq!(blocks.last().context("block")?["cache_control"], mark);
+        assert_eq!(
+            body.to_string().matches("cache_control").count(),
+            3,
+            "within Anthropic's limit of four marks"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cached_input_tokens_are_counted_for_every_provider() -> Result<()> {
+        let mut chat = Accumulator::default();
+        chat.push(&Wire::OpenaiChat, &json!({"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":40,"prompt_tokens_details":{"cached_tokens":1000}}}))?;
+        assert_eq!(
+            (chat.usage.input_tokens, chat.usage.cache_read_tokens),
+            (1200, 1000)
+        );
+        let mut deepseek = Accumulator::default();
+        deepseek.push(&Wire::OpenaiChat, &json!({"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":10,"prompt_cache_hit_tokens":640,"prompt_cache_miss_tokens":260}}))?;
+        assert_eq!(
+            (
+                deepseek.usage.input_tokens,
+                deepseek.usage.cache_read_tokens
+            ),
+            (900, 640)
+        );
+        let mut responses = Accumulator::default();
+        responses.push(&Wire::OpenaiResponses, &json!({"type":"response.completed","response":{"usage":{"input_tokens":500,"output_tokens":7,"input_tokens_details":{"cached_tokens":384}}}}))?;
+        assert_eq!(responses.usage.cache_read_tokens, 384);
+        let mut anthropic = Accumulator::default();
+        anthropic.push(&Wire::Anthropic, &json!({"type":"message_start","message":{"usage":{"input_tokens":12,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000,"output_tokens":1}}}))?;
+        anthropic.push(&Wire::Anthropic, &json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":55}}))?;
+        assert_eq!(
+            anthropic.usage,
+            Usage {
+                input_tokens: 4312,
+                output_tokens: 55,
+                cache_read_tokens: 4000,
+                cache_write_tokens: 300,
+            },
+            "Anthropic's input is fresh, written and read tokens together"
+        );
+        let mut document = Accumulator::default();
+        document.document(&Wire::Anthropic, &json!({"type":"message","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":5,"cache_read_input_tokens":95,"output_tokens":2}}))?;
+        assert_eq!(
+            (
+                document.usage.input_tokens,
+                document.usage.cache_read_tokens
+            ),
+            (100, 95)
+        );
+        let mut gemini = Accumulator::default();
+        gemini.push(&Wire::Gemini, &json!({"candidates":[],"usageMetadata":{"promptTokenCount":2000,"candidatesTokenCount":30,"cachedContentTokenCount":1500}}))?;
+        assert_eq!(
+            (gemini.usage.input_tokens, gemini.usage.cache_read_tokens),
+            (2000, 1500)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_chat_requests_ask_for_usage() -> Result<()> {
+        let provider = Provider {
+            wire: Wire::OpenaiChat,
+            base_url: "https://api.deepseek.com".into(),
+            key_env: None,
+            oauth: None,
+            headers: Default::default(),
+        };
+        let (_, body) = format_request(
+            &provider,
+            &cached_model(false),
+            &[Message::text("user", "hi")],
+            &[],
+            100,
+        )?;
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        Ok(())
+    }
+
     #[test]
     fn anthropic_stream_keeps_signed_thinking_with_the_matching_provider() -> Result<()> {
         let mut a = Accumulator::default();
@@ -1365,6 +1566,11 @@ mod tests {
             input_per_million: None,
             output_per_million: None,
             parameters: Default::default(),
+            notes: None,
+            team_access: Default::default(),
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+            prompt_cache: false,
         };
         let (_, body) =
             format_request(&provider, &model, std::slice::from_ref(&message), &[], 100)?;

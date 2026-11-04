@@ -8,7 +8,7 @@ use super::*;
 use layeragent_protocol::TeamAccess;
 use layeragent_storage::{PatchCarry, PatchSubmission, ReviewOutcome};
 use layeragent_tools::git::team as git_team;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 /// Largest diff slice returned by one `team_patch_show` call.
 const SHOW_BYTES: usize = 48 * 1024;
@@ -164,7 +164,12 @@ impl EngineTeamControl {
         ))
     }
 
-    pub(super) async fn access(&self, ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
+    pub(super) async fn access(
+        &self,
+        ctx: &ToolContext<'_>,
+        snapshot: &TeamSnapshot,
+        args: &Value,
+    ) -> Result<Value> {
         let store = &self.runtime.store;
         let context = &self.runtime.context;
         let (team, member) = (&context.team_id, &context.member_id);
@@ -198,6 +203,7 @@ impl EngineTeamControl {
                     self.engine.config().await.policy.write,
                     "operator policy does not allow writing"
                 );
+                consult::require_writer_model(ctx.config, snapshot, member)?;
                 let work = required(args, "work_id")?;
                 let paths: Vec<String> = args["paths"]
                     .as_array()
@@ -309,6 +315,20 @@ impl EngineTeamControl {
             !git_team::conflict_markers(&body),
             "the patch still contains conflict markers; resolve them first"
         );
+        let reviewer = args["reviewer"].as_str().map(str::to_string);
+        if let Some(reviewer) = &reviewer {
+            // Catch a reviewer that could never approve before asking it.
+            let snapshot = store.team_snapshot_by_id(team).await?;
+            if snapshot.options.cross_model_review
+                && let Some(own) = &context.model_identity
+                && super::consult::member_identity(ctx.config, &snapshot, reviewer).as_ref()
+                    == Some(own)
+            {
+                bail!(
+                    "this team requires cross-model review and {reviewer} runs {own}, the model you run; name a member on another model, or submit without a reviewer and consult one with team_consult and the patch_id"
+                );
+            }
+        }
         store
             .team_submit_patch(
                 team,
@@ -319,7 +339,7 @@ impl EngineTeamControl {
                     base,
                     files,
                     body,
-                    reviewer: args["reviewer"].as_str().map(str::to_string),
+                    reviewer,
                 },
             )
             .await
@@ -353,7 +373,9 @@ impl EngineTeamControl {
         let reason = required(args, "reason")?;
         match required(args, "verdict")? {
             "reject" => {
-                store.team_review_precheck(team, reviewer, patch).await?;
+                store
+                    .team_review_precheck(team, reviewer, patch, false)
+                    .await?;
                 store
                     .team_review_record(team, reviewer, patch, ReviewOutcome::Rejected, reason)
                     .await
@@ -361,7 +383,9 @@ impl EngineTeamControl {
             "approve" => {
                 let gate = integration_gate(team)?;
                 let _order = gate.lock().await;
-                let (_, body) = store.team_review_precheck(team, reviewer, patch).await?;
+                let (_, body) = store
+                    .team_review_precheck(team, reviewer, patch, true)
+                    .await?;
                 let project = self.project(ctx).await?;
                 // Never apply under a task that is writing the same workspace.
                 let lease = self.engine.lease(&project.to_string_lossy())?;
@@ -424,7 +448,12 @@ impl EngineTeamControl {
 
     /// A handoff from a writing member also carries its unsubmitted changes to
     /// the reserved paths of that work, which then leave the sender's worktree.
-    pub(super) async fn handoff(&self, args: &Value) -> Result<Value> {
+    pub(super) async fn handoff(
+        &self,
+        ctx: &ToolContext<'_>,
+        snapshot: &TeamSnapshot,
+        args: &Value,
+    ) -> Result<Value> {
         let store = &self.runtime.store;
         let context = &self.runtime.context;
         let (team, member) = (&context.team_id, &context.member_id);
@@ -437,6 +466,18 @@ impl EngineTeamControl {
             .filter(|(_, w)| w == &work)
             .map(|(p, _)| p.clone())
             .collect();
+        // Reserved paths and unsubmitted changes travel with the work, and
+        // only a member on a model that may write can carry them on.
+        if !claims.is_empty()
+            && let Some(alias) = input
+                .recipient
+                .as_deref()
+                .and_then(|recipient| consult::member_alias(snapshot, recipient))
+        {
+            ctx.config.require_team_model(&alias, true).map_err(|error| {
+                anyhow::anyhow!("this work reserves paths, so its recipient has to write: {error}; submit the changes first, or hand the work to a member on a model that can write")
+            })?;
+        }
         let mut carry = None;
         if let (Some(worktree), Some(base)) = (&state.worktree, &state.base)
             && !claims.is_empty()
@@ -497,44 +538,133 @@ impl Engine {
             }
         };
         for (member, worktree, base) in worktrees {
-            let path = PathBuf::from(&worktree);
-            let mut retained = None;
-            if let Some(base) = base
-                && path.exists()
-            {
-                let captured = async {
-                    let file = scratch_file(self, team, "retain")?;
-                    let result = async {
-                        let files = git_team::diff(&path, &base, &file).await?;
-                        Ok::<_, anyhow::Error>(PatchCarry {
-                            base: base.clone(),
-                            files,
-                            body: std::fs::read(&file)?,
-                        })
-                    }
-                    .await;
-                    let _ = std::fs::remove_file(&file);
-                    result
-                }
+            self.retire_member_worktree(store, team, project, &member, &worktree, base)
                 .await;
-                match captured {
-                    Ok(carry) => retained = Some(carry),
-                    Err(error) => {
-                        // Without a capture the worktree is kept for the operator.
-                        tracing::warn!(%error, team, member, "unsubmitted team work could not be captured; worktree kept");
-                        continue;
-                    }
-                }
-            }
-            if let Err(error) = store.team_retire_worktree(team, &member, retained).await {
-                tracing::warn!(%error, team, member, "team worktree could not be retired");
-                continue;
-            }
-            git_team::remove(project, &path).await;
         }
         if let Ok(area) = team_area(self, team) {
             let _ = std::fs::remove_dir_all(area.join("tmp"));
             let _ = std::fs::remove_dir(&area);
+        }
+    }
+
+    /// Removes one member's worktree, keeping its unsubmitted changes as a
+    /// retained patch. A worktree whose changes cannot be captured is kept.
+    pub(crate) async fn retire_member_worktree(
+        &self,
+        store: &Storage,
+        team: &str,
+        project: &Path,
+        member: &str,
+        worktree: &str,
+        base: Option<String>,
+    ) {
+        let path = PathBuf::from(worktree);
+        let mut retained = None;
+        let mut base = base;
+        // A worktree behind the team workspace still holds changes that
+        // were already integrated; bring it up to date first so only work
+        // that never reached the team workspace is kept.
+        let stale = store
+            .team_writer_state(team, member)
+            .await
+            .is_ok_and(|state| state.stale);
+        if stale
+            && path.exists()
+            && let Some(old) = base.clone()
+            && let Ok(area) = team_area(self, team)
+        {
+            match git_team::sync(project, &path, &old, &area.join("tmp")).await {
+                Ok((synced, _)) => base = Some(synced),
+                Err(error) => {
+                    tracing::warn!(%error, team, member, "stale worktree could not be synced before retiring; its changes are kept against the old base");
+                }
+            }
+        }
+        if let Some(base) = base
+            && path.exists()
+        {
+            let captured = async {
+                let file = scratch_file(self, team, "retain")?;
+                let result = async {
+                    let files = git_team::diff(&path, &base, &file).await?;
+                    Ok::<_, anyhow::Error>(PatchCarry {
+                        base: base.clone(),
+                        files,
+                        body: std::fs::read(&file)?,
+                    })
+                }
+                .await;
+                let _ = std::fs::remove_file(&file);
+                result
+            }
+            .await;
+            match captured {
+                Ok(carry) => retained = Some(carry),
+                Err(error) => {
+                    // Without a capture the worktree is kept for the operator.
+                    tracing::warn!(%error, team, member, "unsubmitted team work could not be captured; worktree kept");
+                    return;
+                }
+            }
+        }
+        if let Err(error) = store.team_retire_worktree(team, member, retained).await {
+            tracing::warn!(%error, team, member, "team worktree could not be retired");
+            return;
+        }
+        git_team::remove(project, &path).await;
+    }
+
+    /// Stops the running activation of every member the operator retired and,
+    /// once it has stopped, keeps its unsubmitted changes as a retained patch.
+    pub(crate) async fn stop_retired_members(
+        &self,
+        store: &Storage,
+        team: &str,
+        snapshot: &TeamSnapshot,
+        running: &mut HashMap<String, CancellationToken>,
+        handled: &mut HashSet<String>,
+        project: &Path,
+    ) {
+        let retired: Vec<&str> = snapshot
+            .members
+            .iter()
+            .filter(|member| member["operator_hold"] == "retired")
+            .filter_map(|member| member["id"].as_str())
+            .filter(|member| !handled.contains(*member))
+            .collect();
+        if retired.is_empty() {
+            return;
+        }
+        for member in &retired {
+            if let Some(token) = running.get(*member) {
+                token.cancel();
+            }
+        }
+        let Ok(worktrees) = store.team_worktrees(team).await else {
+            return;
+        };
+        let mut pending: Vec<(String, String, Option<String>)> = worktrees
+            .into_iter()
+            .filter(|(member, _, _)| retired.contains(&member.as_str()))
+            .collect();
+        for member in &retired {
+            // Done once its activation stopped and its worktree, if any, was
+            // captured; a capture that fails is not retried until the team
+            // ends, which keeps that worktree for the operator.
+            if running.contains_key(*member) {
+                continue;
+            }
+            if let Some(index) = pending.iter().position(|(id, _, _)| id == member) {
+                let (member, worktree, base) = pending.swap_remove(index);
+                // Never capture while an approval is being applied.
+                let Ok(gate) = integration_gate(team) else {
+                    continue;
+                };
+                let _order = gate.lock().await;
+                self.retire_member_worktree(store, team, project, &member, &worktree, base)
+                    .await;
+            }
+            handled.insert((*member).to_string());
         }
     }
 }

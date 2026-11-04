@@ -1,4 +1,4 @@
-import sys, json, pathlib, hashlib, os, tempfile, stat
+import sys, json, pathlib, hashlib, os, tempfile, stat, re, fnmatch
 
 def secret(name):
     return name.startswith('.env') or name in ('.layeragent', '.ssh', '.aws', '.gnupg', '.kube', '.netrc', '.npmrc', '.pypirc', '.git-credentials')
@@ -62,19 +62,38 @@ elif operation in ('write_file', 'edit_file'):
     result = {'written': str(path.relative_to(root)), 'sha256': hashlib.sha256(text.encode()).hexdigest()}
 else:
     results = []
+    pattern = args.get('glob') or None
+    def wanted(relative):
+        # A pattern without a slash matches the file name at any depth.
+        if pattern is None:
+            return True
+        return fnmatch.fnmatch(relative, pattern) or ('/' not in pattern and fnmatch.fnmatch(pathlib.PurePosixPath(relative).name, pattern))
+    matcher = None
+    if operation == 'search_files':
+        flags = re.IGNORECASE if args.get('case_insensitive') else 0
+        if args.get('regex'):
+            matcher = re.compile(args['query'], flags).search
+        elif flags:
+            needle = args['query'].casefold()
+            matcher = lambda line: needle in line.casefold()
+        else:
+            matcher = lambda line: args['query'] in line
     for directory, folders, files in os.walk(path, followlinks=False):
         folders[:] = [f for f in folders if not secret(f) and f not in ('.git', '.agents', 'node_modules', 'target') and not (pathlib.Path(directory) / f).is_symlink()]
         for name in files:
             file = pathlib.Path(directory) / name
             if file.is_symlink() or secret(name):
                 continue
+            relative = file.relative_to(root).as_posix()
+            if not wanted(relative):
+                continue
             if operation == 'list_files':
-                results.append(str(file.relative_to(root)))
+                results.append(relative)
             elif file.stat().st_size <= 1024 * 1024:
                 try:
                     for number, line in enumerate(file.read_text().splitlines(), 1):
-                        if args['query'] in line:
-                            results.append({'path': str(file.relative_to(root)), 'line': number, 'text': line[:1024]})
+                        if matcher(line):
+                            results.append({'path': relative, 'line': number, 'text': line[:1024]})
                             if len(results) >= 200:
                                 break
                 except (UnicodeError, OSError):

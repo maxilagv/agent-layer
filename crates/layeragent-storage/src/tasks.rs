@@ -20,7 +20,7 @@ pub enum TaskCreate {
 
 fn read_task(c: &Connection, id: &str) -> Result<Task> {
     c.query_row(
-        "SELECT id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,correction,error,last_event_seq,effort,mode,bridge,execution,team_id,created_at,updated_at FROM tasks WHERE id=?1",
+        "SELECT id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,correction,error,last_event_seq,effort,mode,bridge,execution,team_id,created_at,updated_at,budget_usd FROM tasks WHERE id=?1",
         [id],
         |r| {
             let state: String = r.get(8)?;
@@ -57,12 +57,13 @@ fn read_task(c: &Connection, id: &str) -> Result<Task> {
                 error: r.get(13)?,
                 last_event_seq: r.get(14)?,
                 effort: effort.parse().unwrap_or_default(),
-                mode: if mode == "illustration" { layeragent_protocol::RunMode::Illustration } else { layeragent_protocol::RunMode::Normal },
+                mode: layeragent_protocol::RunMode::parse_stored(&mode),
                 bridge: r.get(17)?,
                 execution: execution.parse().unwrap_or_default(),
                 team_id: r.get(19)?,
                 created_at: r.get(20)?,
                 updated_at: r.get(21)?,
+                budget_usd: r.get(22)?,
             })
         },
     )
@@ -151,6 +152,47 @@ impl Storage {
         execution: layeragent_protocol::ExecutionMode,
         cooperative: Option<layeragent_protocol::CooperativeOptions>,
     ) -> Result<TaskCreate> {
+        self.create_task_with_budget(
+            scope,
+            project,
+            session_id,
+            objective,
+            executor,
+            idempotency_key,
+            request_sha256,
+            effort,
+            mode,
+            bridge,
+            execution,
+            cooperative,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::create_task_with_execution`], with the most the task's
+    /// whole agent tree may spend.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_task_with_budget(
+        &self,
+        scope: &Scope,
+        project: &str,
+        session_id: Option<&str>,
+        objective: &str,
+        executor: &str,
+        idempotency_key: &str,
+        request_sha256: &str,
+        effort: layeragent_protocol::EffortLevel,
+        mode: layeragent_protocol::RunMode,
+        bridge: bool,
+        execution: layeragent_protocol::ExecutionMode,
+        cooperative: Option<layeragent_protocol::CooperativeOptions>,
+        budget_usd: Option<f64>,
+    ) -> Result<TaskCreate> {
+        ensure!(
+            budget_usd.is_none_or(|budget| budget.is_finite() && budget > 0.0),
+            "budget_usd must be positive"
+        );
         ensure!(
             !idempotency_key.is_empty() && idempotency_key.len() <= 200,
             "idempotency key must contain 1..200 bytes"
@@ -190,8 +232,8 @@ impl Storage {
             let at = now_ms();
             let cooperative_body = cooperative.as_ref().map(serde_json::to_string).transpose()?;
             tx.execute(
-                "INSERT INTO tasks(id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,last_event_seq,idempotency_key,request_sha256,created_at,updated_at,effort,mode,bridge,execution,cooperative) VALUES(?1,?2,?3,?4,?5,?1,?6,?7,'prepared',1,'{}','none',0,?8,?9,?10,?10,?11,?12,?13,?14,?15)",
-                params![id, tenant, principal, project, session_id, objective, executor, key, fingerprint, at, effort.as_str(), mode.as_str(), bridge, execution.as_str(), cooperative_body],
+                "INSERT INTO tasks(id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,last_event_seq,idempotency_key,request_sha256,created_at,updated_at,effort,mode,bridge,execution,cooperative,budget_usd) VALUES(?1,?2,?3,?4,?5,?1,?6,?7,'prepared',1,'{}','none',0,?8,?9,?10,?10,?11,?12,?13,?14,?15,?16)",
+                params![id, tenant, principal, project, session_id, objective, executor, key, fingerprint, at, effort.as_str(), mode.as_str(), bridge, execution.as_str(), cooperative_body, budget_usd],
             )?;
             let team_id = if let Some(options) = &cooperative {
                 let scope = Scope { tenant: tenant.clone(), principal: principal.clone() };
@@ -254,7 +296,7 @@ impl Storage {
         let (tenant, principal) = (scope.tenant.clone(), scope.principal.clone());
         let limit = limit.clamp(1, 200) as i64;
         self.read(move |c| {
-            let mut q = c.prepare("SELECT rowid,id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,correction,error,last_event_seq,effort,mode,bridge,execution,team_id,created_at,updated_at FROM tasks WHERE tenant=?1 AND principal=?2 AND rowid>?3 ORDER BY rowid LIMIT ?4")?;
+            let mut q = c.prepare("SELECT rowid,id,tenant,principal,project,session_id,turn_id,objective,executor,state,revision,usage,cancellation,correction,error,last_event_seq,effort,mode,bridge,execution,team_id,created_at,updated_at,budget_usd FROM tasks WHERE tenant=?1 AND principal=?2 AND rowid>?3 ORDER BY rowid LIMIT ?4")?;
             let rows = q
                 .query_map(params![tenant, principal, after, limit], |r| {
                     let state: String = r.get(9)?;
@@ -282,12 +324,13 @@ impl Storage {
                         error: r.get(14)?,
                         last_event_seq: r.get(15)?,
                         effort: effort.parse().unwrap_or_default(),
-                        mode: if mode == "illustration" { layeragent_protocol::RunMode::Illustration } else { layeragent_protocol::RunMode::Normal },
+                        mode: layeragent_protocol::RunMode::parse_stored(&mode),
                         bridge: r.get(18)?,
                         execution: execution.parse().unwrap_or_default(),
                         team_id: r.get(20)?,
                         created_at: r.get(21)?,
                         updated_at: r.get(22)?,
+                        budget_usd: r.get(23)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

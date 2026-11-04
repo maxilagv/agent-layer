@@ -7,7 +7,11 @@
 `execution: cooperative` exposes teams through CLI/TUI and the task API. Members
 read the shared team workspace; when the operator creates the task with write
 scope, a member can switch to writing in its own worktree (see
-[cooperative writers](#godeye-cooperative-writers)).
+[cooperative writers](#godeye-cooperative-writers)). Members can run different
+models, bring in consultants and require cross-model review (see
+[teams on several models](#godeye-teams-on-several-models)); the operator
+decides per model what it may do in a team (see
+[model rules](#godeye-model-rules-and-usage-by-model)).
 The [terminal guide](15-cooperative-terminal.md) includes a local scripted demo,
 controls and an optional native check. Actual outcomes for the maintained source
 fingerprint belong to `verification.json`; fixture success does not establish
@@ -56,8 +60,9 @@ Terminal milestone additions and their verification boundaries:
 - CLI supports explicit execution mode, bounded cooperative options, inspect,
   watch, messages, team controls, priority and JSON/Markdown export. TUI supports
   creation/attachment, a responsive retained panel and controls during execution.
-  Attachment does not create or resume work. Pauses and cancellation apply to
-  the whole team; targeted member controls are not implemented.
+  Attachment does not create or resume work. Cancellation applies to the whole
+  team; pause, resume and retirement also apply to one member (see
+  [operator controls per member](#godeye-operator-controls-per-member)).
 - Snapshots include an event cursor and pending approvals. Exports read one
   consistent transaction and retain delivery receipts, finding revisions and
   attributed tool events, with recursive supported-pattern redaction.
@@ -77,12 +82,157 @@ declared window, plus the requested output ceiling); no adapter provides an exac
 count. Interrupted in-flight requests retain uncertain reservations until their
 consumption is explicitly reconciled; cancellation does not release that capacity.
 
-Pending: private investigation memory and `MUERTOS.md` export, web/desktop team interfaces, the
+Pending: web/desktop team interfaces, the
 cross-mode evaluator, live-provider evaluation and the complete P0/P1 traceability
 table. An initial assessment is recorded but is not an isolation guarantee against
 seeing peer conclusions; review checks a different reviewer and linked current
 evidence, not independence of every evidence producer. These remain qualification
 boundaries rather than claims of a complete independent-audit workflow.
+
+## Prompt caching and cached-token accounting
+
+Agent rounds resend the same prefix, so cached input is now priced and, on
+Anthropic, requested; see
+[prompt caching and cost](07-multi-provider-resilience-and-model-routing.md#prompt-caching-and-cost).
+
+- Usage carries `cache_read_tokens` and `cache_write_tokens` as parts of
+  `input_tokens`, which now always counts every input token (Anthropic's
+  fresh, written and read input together). Turn and task usage, task metrics,
+  team reservations, team totals and `usage_by_model` record them.
+- One cost function prices fresh input, cache reads, cache writes and output
+  (cache prices default to the input price), and the provider reserve uses the
+  upper bound, every input token at the cache-write price when caching. A
+  completion that does not name its model is charged as the selected model.
+- `models.NAME.prompt_cache` marks the last tool, the instructions and the
+  last conversation block for Anthropic; `setup` enables it for the official
+  Anthropic endpoint. Streamed chat requests send
+  `stream_options.include_usage`. No migration is needed: stored usage
+  without the new fields reads as zero cached tokens.
+
+Verification: a configuration test covers pricing with and without cache
+prices, a provider over-reporting cached tokens, the reserve bound and invalid
+prices. Provider tests check the three marks and their absence without
+`prompt_cache`, the usage request on chat streams, and cached-token parsing for
+OpenAI chat, DeepSeek, OpenAI responses, Anthropic streams and documents, and
+Gemini, using payloads shaped like each provider's documented usage. A runtime
+test charges a two-round turn that writes then reads the cache at the cache
+prices. No live provider was called: real cache hit rates depend on each
+provider's minimum cacheable size, cache lifetime and prefix stability.
+
+## Skill catalogs, guides and skill search
+
+- **Quarantine.** `layeragent skills import` (a directory, or an `https` Git
+  repository cloned without history and without credentials in the URL)
+  copies every `SKILL.md` directory it finds into `skill-quarantine`, refusing
+  symlinks, secret-looking paths, oversize files or skills, more than 200
+  files and text with detected credentials, without execute bits, with a
+  provenance record. `quarantine`, `review` (the `SKILL.md`, files, scripts
+  and links), `accept` and `reject` manage it. Quarantined skills are never
+  discovered or offered.
+- **Reviewed skills.** `accept` moves a skill into the registry with a review
+  record of its hash; discovery marks it `reviewed`, distinct from `verified`
+  by fixtures, and stops marking it when its files change. Records of a skill
+  are not part of its hash. Extra frontmatter keys are ignored, and a
+  `SKILL.md` with Windows line endings reads like any other (a Windows CI
+  checkout first showed every shipped skill refused).
+- **Guides.** `skill_draft` without fixtures quarantines the draft instead of
+  staging it; `skill_verify` refuses it and names the operator's command.
+- **Search.** `skill_search` ranks active skills by words in the name,
+  description and body, and lists matching quarantined ones as waiting.
+- **Starter catalog.** `examples/skills` ships six guides: project kickoff,
+  stack choice, cost control, cinematic web, three.js 3D (with optional
+  Blender in background mode) and storefront.
+
+Verification: skills tests import a catalog with an extra frontmatter key, a
+script and a link next to a skill carrying a credential and, on Unix, one with
+a symlink; check that only the first is quarantined, that nothing in
+quarantine is discovered, the review contents, search before and after
+acceptance, the reviewed mark and its loss on change, replacement and
+rejection, and a guide draft refused by `skill_verify` and accepted by the
+operator. Another test imports the shipped catalog and requires all six to
+quarantine. The guides' advice is written for real tasks but has not been
+measured with real models.
+
+## Planning first, the operator profile and file search
+
+- **Planning mode.** `RunMode::Plan` (`run --plan`, `/plan` in the TUI, task
+  `mode = "plan"`) is stored with the task and refused for cooperative
+  execution. A planning turn has no shell, terminals, Git writes, MCP calls,
+  custom tools or skill authoring; it keeps reading, search, the agent's own
+  browser, memory, skills, budget and read-only delegation, and write_file and
+  edit_file only under `docs/plan/` (checked by path component before the tool
+  runs). Its instructions name the plan's files (brief, stack, plan,
+  acceptance, costs) and end with a request for approval. `/build [notes]`
+  sends the build prompt for the approved plan. Writing the plan needs the
+  operator policy to allow writes; otherwise the plan comes back as the answer.
+- **Operator profile.** `[operator]` (`technical`, `language`,
+  `default_budget_usd`, `publish`, `notes`, each one line) reaches every
+  turn's instructions; without a technical level the agent is told to ask once
+  and remember it. `layeragent profile` edits only that table. The default
+  budget applies to tasks that set none when the selected model is priced.
+  The stack guidance follows the level: the simplest deliverable for a
+  non-technical operator, low-maintenance stacks for some experience, the
+  requirements' stack for a developer.
+- **Search.** `search_files` takes `regex`, `case_insensitive` and `glob`;
+  `list_files` takes `glob`. Both still run in the confined file script.
+
+Verification: a runtime test in `crates/layeragent-core/tests/planning.rs`
+runs a scripted planning task whose write outside `docs/plan/` is refused,
+whose plan file is written, whose tools exclude shell and terminals and whose
+instructions carry the plan and the profile, then a build turn in the same
+session with the shell back. The file script runs directly in that test's
+sandbox double, which does not certify confinement. Unit tests cover the
+planning restrictions (including a narrowed operator allow-list), the write
+scope by path component and traversal, search by literal, case, regular
+expression and pattern, the profile's validation, `layeragent profile`
+preserving other tables, and the CLI and TUI commands; gateway tests cover a
+refused cooperative plan, a stored plan task and the default budget with and
+without prices. Scripted models do not show that a real model plans well or
+fits its stack to the profile.
+
+## Spending awareness, task budgets and the usage ledger
+
+The agent can now see and steer its own spending; see
+[spending controls](16-task-measurement.md#spending-controls).
+
+- **Task budget.** `budget_usd` on task creation (`run --budget-usd`, `/team
+  start --budget-usd`, `/budget` in the TUI) is stored with the task and part
+  of its fingerprint. It requires prices for the selected model, narrows the
+  agent tree's cost ceiling, caps each request's reserve at what is left, and
+  for a team becomes `limits.max_cost_usd` unless that is lower. Migration 013
+  adds the column.
+- **Notices.** The tree budget tracks its spend and announces 50%, 80% and
+  95% of the larger of its token and cost shares once each, as a runtime
+  message entering the root turn's conversation between rounds, like a
+  correction. Only the root turn takes announcements: a child charging at the
+  moment the tree crossed a share could otherwise take one and end before
+  reading it (seen as a lost 50% notice on a macOS CI run).
+- **`budget_status`.** A session tool reporting the turn's usage, cached share
+  and cost, the task's spend and limits, a member's team usage and limits,
+  and the delegable models with prices and notes, cheapest first.
+- **Delegation rules.** `spawn_agent` refuses a model the privacy settings
+  block, a `none` model, a `read` model for a writable child, a model without
+  tool calls, and an unpriced model under a cost limit.
+- **Ledger and report.** Migration 013 adds `usage_ledger`: one row per
+  provider call with the tree's root turn, depth, model, tokens and cost.
+  `GET /v1/tasks/{id}/usage` and `layeragent cost` aggregate it per model and
+  depth, team activations included, with hints computed from the report and
+  the configuration.
+
+Verification: unit tests cover the budget's spend, limits, single
+announcements, a jump past two shares, and a run budget narrowing but never
+widening the operator's ceiling, plus the hint rules. Two runtime tests in
+`crates/layeragent-core/tests/spending.rs` drive a scripted task with a $1
+budget: `budget_status` reports its spend, limits and models cheapest first
+with notes, a child runs on the cheaper model and spends from the same
+budget, the task is told once at 50% and once at 80%, and the report splits
+five premium calls and one cheap call across two depths with the expected
+total; and delegations to an excluded model and a writable child on a
+read-only model are refused before any child runs. A gateway test covers a
+budget refused without prices or when not positive, a stored budget and its
+usage report, and a team ceiling lowered to the budget; CLI and TUI tests
+cover the options, `/budget` and the report rendering. Scripted models do not
+show that a real model reacts well to its notices or delegates sensibly.
 
 ## Godeye team bus, first increment
 
@@ -182,7 +332,9 @@ change reaches the team workspace only after another member approves it.
   unsubmitted changes to the work's reserved paths; they leave the sender's
   worktree and are applied to the recipient's worktree when it writes.
 - **End of a team.** When a team is terminated, cancelled or fails, each worktree
-  is removed and any unsubmitted changes are kept as a `retained` patch. Paused
+  is removed and any unsubmitted changes are kept as a `retained` patch. A
+  worktree that is behind the team workspace is synced first, so changes that
+  were already integrated are not kept again. Paused
   and blocked teams keep their worktrees. `layeragent team patches <task>` and the
   `patches` resource list patches; exports include them. Migration 010 adds
   member access, reservations and patches.
@@ -203,6 +355,208 @@ certify that the native sandbox confines a worktree writer, and the native
 cooperative check was not run for this increment. Scripted models show the
 mechanisms work, not that a real model reserves paths, splits work or reviews
 well.
+
+## Godeye teams on several models
+
+Third godeye increment: members of one team can run different models, a member
+can bring in a consultant on another model for one question, and a team can
+require that patches are approved from a different model than the one that
+wrote them. The operator-facing description is in
+[teams on several models](15-cooperative-terminal.md#teams-on-several-models).
+
+- **Recorded models.** The supervisor fixes each activation's model alias when
+  it starts and records it with its model id (lowercase, without a vendor
+  prefix). Members without their own model run the team's, recorded as the
+  team's `default_model`. Patches record the model of the activation that
+  submitted them and of the one that reviewed them. `team_members` shows each
+  member's model and the configured aliases with model ids and prices, without
+  endpoints, credentials or parameters. Exports list members with their models.
+- **Consultants.** `team_consult` adds a `consultant` member with the resolved
+  model alias, a token budget and the question as its only delivery. The alias
+  must be configured, able to call tools, allowed by the privacy settings, and
+  priced when the team has a cost ceiling. Consultants get read tools and the team tools to answer, wait,
+  record findings and evidence, read and review patches; the team tools that
+  create or take work, switch to writing, add members, consult or close are
+  hidden from them and refused by the runtime and by storage. They receive only
+  messages addressed to them and do not count against `max_members`. Two can
+  run at once and eight over a team's life. When a consultant's activation ends,
+  storage retires it if it answered the member that asked, failed, spent its
+  budget, or finished without answering; one waiting on its own clarifying
+  question, or interrupted by the runtime, stays for at most three activations.
+  A retirement resolves the open question and, without an answer, sends the
+  asker a runtime notice. A consultant's failure or exhausted budget ends the
+  consultation, not the team.
+- **Budget.** Before each model call of a consultant, storage compares the
+  tokens it has consumed (settled usage, plus reserved estimates for calls whose
+  consumption is unknown) with its budget and refuses the call once it is spent.
+  A consultation can therefore exceed its budget by at most one call. Team
+  limits apply on top.
+- **Cross-model review.** With `cross_model_review`, storage refuses an approval
+  whose activation model equals the patch author's, both when the review is
+  checked and when it is recorded; rejections are not restricted. A submission
+  that names a reviewer on the author's model is refused before the request is
+  sent. The option needs write scope, and the gateway refuses it unless two
+  configured models have different model ids. `team_consult` with a `patch_id`
+  makes the consultant's decision the answer to the consultation: the review
+  outcome is sent to the member that asked as a response, and to the author.
+- **Interfaces.** `--cross-model-review` and `--consultant-model ALIAS` on
+  `run` and `/team start`; `team show` lists each member's model and each
+  consultation's outcome and token use. Migration 011 adds the recorded models
+  and the consultant columns.
+
+Verification: storage tests cover an approval refused on the author's model and
+accepted on another, the record repeating that check, recorded author and
+reviewer models, a consultant answering and retiring without taking a member
+place, broadcasts and work kept away from consultants, a budget refused after
+it is spent, a silent consultation reported to the asker, the running and
+lifetime consultation limits, and a consultant's patch decision answering its
+consultation. A unit test covers the consultant's tool list, including an
+operator allow-list that would otherwise become empty. Two runtime tests in
+`crates/layeragent-core/tests/cooperative_consult.rs` drive a scripted team on
+two configured models over a real repository: the writer's same-model reviewer
+is refused before the request, the coordinator consults the other model with
+the patch, the consultant reads the real diff and approves it, the patch is
+integrated with both models recorded, and the consultant is retired with its
+consultation answered; and a model outside the provider allowlist is refused
+before it joins, then a consultation that spends its budget on its first call is
+refused its second, retired, and the team still completes. Both
+scripted models run behind one fixture provider: these tests show the
+mechanisms, not that two real providers interoperate in one team, nor that a
+different model reviews better. No live run with two providers was made for
+this increment. The sandbox is the same test double as for writers and does
+not certify confinement.
+
+## Godeye model rules and usage by model
+
+Fourth godeye increment: the operator states per model what it may do in a
+team, members see the operator's note on each model, and the team reports what
+each model consumed. The operator-facing description is in
+[teams on several models](15-cooperative-terminal.md#teams-on-several-models).
+
+- **Team access per model.** `models.NAME.team_access` is `write` (the
+  default, the previous behaviour), `read` or `none`. Task creation refuses a
+  team model or role model that is `none`, write scope without any `write`
+  model, and cross-model review unless two models allowed in teams have
+  different model ids. `team_add_member` and `team_consult` refuse a `none`
+  model. `team_access mode=write` is refused for a member whose model is
+  `read`, and so is a handoff of work with reserved paths to such a member;
+  review and approval are allowed on `read` models. The supervisor checks the
+  current configuration before every activation and blocks the team with the
+  reason when a member's model may no longer run it, or may no longer write
+  for a writing member. Checks during an activation use the configuration it
+  started with.
+- **Notes.** `models.NAME.notes` is one line of at most 200 bytes. With more
+  than one model allowed in the team, every member's prompt lists those models
+  with their model id, access and note (at most eight; `team_members` lists
+  all), and a member on a `read` model is told it reviews and hands over work
+  needing changes. `team_members` adds `team_access` and `notes` to each model
+  and leaves out `none` models.
+- **Usage by model.** The snapshot's `usage_by_model` groups the team's
+  activations by recorded model: activations, settled input and output tokens
+  and cost, and tokens and estimated cost still reserved or uncertain.
+  `team show` and the Markdown export print it. Figures are the runtime's
+  accounting with configured prices, not provider invoices.
+
+Verification: a configuration test covers parsing, the default, the three
+levels and note validation. A gateway test covers a refused excluded team or
+role model, an excluded model not counting toward cross-model review, write
+scope without a writer model, and accepted read-only teams. A storage test
+covers usage grouped per model, including an interrupted call kept at its
+estimate, and the Markdown section; a CLI test covers its rendering. Two
+runtime tests in `crates/layeragent-core/tests/cooperative_consult.rs` drive
+scripted teams: one checks the prompt's model list and `team_members`, refuses
+an excluded model for a new member and a consultation, refuses writing to the
+reviewer on a `read` model, which hands the work to the writer, refuses the
+writer handing reserved work back, and integrates the writer's patch approved
+from the `read` model, with consumption reported per model; the other blocks a
+team whose role model became `none` after creation before that model runs.
+Scripted models show the rules hold, not that real models choose well between
+models, and no live run with two providers was made.
+
+## Godeye operator controls per member
+
+Fifth godeye increment: the operator can pause, resume or retire one member
+of a running team without stopping the rest. The operator-facing description
+is in [controlling one member](15-cooperative-terminal.md#controlling-one-member).
+
+- **Pause and resume.** `team pause|resume --member` (a `member` on the team
+  command API) records an operator hold on that member. Its activation ends at
+  its next boundary, so it gives its concurrency slot back; it is no
+  candidate, its messages wait and do not count as pending work for the idle
+  check, and idle notices name it. A team resume keeps it paused. Resuming
+  clears the hold and sends it a runtime notice, which reactivates it even
+  when its work is already in progress, and counts as team progress.
+- **Retirement.** `team retire` (refused for the coordinator) terminates the
+  member in one transaction: its live activation becomes interrupted and its
+  reserved budget uncertain, deliveries to it are cancelled, its work returns
+  to the coordinator as pending, its path claims are released, its open
+  submissions become `withdrawn` and pending handoffs to it `retained`,
+  questions it asked are resolved, and questions waiting on it are resolved
+  with a runtime notice to their senders. The coordinator is told which work
+  and patches were affected. The supervisor then cancels the member's running
+  activation, including an in-flight provider call, and once it has stopped
+  keeps its unsubmitted worktree changes as a retained patch, under the
+  integration lock. An activation stopped by either control ends as
+  interrupted and never fails the team. Migration 012 adds the hold columns.
+
+Verification: storage tests cover a pause that leaves the team active, its
+replay, the paused activation reaching its boundary and being refused
+budget, the member leaving the candidates, the idle notice, a team resume
+keeping it paused, the resume notice, a retirement that fences the
+activation, keeps its reservation uncertain, returns the work, releases
+claims, withdraws the patch, tells the waiting reviewer and the coordinator
+and labels the retained patch, the coordinator refused, and a retired
+consultant reporting to its asker. CLI tests cover the commands, the name to
+id resolution and the terminal syntax. A runtime test in
+`crates/layeragent-core/tests/cooperative_controls.rs` drives a scripted team
+over a real repository: a writer paused after one edit makes no further model
+call while the team goes on, is resumed by notice, edits again and is retired
+during a held provider call; the call is cancelled within seconds (the test
+fails with the supervisor's cancellation removed, the call then staying open
+for its full 20 seconds), the change it made after resuming is kept as a
+retained patch, its worktree is removed, the coordinator cancels the returned
+work and the team completes. The scripted model plays the operator at fixed
+points; this shows the mechanism, not how an operator uses it with real
+models.
+
+## Godeye project memory and dead ends
+
+Sixth godeye increment: teams learn what earlier teams on the same workspace
+concluded, and an export collects what did not work out. The operator-facing
+description is in
+[what earlier teams concluded](15-cooperative-terminal.md#what-earlier-teams-concluded).
+
+- **Project memory.** Findings in a concluded state (discarded, inconclusive,
+  reviewed, reproduced) of ended teams with the same tenant, principal and
+  workspace path are a team's project memory; nothing crosses principals or
+  workspaces, and a running team's conclusions are not memory yet. Each entry
+  carries its claim, final reason, the snapshot it held for, whether that is
+  the asking team's current snapshot (when both are known), the earlier task
+  and its latest evidence (output capped), redacted. Every member's first
+  prompt lists the eight most recent as earlier peer conclusions, not
+  instructions, with claims and reasons reduced to one line of at most 200
+  bytes; consultants are not given the list. `team_memory` filters by state or
+  text (at most 50 entries). `cooperative.without_project_memory`
+  (`--without-project-memory`) starts a team without it, and `team_memory`
+  then returns nothing.
+- **Dead ends.** The export's `dead_ends` Markdown lists the team's discarded
+  and inconclusive findings with their revision history and evidence
+  (invocation, exit code, observed output, error), rejected and withdrawn
+  patches, and earlier teams' dead ends on the workspace. `team export
+  --format dead-ends` prints it, for example into `MUERTOS.md`; `team memory`
+  and `GET /v1/tasks/{id}/team/memory` list the project memory.
+
+Verification: a storage test covers memory appearing only once the earlier
+team ended, open hypotheses left out, the evidence and snapshot comparison,
+state and text filters, a refused state, isolation from another principal on
+the same path and from another workspace, and both teams' dead-ends documents.
+CLI tests cover the option, the commands and the rendering. A runtime test in
+`crates/layeragent-core/tests/cooperative_memory.rs` runs two scripted teams
+after an earlier one that discarded a hypothesis with evidence and left
+another inconclusive: the next team's first prompt lists both, its coordinator
+finds the evidence with `team_memory`, and a team started without project
+memory is told nothing. Scripted models show the mechanism, not that a real
+model rechecks or uses earlier conclusions well.
 
 ## Cooperative bus hardening increment
 

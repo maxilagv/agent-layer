@@ -4,13 +4,19 @@ use crate::Storage;
 use anyhow::{Context, Result, ensure};
 use layeragent_protocol::{
     CooperativeOptions, FindingInput, FindingState, FindingTransition, Message, MessagePurpose,
-    Scope, TeamCommand, TeamExport, TeamMemberInput, TeamMessageInput, TeamRole, TeamSnapshot,
-    TeamTemplate, TeamWorkInput, new_id, now_ms, template_instructions,
+    PROJECT_MEMORY_MAX_ITEMS, Scope, TeamCommand, TeamExport, TeamMemberInput, TeamMessageInput,
+    TeamRole, TeamSnapshot, TeamTemplate, TeamWorkInput, new_id, now_ms, template_instructions,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
+mod consult;
+mod controls;
+mod memory;
 mod writers;
+
+pub use controls::OperatorHold;
+pub use memory::MemoryQuery;
 pub use writers::{PatchCarry, PatchSubmission, ReviewOutcome, WriterState};
 
 #[derive(Debug, thiserror::Error)]
@@ -336,7 +342,9 @@ impl Storage {
             ensure!(revision == input.expected_revision, TeamConflict);
             ensure!(!input.name.trim().is_empty() && input.name.len() <= 64 && !input.justification.trim().is_empty(), "member name and distinct-work justification are required");
             ensure!(input.role != TeamRole::Coordinator, "a team has exactly one coordinator");
-            let count: i64 = tx.query_row("SELECT count(*) FROM team_members WHERE team_id=?1", [&team], |r| r.get(0))?;
+            ensure!(input.role != TeamRole::Consultant, "a consultant joins for one question with team_consult, not as a member");
+            // Consultants come and go; they never take a member place.
+            let count: i64 = tx.query_row("SELECT count(*) FROM team_members WHERE team_id=?1 AND role<>'consultant'", [&team], |r| r.get(0))?;
             ensure!((count as usize) < opts.limits.max_members, "team member limit reached");
             let id = new_id();
             let at = now_ms();
@@ -373,8 +381,9 @@ impl Storage {
             let revision: i64 = tx.query_row("SELECT revision FROM teams WHERE id=?1 AND state='active'", [&team], |r| r.get(0))?;
             ensure!(revision == input.expected_revision, TeamConflict);
             ensure!(!input.title.trim().is_empty() && !input.deliverable.trim().is_empty() && !input.close_conditions.trim().is_empty(), "work title, deliverable and close conditions are required");
+            ensure!(member_team(&tx, &team, &member)? != TeamRole::Consultant, "a consultant answers its question; it does not create work");
             if let Some(assignee) = &input.assignee {
-                member_team(&tx, &team, assignee)?;
+                ensure!(member_team(&tx, &team, assignee)? != TeamRole::Consultant, "work cannot be assigned to a consultant; ask it with team_consult");
             }
             let id = new_id();
             let at = now_ms();
@@ -407,7 +416,7 @@ impl Storage {
         let (team, member, work) = (team.to_string(), member.to_string(), work.to_string());
         self.write(move |c| {
             let tx = c.transaction()?;
-            member_team(&tx, &team, &member)?;
+            ensure!(member_team(&tx, &team, &member)? != TeamRole::Consultant, "a consultant answers its question; it does not take work");
             ensure!(team_state(&tx, &team)? == "active", "team is not accepting new work claims");
             let (assignee, revision): (Option<String>, i64) = tx.query_row("SELECT assignee,revision FROM team_work WHERE id=?1 AND team_id=?2 AND state IN ('pending','assigned')", params![work, team], |r| Ok((r.get(0)?, r.get(1)?)))?;
             ensure!(revision == expected_revision, TeamConflict);
@@ -741,7 +750,7 @@ impl Storage {
         let (activation, session) = (activation.to_string(), session.to_string());
         self.read(move |c| {
             c.query_row(
-                "SELECT a.id,a.team_id,t.task_id,a.member_id,m.name,m.role,a.generation,COALESCE(m.model,''),t.template,t.template_version,t.options,m.access_applied,m.worktree FROM team_activations a JOIN teams t ON t.id=a.team_id JOIN team_members m ON m.id=a.member_id AND m.team_id=t.id WHERE a.id=?1 AND m.session_id=?2 AND a.state='running' AND a.lease_expires_at>?3",
+                "SELECT a.id,a.team_id,t.task_id,a.member_id,m.name,m.role,a.generation,COALESCE(m.model,''),t.template,t.template_version,t.options,m.access_applied,m.worktree,a.model,a.model_identity FROM team_activations a JOIN teams t ON t.id=a.team_id JOIN team_members m ON m.id=a.member_id AND m.team_id=t.id WHERE a.id=?1 AND m.session_id=?2 AND a.state='running' AND a.lease_expires_at>?3",
                 params![activation, session, now_ms()],
                 |row| {
                     let model: String = row.get(7)?;
@@ -753,6 +762,8 @@ impl Storage {
                         template_version: row.get(9)?, options: serde_json::from_str(&row.get::<_,String>(10)?).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))))?,
                         access: row.get::<_,String>(11)?.parse().map_err(|error: anyhow::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))))?,
                         worktree: row.get(12)?,
+                        activation_model: row.get(13)?,
+                        model_identity: row.get(14)?,
                     })
                 },
             ).context("activation is stale, expired or outside the member session")
@@ -823,8 +834,8 @@ impl Storage {
     pub async fn team_candidates(&self, team: &str) -> Result<Vec<Value>> {
         let team = team.to_string();
         self.read(move |c| {
-            let mut q = c.prepare("SELECT m.id,m.name,m.role,m.model,m.session_id,m.activations FROM team_members m WHERE m.team_id=?1 AND m.state IN ('inactive','waiting_response') AND NOT EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=m.id AND a.state IN ('starting','running')) AND (m.activations=0 OR EXISTS(SELECT 1 FROM team_deliveries d WHERE d.recipient_member_id=m.id AND d.state='accepted') OR EXISTS(SELECT 1 FROM team_work w WHERE w.assignee=m.id AND w.state IN ('pending','assigned')) OR (m.access='write' AND m.access_applied='read')) ORDER BY m.role='coordinator' DESC,m.created_at,m.rowid")?;
-            let rows = q.query_map([&team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"activations":r.get::<_,i64>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut q = c.prepare("SELECT m.id,m.name,m.role,m.model,m.session_id,m.activations,m.consult_asker,m.consult_question,m.consult_budget,(SELECT s.name FROM team_members s WHERE s.id=m.consult_asker),m.access FROM team_members m WHERE m.team_id=?1 AND m.state IN ('inactive','waiting_response') AND NOT EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=m.id AND a.state IN ('starting','running')) AND (m.activations=0 OR EXISTS(SELECT 1 FROM team_deliveries d WHERE d.recipient_member_id=m.id AND d.state='accepted') OR EXISTS(SELECT 1 FROM team_work w WHERE w.assignee=m.id AND w.state IN ('pending','assigned')) OR (m.access='write' AND m.access_applied='read')) ORDER BY m.role='coordinator' DESC,m.created_at,m.rowid")?;
+            let rows = q.query_map([&team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"activations":r.get::<_,i64>(5)?,"consult":r.get::<_,Option<String>>(6)?.map(|asker| json!({"asker":asker,"question_id":r.get::<_,Option<String>>(7).ok().flatten(),"budget_tokens":r.get::<_,Option<i64>>(8).ok().flatten(),"asker_name":r.get::<_,Option<String>>(9).ok().flatten()})),"access":r.get::<_,String>(10)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         }).await
     }
@@ -846,17 +857,46 @@ impl Storage {
         .await
     }
 
+    /// Records the model alias the supervisor runs members without their own
+    /// model with, so peers can see which model each member uses.
+    pub async fn team_record_default_model(&self, team: &str, model: &str) -> Result<()> {
+        let (team, model) = (team.to_string(), model.to_string());
+        self.write(move |c| {
+            c.execute(
+                "UPDATE teams SET default_model=?2 WHERE id=?1",
+                params![team, model],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn team_start_activation(
         &self,
         team: &str,
         member: &str,
         lease_owner: &str,
     ) -> Result<Value> {
+        self.team_start_activation_with_model(team, member, lease_owner, None, None)
+            .await
+    }
+
+    /// Starts an activation and records the model it runs with: its alias and
+    /// its [`layeragent_protocol::model_identity`].
+    pub async fn team_start_activation_with_model(
+        &self,
+        team: &str,
+        member: &str,
+        lease_owner: &str,
+        model: Option<&str>,
+        identity: Option<&str>,
+    ) -> Result<Value> {
         let (team, member, lease_owner) = (
             team.to_string(),
             member.to_string(),
             lease_owner.to_string(),
         );
+        let (model, identity) = (model.map(str::to_string), identity.map(str::to_string));
         self.write(move |c| {
             let tx = c.transaction()?;
             let opts = options(&tx, &team)?;
@@ -880,11 +920,11 @@ impl Storage {
             let member_live: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM team_activations WHERE member_id=?1 AND state IN ('starting','running'))", [&member], |r| r.get(0))?;
             ensure!(!member_live, "member already has a live activation");
             let id = new_id();
-            tx.execute("INSERT INTO team_activations(id,team_id,member_id,generation,lease_owner,lease_expires_at,state,started_at) VALUES(?1,?2,?3,?4,?5,?6,'running',?7)", params![id, team, member, used + 1, lease_owner, at + 300_000, at])?;
+            tx.execute("INSERT INTO team_activations(id,team_id,member_id,generation,lease_owner,lease_expires_at,state,started_at,model,model_identity) VALUES(?1,?2,?3,?4,?5,?6,'running',?7,?8,?9)", params![id, team, member, used + 1, lease_owner, at + 300_000, at, model, identity])?;
             tx.execute("UPDATE team_members SET activations=activations+1,state='working',reason=NULL,access_applied=access,updated_at=?2 WHERE id=?1", params![member, at])?;
             tx.execute("UPDATE teams SET active_since=COALESCE(active_since,?2),updated_at=?2 WHERE id=?1", params![team, at])?;
             let access: String = tx.query_row("SELECT access FROM team_members WHERE id=?1", [&member], |r| r.get(0))?;
-            event(&tx, &team, "team_activation_started", json!({"activation_id":id,"member_id":member,"generation":used+1,"access":access}), at)?;
+            event(&tx, &team, "team_activation_started", json!({"activation_id":id,"member_id":member,"generation":used+1,"access":access,"model":model}), at)?;
             tx.commit()?;
             Ok(json!({"id":id,"team_id":team,"member_id":member,"generation":used+1}))
         })
@@ -922,6 +962,9 @@ impl Storage {
             }
             settle_active_time(&tx, &team, at)?;
             event(&tx, &team, "team_activation_finished", json!({"activation_id":activation,"member_id":member,"state":state,"reason":reason}), at)?;
+            if member_team(&tx, &team, &member)? == TeamRole::Consultant {
+                consult::settle(&tx, &team, &member, &state, reason.as_deref(), at)?;
+            }
             tx.commit()?;
             Ok(true)
         })
@@ -1046,7 +1089,7 @@ impl Storage {
         ensure!(
             matches!(
                 category,
-                "coordination" | "investigation" | "review" | "verification"
+                "coordination" | "investigation" | "review" | "verification" | "consultation"
             ),
             "invalid usage category"
         );
@@ -1062,6 +1105,7 @@ impl Storage {
             let (state, member_state): (String, String) = tx.query_row("SELECT t.state,m.state FROM teams t JOIN team_activations a ON a.team_id=t.id JOIN team_members m ON m.id=a.member_id WHERE a.id=?1 AND t.id=?2", params![activation,team], |r| Ok((r.get(0)?,r.get(1)?)))?;
             ensure!(!matches!(state.as_str(), "paused" | "blocked") && member_state != "paused", TeamPaused);
             ensure!(state == "active", "team no longer accepts provider calls");
+            consult::check_budget(&tx, &activation)?;
             let opts = options(&tx, &team)?;
             let (usage, reserved_tokens, reserved_cost): (String, i64, f64) = tx.query_row("SELECT usage,COALESCE((SELECT sum(input_tokens+output_tokens) FROM team_reservations WHERE team_id=?1 AND state IN ('reserved','uncertain')),0),COALESCE((SELECT sum(estimated_cost_usd) FROM team_reservations WHERE team_id=?1 AND state IN ('reserved','uncertain')),0) FROM teams WHERE id=?1", [&team], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             let usage: Value = serde_json::from_str(&usage)?;
@@ -1098,7 +1142,7 @@ impl Storage {
             ensure!(state == "reserved", "reservation already reconciled");
             let at = now_ms();
             let state = if uncertain { "uncertain" } else if usage.is_some() { "settled" } else { "released" };
-            tx.execute("UPDATE team_reservations SET state=?2,actual_usage=?3,settled_at=CASE WHEN ?2='uncertain' THEN NULL ELSE ?4 END WHERE id=?1", params![reservation, state, usage.as_ref().map(|u|json!({"input_tokens":u.input_tokens,"output_tokens":u.output_tokens,"cost_usd":cost}).to_string()), at])?;
+            tx.execute("UPDATE team_reservations SET state=?2,actual_usage=?3,settled_at=CASE WHEN ?2='uncertain' THEN NULL ELSE ?4 END WHERE id=?1", params![reservation, state, usage.as_ref().map(|u|json!({"input_tokens":u.input_tokens,"output_tokens":u.output_tokens,"cache_read_tokens":u.cache_read_tokens,"cache_write_tokens":u.cache_write_tokens,"cost_usd":cost}).to_string()), at])?;
             if let Some(usage) = usage {
                 let mut totals: Value = serde_json::from_str(&tx.query_row("SELECT usage FROM teams WHERE id=?1", [&team], |r| r.get::<_,String>(0))?)?;
                 let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
@@ -1106,6 +1150,11 @@ impl Storage {
                 totals["input_tokens"] = json!(totals["input_tokens"].as_u64().unwrap_or(0).saturating_add(usage.input_tokens));
                 totals["output_tokens"] = json!(totals["output_tokens"].as_u64().unwrap_or(0).saturating_add(usage.output_tokens));
                 totals["cost_usd"] = json!(totals["cost_usd"].as_f64().unwrap_or(0.0) + cost);
+                for (field, tokens) in [("cache_read_tokens", usage.cache_read_tokens), ("cache_write_tokens", usage.cache_write_tokens)] {
+                    if tokens > 0 {
+                        totals[field] = json!(totals[field].as_u64().unwrap_or(0).saturating_add(tokens));
+                    }
+                }
                 totals[category.as_str()] = json!({"input_tokens":totals[category.as_str()]["input_tokens"].as_u64().unwrap_or(0).saturating_add(usage.input_tokens),"output_tokens":totals[category.as_str()]["output_tokens"].as_u64().unwrap_or(0).saturating_add(usage.output_tokens),"cost_usd":totals[category.as_str()]["cost_usd"].as_f64().unwrap_or(0.0)+cost});
                 tx.execute("UPDATE teams SET usage=?2,updated_at=?3 WHERE id=?1", params![team, totals.to_string(), at])?;
             }
@@ -1123,13 +1172,16 @@ impl Storage {
         action: &str,
         command: TeamCommand,
     ) -> Result<Value> {
+        if command.member.is_some() || action == "retire" {
+            return self.team_member_command(scope, task, action, command).await;
+        }
         ensure!(
             matches!(action, "pause" | "resume" | "cancel" | "close" | "priority"),
             "unknown team command"
         );
         ensure!(
             action == "priority" || command.recipient.is_none(),
-            "member-targeted controls are not supported; omit recipient for team controls"
+            "recipient names the work of a priority command; name one member with member"
         );
         let scope = scope.clone();
         let task = task.to_string();
@@ -1169,7 +1221,8 @@ impl Storage {
                     settle_active_time(&tx, &team, at)?;
                 }
                 if action == "resume" {
-                    tx.execute("UPDATE team_members SET state=CASE WHEN EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=team_members.id AND a.state IN ('starting','running')) THEN 'working' ELSE 'inactive' END,reason=NULL,updated_at=?2 WHERE team_id=?1 AND state IN ('paused','blocked')", params![team, at])?;
+                    // A member the operator paused on its own stays paused.
+                    tx.execute("UPDATE team_members SET state=CASE WHEN operator_hold='paused' THEN 'paused' WHEN EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=team_members.id AND a.state IN ('starting','running')) THEN 'working' ELSE 'inactive' END,reason=CASE WHEN operator_hold='paused' THEN reason ELSE NULL END,updated_at=?2 WHERE team_id=?1 AND state IN ('paused','blocked')", params![team, at])?;
                     tx.execute("UPDATE team_activations SET pause_boundary=0 WHERE team_id=?1 AND state IN ('starting','running')", [&team])?;
                     tx.execute("UPDATE teams SET active_ms=active_ms+COALESCE(?2-active_since,0),active_since=CASE WHEN EXISTS(SELECT 1 FROM team_activations a WHERE a.team_id=teams.id AND a.state IN ('starting','running')) THEN ?2 ELSE NULL END WHERE id=?1", params![team,at])?;
                 }
@@ -1343,7 +1396,9 @@ impl Storage {
             let tx = c.transaction()?;
             let state: String = tx.query_row("SELECT state FROM teams WHERE id=?1", [&team], |r| r.get(0))?;
             let live: i64 = tx.query_row("SELECT count(*) FROM team_activations WHERE team_id=?1 AND state IN ('starting','running')", [&team], |r| r.get(0))?;
-            let pending: i64 = tx.query_row("SELECT count(*) FROM team_deliveries WHERE team_id=?1 AND state='accepted'", [&team], |r| r.get(0))?;
+            // Messages waiting for a member the operator paused are not work
+            // the rest of the team can make progress on.
+            let pending: i64 = tx.query_row("SELECT count(*) FROM team_deliveries d JOIN team_members m ON m.id=d.recipient_member_id WHERE d.team_id=?1 AND d.state='accepted' AND m.operator_hold IS NULL", [&team], |r| r.get(0))?;
             if state != "active" || live > 0 || pending > 0 {
                 return Ok(None);
             }
@@ -1377,7 +1432,14 @@ impl Storage {
             } else {
                 let coordinator: Option<String> = tx.query_row("SELECT id FROM team_members WHERE team_id=?1 AND role='coordinator' AND state NOT IN ('terminated','failed','paused')", [&team], |r| r.get(0)).optional()?;
                 let Some(coordinator) = coordinator else { return Ok(None) };
-                let diagnostic = "team idle: no member has pending messages or claimable work. Assign distinct work, answer open questions, record inconclusive outcomes, or propose close with team_close.".to_string();
+                let held: Vec<String> = {
+                    let mut q = tx.prepare("SELECT name FROM team_members WHERE team_id=?1 AND operator_hold='paused' ORDER BY created_at,rowid")?;
+                    q.query_map([&team], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+                };
+                let mut diagnostic = "team idle: no member has pending messages or claimable work. Assign distinct work, answer open questions, record inconclusive outcomes, or propose close with team_close.".to_string();
+                if !held.is_empty() {
+                    diagnostic.push_str(&format!(" The operator paused {}; their messages and work wait until the operator resumes them.", held.join(", ")));
+                }
                 runtime_notice(&tx, &team, &coordinator, &diagnostic, at)?;
                 event(&tx, &team, "team_idle", json!({"coordinator":coordinator,"diagnostic":diagnostic}), at)?;
                 diagnostic
@@ -1505,11 +1567,21 @@ impl Storage {
                 evidence,
                 patches,
                 markdown: String::new(),
+                dead_ends: String::new(),
             };
             // Model text and runtime tool output share one sanitization boundary.
             let mut safe = serde_json::to_value(&export)?;
             layeragent_protocol::redact::redact_value(&mut safe);
             export = serde_json::from_value(safe)?;
+            let earlier = memory::project_memory(
+                &tx,
+                &team,
+                &MemoryQuery {
+                    limit: PROJECT_MEMORY_MAX_ITEMS,
+                    ..Default::default()
+                },
+            )?;
+            export.dead_ends = memory::dead_ends_markdown(&export, &earlier);
             export.markdown = markdown_export(
                 &export.team,
                 &export.work,
@@ -1774,6 +1846,10 @@ fn settle_active_time(c: &Connection, team: &str, at: i64) -> Result<()> {
 
 fn team_snapshot(c: &Connection, team: &str) -> Result<TeamSnapshot> {
     let (task, state, reason, revision, template, version, opts, usage, created, updated): (String,String,Option<String>,i64,String,u32,String,String,i64,i64) = c.query_row("SELECT task_id,state,reason,revision,template,template_version,options,usage,created_at,updated_at FROM teams WHERE id=?1", [team], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)))?;
+    let default_model: Option<String> =
+        c.query_row("SELECT default_model FROM teams WHERE id=?1", [team], |r| {
+            r.get(0)
+        })?;
     let (reserved, uncertain): (i64, i64) = c.query_row("SELECT COALESCE(sum(CASE WHEN state='reserved' THEN input_tokens+output_tokens ELSE 0 END),0),COALESCE(sum(CASE WHEN state='uncertain' THEN input_tokens+output_tokens ELSE 0 END),0) FROM team_reservations WHERE team_id=?1", [team], |r| Ok((r.get(0)?,r.get(1)?)))?;
     let open: i64 = c.query_row("SELECT count(*) FROM team_messages m WHERE m.team_id=?1 AND m.state='accepted' AND m.purpose IN ('question','verification_request') AND m.resolved_at IS NULL AND NOT EXISTS(SELECT 1 FROM team_messages response WHERE response.team_id=m.team_id AND response.reply_to=m.id AND response.purpose='response' AND response.state='accepted')", [team], |r| r.get(0))?;
     let template: TeamTemplate = template.parse()?;
@@ -1805,6 +1881,8 @@ fn team_snapshot(c: &Connection, team: &str) -> Result<TeamSnapshot> {
         reservations: json!({"reserved_tokens":reserved,"uncertain_tokens":uncertain,"estimate_only":true,"provider_billing":false}),
         open_questions: open as u64,
         pending_approvals,
+        default_model,
+        usage_by_model: usage_by_model(c, team)?,
         last_event_seq: c.query_row("SELECT last_event_seq FROM tasks WHERE id=?1", [&task], |r| r.get(0))?,
         pause_pending: state == "paused" && c.query_row("SELECT EXISTS(SELECT 1 FROM team_activations WHERE team_id=?1 AND state IN ('starting','running') AND pause_boundary=0)", [team], |r| r.get::<_, bool>(0))?,
         created_at: created,
@@ -1812,9 +1890,40 @@ fn team_snapshot(c: &Connection, team: &str) -> Result<TeamSnapshot> {
     })
 }
 
+/// What each model the team ran consumed. Settled figures come from the
+/// provider's reported usage; reserved and uncertain ones are estimates.
+fn usage_by_model(c: &Connection, team: &str) -> Result<Vec<Value>> {
+    let settled = |field: &str| {
+        format!(
+            "COALESCE(sum(CASE WHEN r.state='settled' THEN COALESCE(json_extract(r.actual_usage,'$.{field}'),0) ELSE 0 END),0)"
+        )
+    };
+    let mut q = c.prepare(&format!(
+        "SELECT a.model,a.model_identity,count(DISTINCT a.id),{},{},{},{},COALESCE(sum(CASE WHEN r.state='reserved' THEN r.input_tokens+r.output_tokens ELSE 0 END),0),COALESCE(sum(CASE WHEN r.state='uncertain' THEN r.input_tokens+r.output_tokens ELSE 0 END),0),COALESCE(sum(CASE WHEN r.state IN ('reserved','uncertain') THEN r.estimated_cost_usd ELSE 0 END),0) FROM team_activations a LEFT JOIN team_reservations r ON r.activation_id=a.id WHERE a.team_id=?1 GROUP BY a.model,a.model_identity ORDER BY min(a.started_at),min(a.rowid)",
+        settled("input_tokens"),
+        settled("output_tokens"),
+        settled("cost_usd"),
+        settled("cache_read_tokens"),
+    ))?;
+    let rows = q
+        .query_map([team], |r| {
+            Ok(json!({"model":r.get::<_,Option<String>>(0)?,"model_id":r.get::<_,Option<String>>(1)?,"activations":r.get::<_,i64>(2)?,"input_tokens":r.get::<_,i64>(3)?,"output_tokens":r.get::<_,i64>(4)?,"cost_usd":r.get::<_,f64>(5)?,"cache_read_tokens":r.get::<_,i64>(6)?,"reserved_tokens":r.get::<_,i64>(7)?,"uncertain_tokens":r.get::<_,i64>(8)?,"estimated_open_cost_usd":r.get::<_,f64>(9)?}))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 fn members(c: &Connection, team: &str) -> Result<Vec<Value>> {
-    let mut q = c.prepare("SELECT id,name,role,model,session_id,state,reason,work_state,current_work_id,activations,initial_assessment IS NOT NULL,created_at,updated_at,access,access_applied,(SELECT json_group_array(p.path) FROM team_path_claims p WHERE p.team_id=m.team_id AND p.member_id=m.id) FROM team_members m WHERE team_id=?1 ORDER BY created_at,rowid")?;
-    let rows = q.query_map([team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"reason":r.get::<_,Option<String>>(6)?,"work_state":r.get::<_,String>(7)?,"current_work_id":r.get::<_,Option<String>>(8)?,"activations":r.get::<_,i64>(9)?,"initial_assessment_recorded":r.get::<_,bool>(10)?,"created_at":r.get::<_,i64>(11)?,"updated_at":r.get::<_,i64>(12)?,"access":r.get::<_,String>(13)?,"access_applied":r.get::<_,String>(14)?,"claimed_paths":serde_json::from_str::<Value>(&r.get::<_,String>(15)?).unwrap_or(json!([]))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut q = c.prepare("SELECT id,name,role,model,session_id,state,reason,work_state,current_work_id,activations,initial_assessment IS NOT NULL,created_at,updated_at,access,access_applied,(SELECT json_group_array(p.path) FROM team_path_claims p WHERE p.team_id=m.team_id AND p.member_id=m.id),(SELECT a.model FROM team_activations a WHERE a.member_id=m.id AND a.model IS NOT NULL ORDER BY a.started_at DESC,a.rowid DESC LIMIT 1),consult_asker,consult_question,consult_budget,consult_outcome,operator_hold FROM team_members m WHERE team_id=?1 ORDER BY created_at,rowid")?;
+    let mut rows = q.query_map([team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"reason":r.get::<_,Option<String>>(6)?,"work_state":r.get::<_,String>(7)?,"current_work_id":r.get::<_,Option<String>>(8)?,"activations":r.get::<_,i64>(9)?,"initial_assessment_recorded":r.get::<_,bool>(10)?,"created_at":r.get::<_,i64>(11)?,"updated_at":r.get::<_,i64>(12)?,"access":r.get::<_,String>(13)?,"access_applied":r.get::<_,String>(14)?,"claimed_paths":serde_json::from_str::<Value>(&r.get::<_,String>(15)?).unwrap_or(json!([])),"last_model":r.get::<_,Option<String>>(16)?,"consult":r.get::<_,Option<String>>(17)?.map(|asker| json!({"asker":asker,"question_id":r.get::<_,Option<String>>(18).ok().flatten(),"budget_tokens":r.get::<_,Option<i64>>(19).ok().flatten(),"outcome":r.get::<_,Option<String>>(20).ok().flatten()})),"operator_hold":r.get::<_,Option<String>>(21)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(q);
+    for row in &mut rows {
+        if row["role"] == "consultant"
+            && let Some(id) = row["id"].as_str().map(str::to_string)
+        {
+            row["consult"]["tokens_used"] = json!(consult::tokens_used(c, &id)?);
+        }
+    }
     Ok(rows)
 }
 
@@ -1873,6 +1982,12 @@ fn send_message(
     }
     if input.purpose == MessagePurpose::Handoff {
         ensure!(sender_kind == "member", "only a member can hand off work");
+        if let Some(recipient) = &input.recipient {
+            ensure!(
+                member_team(c, team, recipient)? != TeamRole::Consultant,
+                "work cannot be handed to a consultant; ask it with team_consult"
+            );
+        }
         ensure!(
             input.recipient.is_some() && input.work_id.is_some(),
             "a handoff requires a recipient and a work_id"
@@ -1957,7 +2072,9 @@ fn send_message(
         );
         vec![recipient.clone()]
     } else {
-        let mut q = c.prepare("SELECT id FROM team_members WHERE team_id=?1 AND state NOT IN ('terminated','failed') AND (?2 IS NULL OR id<>?2)")?;
+        // A consultant only receives what is addressed to it: a broadcast
+        // would spend its budget on work it was not brought in for.
+        let mut q = c.prepare("SELECT id FROM team_members WHERE team_id=?1 AND state NOT IN ('terminated','failed') AND role<>'consultant' AND (?2 IS NULL OR id<>?2)")?;
         q.query_map(params![team, sender], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -2115,7 +2232,7 @@ fn normalize_request(body: &str) -> String {
 /// Latest point at which the team made verifiable progress or the user intervened.
 fn progress_since(c: &Connection, team: &str) -> Result<i64> {
     Ok(c.query_row(
-        "SELECT COALESCE(max(at),0) FROM (SELECT max(created_at) at FROM team_evidence WHERE team_id=?1 UNION ALL SELECT max(created_at) FROM team_finding_revisions WHERE team_id=?1 UNION ALL SELECT max(created_at) FROM team_messages WHERE team_id=?1 AND sender_kind='user' UNION ALL SELECT max(created_at) FROM team_messages WHERE team_id=?1 AND sender_kind='member' AND purpose='response' AND state='accepted' UNION ALL SELECT max(created_at) FROM team_operations WHERE team_id=?1 AND kind='resume')",
+        "SELECT COALESCE(max(at),0) FROM (SELECT max(created_at) at FROM team_evidence WHERE team_id=?1 UNION ALL SELECT max(created_at) FROM team_finding_revisions WHERE team_id=?1 UNION ALL SELECT max(created_at) FROM team_messages WHERE team_id=?1 AND sender_kind='user' UNION ALL SELECT max(created_at) FROM team_messages WHERE team_id=?1 AND sender_kind='member' AND purpose='response' AND state='accepted' UNION ALL SELECT max(created_at) FROM team_operations WHERE team_id=?1 AND kind IN ('resume','member_resume'))",
         [team],
         |r| r.get(0),
     )?)
@@ -2191,7 +2308,52 @@ fn markdown_export(
         team.template_version,
         team.state
     );
-    out.push_str("Cost and token figures are estimates, not provider invoices. Incorporated context does not attest model comprehension.\n\n## Work\n");
+    out.push_str("Cost and token figures are estimates, not provider invoices. Incorporated context does not attest model comprehension.\n\n## Members\n");
+    for member in &team.members {
+        let model = member["model"]
+            .as_str()
+            .or(member["last_model"].as_str())
+            .or(team.default_model.as_deref())
+            .unwrap_or("unknown");
+        let consult = if member["role"] == "consultant" {
+            format!(
+                "; consultation {}, {} of {} tokens",
+                member["consult"]["outcome"].as_str().unwrap_or("open"),
+                member["consult"]["tokens_used"].as_i64().unwrap_or(0),
+                member["consult"]["budget_tokens"].as_i64().unwrap_or(0)
+            )
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "- {} ({}), model {}{}\n",
+            inline(&member["name"]),
+            member["role"].as_str().unwrap_or(""),
+            inline(&json!(model)),
+            consult
+        ));
+    }
+    if !team.usage_by_model.is_empty() {
+        out.push_str("\n## Usage by model\n");
+        for row in &team.usage_by_model {
+            let open = row["reserved_tokens"].as_i64().unwrap_or(0)
+                + row["uncertain_tokens"].as_i64().unwrap_or(0);
+            out.push_str(&format!(
+                "- {}: {} activations, {} input and {} output tokens, ${:.4}{}\n",
+                inline(&json!(row["model"].as_str().unwrap_or("unrecorded"))),
+                row["activations"].as_i64().unwrap_or(0),
+                row["input_tokens"].as_i64().unwrap_or(0),
+                row["output_tokens"].as_i64().unwrap_or(0),
+                row["cost_usd"].as_f64().unwrap_or(0.0),
+                if open > 0 {
+                    format!("; {open} tokens reserved or uncertain")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    }
+    out.push_str("\n## Work\n");
     for row in work {
         out.push_str(&format!(
             "- `{}` {} — {} ({})\n",
@@ -2370,6 +2532,7 @@ mod tests {
                         reason: Some("operator test".into()),
                         recipient: None,
                         priority: None,
+                        member: None,
                     },
                 )
                 .await
@@ -3104,6 +3267,7 @@ mod tests {
             reason: Some("stop".into()),
             recipient: None,
             priority: None,
+            member: None,
         };
         f.store
             .team_command(
@@ -3242,6 +3406,7 @@ mod tests {
                     reason: None,
                     recipient: None,
                     priority: None,
+                    member: None,
                 },
             )
             .await?;
@@ -3328,7 +3493,9 @@ mod tests {
     async fn active_clock_excludes_safe_pause_but_counts_operations_draining() -> Result<()> {
         let f = Fixture::new(CooperativeOptions {
             limits: layeragent_protocol::TeamLimits {
-                max_active_seconds: 1,
+                // Wide margins: a loaded runner can stall between the
+                // writes below without changing what the test shows.
+                max_active_seconds: 30,
                 ..Default::default()
             },
             ..Default::default()
@@ -3372,7 +3539,7 @@ mod tests {
             .write(move |c| {
                 c.execute(
                     "UPDATE teams SET active_since=?2 WHERE id=?1",
-                    params![team, now_ms() - 2000],
+                    params![team, now_ms() - 60_000],
                 )?;
                 Ok(())
             })
@@ -3700,13 +3867,13 @@ mod tests {
 
         assert!(
             f.store
-                .team_review_precheck(&f.team, &analyst, &patch)
+                .team_review_precheck(&f.team, &analyst, &patch, true)
                 .await
                 .is_err()
         );
         let (meta, body) = f
             .store
-            .team_review_precheck(&f.team, &reviewer, &patch)
+            .team_review_precheck(&f.team, &reviewer, &patch, true)
             .await?;
         assert_eq!(meta["files"], json!(["src/lib.rs"]));
         assert!(body.starts_with(b"diff --git"));
@@ -3950,7 +4117,8 @@ mod tests {
                             expected_revision: f.revision().await?,
                             reason: None,
                             recipient: Some("missing".into()),
-                            priority: Some(1)
+                            priority: Some(1),
+                            member: None,
                         }
                     )
                     .await
@@ -4596,5 +4764,1083 @@ mod tests {
             wait_cycle(&[edge("a", "b"), edge("b", "a")]).map(|c| c.len()),
             Some(2)
         );
+    }
+
+    impl Fixture {
+        /// An activation recorded as running `identity`, like the supervisor
+        /// starts one.
+        async fn activation_on(&self, member: &str, identity: &str) -> Result<(String, String)> {
+            let activation = self
+                .store
+                .team_start_activation_with_model(
+                    &self.team,
+                    member,
+                    "fixture",
+                    Some(identity),
+                    Some(identity),
+                )
+                .await?;
+            let id = activation["id"].as_str().context("id")?.to_string();
+            let session = self
+                .store
+                .create_session(&self.scope.principal, self._dir.path())
+                .await?;
+            self.store
+                .team_bind_member_session(
+                    &self.team,
+                    member,
+                    &id,
+                    activation["generation"].as_i64().context("generation")?,
+                    &session.id,
+                )
+                .await?;
+            Ok((id, session.id))
+        }
+
+        async fn finish(&self, activation: &str, member: &str, state: &str) -> Result<()> {
+            let generation = self
+                .store
+                .team_members(&self.team)
+                .await?
+                .iter()
+                .find(|m| m["id"] == member)
+                .and_then(|m| m["activations"].as_i64())
+                .context("generation")?;
+            self.store
+                .team_finish_activation(activation, member, generation, state, None, &json!({}))
+                .await?;
+            Ok(())
+        }
+
+        async fn consult(
+            &self,
+            asker: &str,
+            key: &str,
+            max_tokens: Option<u64>,
+            patch: Option<&str>,
+        ) -> Result<Value> {
+            self.store
+                .team_consult(
+                    &self.team,
+                    asker,
+                    layeragent_protocol::TeamConsultInput {
+                        idempotency_key: key.into(),
+                        expected_revision: self.revision().await?,
+                        question: format!("second opinion {key}: is the parser safe?"),
+                        model: Some("deepseek".into()),
+                        name: None,
+                        max_tokens,
+                        work_id: None,
+                        patch_id: patch.map(str::to_string),
+                    },
+                )
+                .await
+        }
+
+        async fn member_row(&self, id: &str) -> Result<Value> {
+            self.store
+                .team_members(&self.team)
+                .await?
+                .into_iter()
+                .find(|m| m["id"] == id)
+                .context("member row")
+        }
+
+        async fn deliveries_to(&self, member: &str) -> Result<Vec<Value>> {
+            let (rows, _) = self
+                .store
+                .team_resource(&self.scope, &self.task, "deliveries", 0, 200)
+                .await?;
+            let messages = self
+                .store
+                .team_resource(&self.scope, &self.task, "messages", 0, 200)
+                .await?
+                .0;
+            Ok(rows
+                .into_iter()
+                .filter(|d| d["recipient_member_id"] == member)
+                .filter_map(|d| {
+                    messages
+                        .iter()
+                        .find(|m| m["id"] == d["message_id"])
+                        .cloned()
+                })
+                .collect())
+        }
+    }
+
+    fn cross_model() -> CooperativeOptions {
+        let mut options = writable();
+        options.cross_model_review = true;
+        options
+    }
+
+    #[tokio::test]
+    async fn cross_model_review_needs_an_approver_on_another_model() -> Result<()> {
+        let f = Fixture::new(cross_model()).await?;
+        let (analyst, reviewer, verifier) = (
+            f.member("analyst").await?,
+            f.member("reviewer").await?,
+            f.member("verifier").await?,
+        );
+        let work = f.owned_work(&analyst, "w").await?;
+        f.write(&analyst, &work, &["src"]).await?;
+        let (author_activation, _) = f.activation_on(&analyst, "claude-opus-5-5").await?;
+        let submitted = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], None),
+            )
+            .await?;
+        let patch = submitted["patch_id"].as_str().context("patch")?.to_string();
+        f.finish(&author_activation, &analyst, "completed").await?;
+
+        // Same model, another member: it may reject, not approve.
+        let (same, _) = f.activation_on(&reviewer, "claude-opus-5-5").await?;
+        let refused = f
+            .store
+            .team_review_precheck(&f.team, &reviewer, &patch, true)
+            .await
+            .expect_err("same model");
+        assert!(
+            refused.to_string().contains("cross-model review"),
+            "{refused}"
+        );
+        f.store
+            .team_review_precheck(&f.team, &reviewer, &patch, false)
+            .await?;
+        let around = f
+            .store
+            .team_review_record(
+                &f.team,
+                &reviewer,
+                &patch,
+                ReviewOutcome::Integrated,
+                "lgtm",
+            )
+            .await;
+        assert!(around.is_err(), "the record repeats the check");
+        f.finish(&same, &reviewer, "completed").await?;
+
+        let (other, _) = f.activation_on(&verifier, "deepseek-chat").await?;
+        f.store
+            .team_review_precheck(&f.team, &verifier, &patch, true)
+            .await?;
+        let review = f
+            .store
+            .team_review_record(
+                &f.team,
+                &verifier,
+                &patch,
+                ReviewOutcome::Integrated,
+                "checked",
+            )
+            .await?;
+        assert_eq!(review["state"], "integrated");
+        f.finish(&other, &verifier, "completed").await?;
+        let (meta, _) = f.store.team_patch(&f.team, &patch).await?;
+        assert_eq!(meta["author_model"], "claude-opus-5-5");
+        assert_eq!(meta["reviewer_model"], "deepseek-chat");
+        assert_eq!(
+            f.member_row(&analyst).await?["last_model"],
+            "claude-opus-5-5"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_consultant_answers_once_without_taking_a_member_place() -> Result<()> {
+        let mut options = CooperativeOptions::default();
+        options.limits.max_members = 4;
+        let f = Fixture::new(options).await?;
+        let coordinator = f.member("coordinator").await?;
+        let full = f
+            .store
+            .team_add_member(
+                &f.team,
+                &coordinator,
+                TeamMemberInput {
+                    idempotency_key: "add".into(),
+                    expected_revision: f.revision().await?,
+                    name: "extra".into(),
+                    role: TeamRole::Analyst,
+                    justification: "more hands".into(),
+                    model: None,
+                },
+            )
+            .await;
+        assert!(full.expect_err("full").to_string().contains("member limit"));
+        let joined = f.consult(&coordinator, "c1", None, None).await?;
+        let consultant = joined["consultant_id"].as_str().context("id")?.to_string();
+        let question = joined["question_id"].as_str().context("q")?.to_string();
+        assert_eq!(joined["budget_tokens"], 150_000);
+        assert_eq!(joined["model"], "deepseek");
+        let row = f.member_row(&consultant).await?;
+        assert_eq!(row["role"], "consultant");
+        assert_eq!(row["consult"]["question_id"], question.as_str());
+        assert_eq!(row["consult"]["tokens_used"], 0);
+        assert!(
+            f.store
+                .team_candidates(&f.team)
+                .await?
+                .iter()
+                .any(|c| c["id"] == consultant.as_str()
+                    && c["consult"]["asker"] == coordinator.as_str())
+        );
+
+        // Broadcasts, work and member roles are not for consultants.
+        let broadcast = f
+            .store
+            .team_member_message(
+                &f.team,
+                &coordinator,
+                f.message("all", MessagePurpose::Observation, None, "plan is up")
+                    .await?,
+            )
+            .await?;
+        assert_eq!(broadcast["deliveries"], 3);
+        let work = f
+            .store
+            .team_create_work(
+                &f.team,
+                &coordinator,
+                TeamWorkInput {
+                    idempotency_key: "w".into(),
+                    expected_revision: f.revision().await?,
+                    title: "t".into(),
+                    deliverable: "d".into(),
+                    assignee: None,
+                    dependencies: vec![],
+                    priority: 1,
+                    close_conditions: "c".into(),
+                },
+            )
+            .await?;
+        let work = work["id"].as_str().context("work")?.to_string();
+        assert!(
+            f.store
+                .team_claim_work(&f.team, &consultant, &work, 1)
+                .await
+                .is_err()
+        );
+        assert!(f.consult(&consultant, "nested", None, None).await.is_err());
+        let analyst_role = f
+            .store
+            .team_add_member(
+                &f.team,
+                &coordinator,
+                TeamMemberInput {
+                    idempotency_key: "add-consultant".into(),
+                    expected_revision: f.revision().await?,
+                    name: "c".into(),
+                    role: TeamRole::Consultant,
+                    justification: "x".into(),
+                    model: None,
+                },
+            )
+            .await;
+        assert!(
+            analyst_role
+                .expect_err("role")
+                .to_string()
+                .contains("team_consult")
+        );
+
+        let (activation, _) = f.activation_on(&consultant, "deepseek-chat").await?;
+        let incorporated = f
+            .store
+            .team_incorporate(&f.team, &consultant, &activation, 1)
+            .await?;
+        assert_eq!(incorporated.len(), 1, "only the question reaches it");
+        assert_eq!(incorporated[0]["id"], question.as_str());
+        let mut answer = f
+            .message(
+                "answer",
+                MessagePurpose::Response,
+                Some(coordinator.clone()),
+                "it is safe",
+            )
+            .await?;
+        answer.reply_to = Some(question.clone());
+        f.store
+            .team_member_message(&f.team, &consultant, answer)
+            .await?;
+        f.finish(&activation, &consultant, "completed").await?;
+        let row = f.member_row(&consultant).await?;
+        assert_eq!(row["state"], "terminated");
+        assert_eq!(row["consult"]["outcome"], "answered");
+        assert!(
+            f.deliveries_to(&coordinator)
+                .await?
+                .iter()
+                .any(|m| m["body"] == "it is safe")
+        );
+        let late = f
+            .store
+            .team_member_message(
+                &f.team,
+                &coordinator,
+                f.message(
+                    "late",
+                    MessagePurpose::Question,
+                    Some(consultant.clone()),
+                    "one more?",
+                )
+                .await?,
+            )
+            .await;
+        assert!(late.is_err(), "a retired consultant receives nothing");
+        assert_eq!(
+            f.store.team_snapshot_by_id(&f.team).await?.open_questions,
+            0
+        );
+        Ok(())
+    }
+
+    impl Fixture {
+        fn on_member(&self, key: &str, revision: i64, member: &str) -> TeamCommand {
+            TeamCommand {
+                idempotency_key: key.into(),
+                expected_revision: revision,
+                reason: Some("off track".into()),
+                recipient: None,
+                priority: None,
+                member: Some(member.into()),
+            }
+        }
+
+        async fn control(&self, action: &str, key: &str, member: &str) -> Result<Value> {
+            let command = self.on_member(key, self.revision().await?, member);
+            self.store
+                .team_command(&self.scope, &self.task, action, command)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_operator_pauses_and_resumes_one_member_while_the_team_works() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let (activation, session) = f.activation(&analyst).await?;
+        let command = f.on_member("p1", f.revision().await?, &analyst);
+        let paused = f
+            .store
+            .team_command(&f.scope, &f.task, "pause", command.clone())
+            .await?;
+        assert_eq!(paused["applies"], "next_boundary");
+        let replay = f
+            .store
+            .team_command(&f.scope, &f.task, "pause", command)
+            .await?;
+        assert_eq!(replay, paused, "a repeated key replays the result");
+        assert_eq!(f.store.team_snapshot_by_id(&f.team).await?.state, "active");
+        // Its activation stops at the next boundary; the runtime ends it there.
+        assert!(
+            f.store
+                .team_activation_should_pause(&activation, &session, 1)
+                .await?
+        );
+        assert_eq!(
+            f.store.team_operator_hold(&f.team, &analyst).await?,
+            Some(OperatorHold::Paused)
+        );
+        assert!(
+            f.store
+                .team_reserve(&f.team, &activation, 1, "investigation", 1, 1, 0.0)
+                .await
+                .err()
+                .is_some_and(|e| e.downcast_ref::<TeamPaused>().is_some())
+        );
+        f.finish(&activation, &analyst, "interrupted").await?;
+        let row = f.member_row(&analyst).await?;
+        assert_eq!(row["state"], "paused");
+        assert_eq!(row["operator_hold"], "paused");
+        assert!(
+            f.store
+                .team_candidates(&f.team)
+                .await?
+                .iter()
+                .all(|candidate| candidate["id"] != analyst.as_str())
+        );
+        // A message waiting for it is not progress the team can make.
+        f.store
+            .team_member_message(
+                &f.team,
+                &reviewer,
+                f.message("q", MessagePurpose::Question, Some(analyst.clone()), "why?")
+                    .await?,
+            )
+            .await?;
+        let idle = f.store.team_idle_check(&f.team).await?.context("idle")?;
+        assert!(idle.contains("The operator paused analyst"), "{idle}");
+
+        assert!(
+            f.control("pause", "p2", &analyst).await.is_err(),
+            "already paused"
+        );
+        f.command("pause", "team-pause").await?;
+        f.command("resume", "team-resume").await?;
+        assert_eq!(
+            f.member_row(&analyst).await?["state"],
+            "paused",
+            "a team resume does not release a member the operator paused"
+        );
+        let resumed = f.control("resume", "r1", &analyst).await?;
+        assert_eq!(resumed["member_state"], "inactive");
+        let row = f.member_row(&analyst).await?;
+        assert!(row["operator_hold"].is_null());
+        assert!(
+            f.store
+                .team_candidates(&f.team)
+                .await?
+                .iter()
+                .any(|candidate| candidate["id"] == analyst.as_str())
+        );
+        assert!(f.deliveries_to(&analyst).await?.iter().any(|m| {
+            m["sender_kind"] == "runtime"
+                && m["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains("resumed you"))
+        }));
+        assert!(
+            f.control("resume", "r2", &reviewer).await.is_err(),
+            "only a paused member resumes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retiring_a_member_returns_its_work_and_tells_those_waiting_on_it() -> Result<()> {
+        let f = Fixture::new(writable()).await?;
+        let coordinator = f.member("coordinator").await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let work = f.owned_work(&analyst, "w").await?;
+        f.write(&analyst, &work, &["src"]).await?;
+        let (activation, session) = f.activation(&analyst).await?;
+        let patch = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], Some(&reviewer)),
+            )
+            .await?;
+        let patch = patch["patch_id"].as_str().context("patch")?.to_string();
+        f.store
+            .team_reserve(&f.team, &activation, 1, "investigation", 100, 100, 0.0)
+            .await?;
+        f.store
+            .team_member_message(
+                &f.team,
+                &reviewer,
+                f.message(
+                    "why",
+                    MessagePurpose::Question,
+                    Some(analyst.clone()),
+                    "why src?",
+                )
+                .await?,
+            )
+            .await?;
+
+        assert!(
+            f.control("retire", "coordinator", &coordinator)
+                .await
+                .is_err(),
+            "the coordinator stays"
+        );
+        let retired = f.control("retire", "x1", &analyst).await?;
+        assert_eq!(
+            retired["retired"]["interrupted_activation"],
+            activation.as_str()
+        );
+        assert_eq!(retired["retired"]["work_returned"], json!([work]));
+        assert_eq!(retired["retired"]["patches_withdrawn"], json!([patch]));
+        assert_eq!(f.store.team_snapshot_by_id(&f.team).await?.state, "active");
+
+        // Its activation is fenced at once and its reservation stays charged.
+        assert!(
+            f.store
+                .team_activation_context(&activation, &session)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            f.store.team_snapshot_by_id(&f.team).await?.reservations["uncertain_tokens"],
+            200
+        );
+        assert!(
+            !f.store
+                .team_finish_activation(&activation, &analyst, 1, "failed", None, &json!({}))
+                .await?,
+            "a late finish changes nothing"
+        );
+        let row = f.member_row(&analyst).await?;
+        assert_eq!(row["state"], "terminated");
+        assert_eq!(row["operator_hold"], "retired");
+        assert_eq!(row["claimed_paths"], json!([]));
+        assert_eq!(
+            f.store.team_operator_hold(&f.team, &analyst).await?,
+            Some(OperatorHold::Retired)
+        );
+
+        let (rows, _) = f
+            .store
+            .team_resource(&f.scope, &f.task, "work", 0, 50)
+            .await?;
+        let returned = rows
+            .iter()
+            .find(|w| w["id"] == work.as_str())
+            .context("work")?;
+        assert_eq!(returned["state"], "pending");
+        assert_eq!(returned["assignee"], coordinator.as_str());
+        f.store
+            .team_claim_work(
+                &f.team,
+                &coordinator,
+                &work,
+                returned["revision"].as_i64().context("revision")?,
+            )
+            .await?;
+
+        let (meta, _) = f.store.team_patch(&f.team, &patch).await?;
+        assert_eq!(meta["state"], "withdrawn");
+        assert!(
+            f.store
+                .team_review_precheck(&f.team, &reviewer, &patch, true)
+                .await
+                .is_err(),
+            "a withdrawn patch cannot be approved"
+        );
+        assert!(f.deliveries_to(&reviewer).await?.iter().any(|m| {
+            m["sender_kind"] == "runtime"
+                && m["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains("will not answer"))
+        }));
+        assert!(f.deliveries_to(&coordinator).await?.iter().any(|m| {
+            m["sender_kind"] == "runtime"
+                && m["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains("pending for you again"))
+        }));
+        assert!(
+            f.control("retire", "x2", &analyst).await.is_err(),
+            "already gone"
+        );
+        assert!(f.control("pause", "x3", &analyst).await.is_err());
+
+        // Its unsubmitted changes are kept, labelled as the operator's doing.
+        let kept = f
+            .store
+            .team_retire_worktree(
+                &f.team,
+                &analyst,
+                Some(PatchCarry {
+                    base: "b".repeat(40),
+                    files: vec!["src/lib.rs".into()],
+                    body: b"diff".to_vec(),
+                }),
+            )
+            .await?
+            .context("retained")?;
+        let (meta, _) = f.store.team_patch(&f.team, &kept).await?;
+        assert!(
+            meta["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("operator retired")),
+            "{meta}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_retired_consultant_tells_the_member_that_asked() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let analyst = f.member("analyst").await?;
+        let consult = f.consult(&analyst, "c", None, None).await?;
+        let consultant = consult["consultant_id"].as_str().context("id")?.to_string();
+        f.control("retire", "c1", &consultant).await?;
+        let row = f.member_row(&consultant).await?;
+        assert_eq!(row["consult"]["outcome"], "retired");
+        assert!(f.deliveries_to(&analyst).await?.iter().any(|m| {
+            m["sender_kind"] == "runtime"
+                && m["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains("will not answer"))
+        }));
+        assert_eq!(
+            f.store.team_snapshot_by_id(&f.team).await?.open_questions,
+            0
+        );
+        Ok(())
+    }
+
+    impl Fixture {
+        /// Another cooperative team in the same store, for `principal` on
+        /// `workspace`.
+        async fn sibling(
+            &self,
+            principal: &str,
+            workspace: &str,
+            key: &str,
+        ) -> Result<(Scope, String, String)> {
+            let scope = Scope {
+                tenant: "test".into(),
+                principal: principal.into(),
+            };
+            let created = self
+                .store
+                .create_task_with_execution(
+                    &scope,
+                    workspace,
+                    None,
+                    "audit again",
+                    "fixture",
+                    key,
+                    "sha",
+                    EffortLevel::Auto,
+                    RunMode::Normal,
+                    false,
+                    ExecutionMode::Cooperative,
+                    Some(CooperativeOptions::default()),
+                )
+                .await?;
+            let task = match created {
+                crate::TaskCreate::Created(task) | crate::TaskCreate::Replayed(task) => task,
+            };
+            let team = task.team_id.clone().context("team")?;
+            Ok((scope, task.id, team))
+        }
+
+        async fn conclude(
+            &self,
+            member: &str,
+            key: &str,
+            claim: &str,
+            state: FindingState,
+            snapshot: &str,
+        ) -> Result<String> {
+            let created = self
+                .store
+                .team_create_finding(
+                    &self.team,
+                    member,
+                    FindingInput {
+                        idempotency_key: key.into(),
+                        expected_revision: self.revision().await?,
+                        claim: claim.into(),
+                        state: FindingState::Hypothesis,
+                        reason: "initial read".into(),
+                        evidence_ids: vec![],
+                        snapshot_sha256: None,
+                    },
+                )
+                .await?;
+            let id = created["id"].as_str().context("id")?.to_string();
+            let evidence = if state == FindingState::Discarded {
+                vec![self.evidence(member, &id, snapshot, true, None).await?]
+            } else {
+                vec![]
+            };
+            self.store
+                .team_transition_finding(
+                    &self.team,
+                    member,
+                    &id,
+                    FindingTransition {
+                        idempotency_key: format!("{key}-end"),
+                        expected_revision: 1,
+                        state,
+                        reason: format!("{claim}: settled by the check"),
+                        evidence_ids: evidence,
+                        snapshot_sha256: (state == FindingState::Discarded)
+                            .then(|| snapshot.into()),
+                        environmental_failure: false,
+                    },
+                )
+                .await?;
+            Ok(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn later_teams_on_the_workspace_see_what_earlier_ones_concluded() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let analyst = f.member("analyst").await?;
+        let snapshot = "c".repeat(64);
+        f.store.team_snapshot_changed(&f.team, &snapshot).await?;
+        let discarded = f
+            .conclude(
+                &analyst,
+                "d",
+                "storage skips the token check",
+                FindingState::Discarded,
+                &snapshot,
+            )
+            .await?;
+        f.conclude(
+            &analyst,
+            "i",
+            "the cache leaks sessions",
+            FindingState::Inconclusive,
+            &snapshot,
+        )
+        .await?;
+        f.store
+            .team_create_finding(
+                &f.team,
+                &analyst,
+                FindingInput {
+                    idempotency_key: "open".into(),
+                    expected_revision: f.revision().await?,
+                    claim: "still a hypothesis".into(),
+                    state: FindingState::Hypothesis,
+                    reason: "not checked".into(),
+                    evidence_ids: vec![],
+                    snapshot_sha256: None,
+                },
+            )
+            .await?;
+        let workspace = f._dir.path().to_string_lossy().into_owned();
+        let (later_scope, later_task, later) = f.sibling("alice", &workspace, "later").await?;
+        let all = MemoryQuery {
+            limit: 50,
+            ..Default::default()
+        };
+        assert!(
+            f.store
+                .team_project_memory(&later, all.clone())
+                .await?
+                .is_empty(),
+            "a running team's conclusions are not memory yet"
+        );
+        f.command("cancel", "end-first").await?;
+        let memory = f.store.team_project_memory(&later, all.clone()).await?;
+        assert_eq!(memory.len(), 2, "open hypotheses are left out: {memory:?}");
+        let ruled_out = memory
+            .iter()
+            .find(|m| m["finding_id"] == discarded.as_str())
+            .context("discarded")?;
+        assert_eq!(ruled_out["state"], "discarded");
+        assert_eq!(ruled_out["task_id"], f.task.as_str());
+        assert_eq!(ruled_out["evidence"]["invocation"], "true");
+        assert_eq!(ruled_out["valid_for_snapshot"], snapshot.as_str());
+        assert!(
+            ruled_out["same_snapshot"].is_null(),
+            "the later team has no snapshot yet"
+        );
+        f.store.team_snapshot_changed(&later, &snapshot).await?;
+        let memory = f
+            .store
+            .team_project_memory(
+                &later,
+                MemoryQuery {
+                    state: Some("discarded".into()),
+                    ..all.clone()
+                },
+            )
+            .await?;
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory[0]["same_snapshot"], true);
+        let found = f
+            .store
+            .team_project_memory(
+                &later,
+                MemoryQuery {
+                    text: Some("CACHE".into()),
+                    ..all.clone()
+                },
+            )
+            .await?;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["state"], "inconclusive");
+        assert!(
+            f.store
+                .team_project_memory(
+                    &later,
+                    MemoryQuery {
+                        state: Some("hypothesis".into()),
+                        ..all.clone()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        // Memory stays with its owner and its workspace.
+        let (_, _, other_owner) = f.sibling("bob", &workspace, "bob").await?;
+        assert!(
+            f.store
+                .team_project_memory(&other_owner, all.clone())
+                .await?
+                .is_empty()
+        );
+        let (_, _, elsewhere) = f
+            .sibling("alice", "/elsewhere/project", "elsewhere")
+            .await?;
+        assert!(
+            f.store
+                .team_project_memory(&elsewhere, all.clone())
+                .await?
+                .is_empty()
+        );
+
+        // The dead-ends export lists this team's and the earlier ones.
+        let export = f.store.team_export(&f.scope, &f.task).await?;
+        assert!(
+            export
+                .dead_ends
+                .contains("### discarded — storage skips the token check"),
+            "{}",
+            export.dead_ends
+        );
+        assert!(
+            export.dead_ends.contains("- Evidence `"),
+            "{}",
+            export.dead_ends
+        );
+        assert!(
+            export
+                .dead_ends
+                .contains("### inconclusive — the cache leaks sessions")
+        );
+        assert!(!export.dead_ends.contains("still a hypothesis"));
+        let later_export = f.store.team_export(&later_scope, &later_task).await?;
+        assert!(
+            later_export
+                .dead_ends
+                .contains("## Earlier teams on this workspace")
+                && later_export.dead_ends.contains("discarded (task `"),
+            "{}",
+            later_export.dead_ends
+        );
+        assert_eq!(
+            f.store
+                .team_project_memory_scoped(&later_scope, &later_task, all)
+                .await?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn usage_is_reported_per_model_the_team_ran() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let analyst = f.member("analyst").await?;
+        let reviewer = f.member("reviewer").await?;
+        let spend = |activation: String, input: u64, output: u64, cost: f64| {
+            let store = f.store.clone();
+            let team = f.team.clone();
+            async move {
+                let reservation = store
+                    .team_reserve(&team, &activation, 1, "investigation", 100, 100, 0.01)
+                    .await?;
+                store
+                    .team_settle_reservation(
+                        &reservation,
+                        &activation,
+                        Some(&layeragent_protocol::Usage {
+                            input_tokens: input,
+                            output_tokens: output,
+                            ..Default::default()
+                        }),
+                        cost,
+                        false,
+                    )
+                    .await
+            }
+        };
+        let (opus, _) = f.activation_on(&analyst, "claude-opus-5-5").await?;
+        spend(opus.clone(), 1_000, 200, 0.05).await?;
+        spend(opus.clone(), 500, 100, 0.02).await?;
+        f.finish(&opus, &analyst, "completed").await?;
+        let (deepseek, _) = f.activation_on(&reviewer, "deepseek-chat").await?;
+        spend(deepseek.clone(), 3_000, 400, 0.01).await?;
+        // A call cut short stays charged at its estimate.
+        f.store
+            .team_reserve(&f.team, &deepseek, 1, "review", 300, 200, 0.004)
+            .await?;
+        f.finish(&deepseek, &reviewer, "interrupted").await?;
+
+        let snapshot = f.store.team_snapshot_by_id(&f.team).await?;
+        let rows = &snapshot.usage_by_model;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["model"], "claude-opus-5-5", "first used first");
+        assert_eq!(rows[0]["activations"], 1);
+        assert_eq!(rows[0]["input_tokens"], 1_500);
+        assert_eq!(rows[0]["output_tokens"], 300);
+        assert!((rows[0]["cost_usd"].as_f64().context("cost")? - 0.07).abs() < 1e-9);
+        assert_eq!(rows[0]["uncertain_tokens"], 0);
+        assert_eq!(rows[1]["model_id"], "deepseek-chat");
+        assert_eq!(rows[1]["input_tokens"], 3_000);
+        assert_eq!(rows[1]["uncertain_tokens"], 500);
+        assert!(
+            (rows[1]["estimated_open_cost_usd"]
+                .as_f64()
+                .context("estimate")?
+                - 0.004)
+                .abs()
+                < 1e-9
+        );
+
+        let export = f.store.team_export(&f.scope, &f.task).await?;
+        assert!(
+            export.markdown.contains("## Usage by model\n- claude-opus-5-5: 1 activations, 1500 input and 300 output tokens, $0.0700\n- deepseek-chat: 1 activations, 3000 input and 400 output tokens, $0.0100; 500 tokens reserved or uncertain"),
+            "{}",
+            export.markdown
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_consultation_that_overspends_or_goes_quiet_is_reported_to_the_asker() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let analyst = f.member("analyst").await?;
+        let first = f.consult(&analyst, "spend", Some(5_000), None).await?;
+        let second = f.consult(&analyst, "quiet", None, None).await?;
+        let third = f.consult(&analyst, "third", None, None).await;
+        assert!(
+            third
+                .expect_err("two at once")
+                .to_string()
+                .contains("already running")
+        );
+        let small = f
+            .store
+            .team_consult(
+                &f.team,
+                &analyst,
+                layeragent_protocol::TeamConsultInput {
+                    idempotency_key: "tiny".into(),
+                    expected_revision: f.revision().await?,
+                    question: "q".into(),
+                    model: None,
+                    name: None,
+                    max_tokens: Some(10),
+                    work_id: None,
+                    patch_id: None,
+                },
+            )
+            .await;
+        assert!(small.is_err());
+
+        let spender = first["consultant_id"].as_str().context("id")?.to_string();
+        let (activation, _) = f.activation_on(&spender, "deepseek-chat").await?;
+        let reservation = f
+            .store
+            .team_reserve(&f.team, &activation, 1, "consultation", 100, 100, 0.0)
+            .await?;
+        f.store
+            .team_settle_reservation(
+                &reservation,
+                &activation,
+                Some(&layeragent_protocol::Usage {
+                    input_tokens: 4_000,
+                    output_tokens: 1_500,
+                    ..Default::default()
+                }),
+                0.0,
+                false,
+            )
+            .await?;
+        let over = f
+            .store
+            .team_reserve(&f.team, &activation, 1, "consultation", 100, 100, 0.0)
+            .await
+            .expect_err("budget");
+        assert!(over.to_string().contains("budget exhausted"), "{over}");
+        f.finish(&activation, &spender, "failed").await?;
+        let row = f.member_row(&spender).await?;
+        assert_eq!(row["state"], "terminated");
+        assert_eq!(row["consult"]["outcome"], "budget_exhausted");
+        assert_eq!(row["consult"]["tokens_used"], 5_500);
+
+        let quiet = second["consultant_id"].as_str().context("id")?.to_string();
+        let (activation, _) = f.activation_on(&quiet, "deepseek-chat").await?;
+        f.finish(&activation, &quiet, "completed").await?;
+        assert_eq!(
+            f.member_row(&quiet).await?["consult"]["outcome"],
+            "unanswered"
+        );
+        let notices: Vec<Value> = f
+            .deliveries_to(&analyst)
+            .await?
+            .into_iter()
+            .filter(|m| m["sender_kind"] == "runtime")
+            .collect();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices.iter().any(|m| {
+            m["body"]
+                .as_str()
+                .is_some_and(|b| b.contains("budget exhausted"))
+        }));
+        assert_eq!(
+            f.store.team_snapshot_by_id(&f.team).await?.open_questions,
+            0,
+            "both questions are resolved"
+        );
+        // Retired consultations free a running place, not the lifetime count.
+        f.consult(&analyst, "after", None, None).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_consultant_on_another_model_reviews_a_patch_and_that_answers_it() -> Result<()> {
+        let f = Fixture::new(cross_model()).await?;
+        let (coordinator, analyst) = (f.member("coordinator").await?, f.member("analyst").await?);
+        let work = f.owned_work(&analyst, "w").await?;
+        f.write(&analyst, &work, &["src"]).await?;
+        let (author, _) = f.activation_on(&analyst, "claude-opus-5-5").await?;
+        let submitted = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], None),
+            )
+            .await?;
+        let patch = submitted["patch_id"].as_str().context("patch")?.to_string();
+        f.finish(&author, &analyst, "completed").await?;
+        let joined = f
+            .consult(&coordinator, "review", None, Some(&patch))
+            .await?;
+        let consultant = joined["consultant_id"].as_str().context("id")?.to_string();
+        let question = joined["question_id"].as_str().context("q")?.to_string();
+        let (activation, _) = f.activation_on(&consultant, "deepseek-chat").await?;
+        f.store
+            .team_review_precheck(&f.team, &consultant, &patch, true)
+            .await?;
+        f.store
+            .team_review_record(
+                &f.team,
+                &consultant,
+                &patch,
+                ReviewOutcome::Integrated,
+                "safe rename",
+            )
+            .await?;
+        f.finish(&activation, &consultant, "completed").await?;
+        assert_eq!(
+            f.member_row(&consultant).await?["consult"]["outcome"],
+            "answered"
+        );
+        let to_coordinator = f.deliveries_to(&coordinator).await?;
+        assert!(
+            to_coordinator
+                .iter()
+                .any(|m| m["purpose"] == "response" && m["reply_to"] == question.as_str()),
+            "the decision answers the consultation"
+        );
+        assert!(
+            f.deliveries_to(&analyst)
+                .await?
+                .iter()
+                .any(|m| m["purpose"] == "observation"
+                    && m["body"].as_str().is_some_and(|b| b.contains("approved")))
+        );
+        Ok(())
     }
 }

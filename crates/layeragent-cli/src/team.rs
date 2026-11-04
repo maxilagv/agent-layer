@@ -2,7 +2,7 @@
 use crate::client::Client;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
-use layeragent_protocol::{CooperativeOptions, ExecutionMode, TeamTemplate};
+use layeragent_protocol::{CooperativeOptions, ExecutionMode, TeamRole, TeamTemplate};
 use serde_json::{Value, json};
 
 #[derive(Args, Clone, Debug, Default)]
@@ -21,6 +21,25 @@ pub struct ExecutionOptions {
     /// change reaches the project only when another member approves it.
     #[arg(long)]
     pub allow_write: bool,
+    /// Approve a patch only from a member or consultant on a different model
+    /// than the one that wrote it. Needs --allow-write.
+    #[arg(long)]
+    pub cross_model_review: bool,
+    /// Configured model alias consultants run when the member asking names
+    /// none.
+    #[arg(long)]
+    pub consultant_model: Option<String>,
+    /// Start without what earlier teams on this workspace concluded.
+    #[arg(long)]
+    pub without_project_memory: bool,
+    /// Most the task may spend in US dollars at the configured prices,
+    /// child agents and team members included.
+    #[arg(long)]
+    pub budget_usd: Option<f64>,
+    /// Plan only: investigate and write the plan under docs/plan/, then ask
+    /// for approval. Nothing is built.
+    #[arg(long)]
+    pub plan: bool,
 }
 impl ExecutionOptions {
     pub fn body(&self) -> Result<Value> {
@@ -34,13 +53,33 @@ impl ExecutionOptions {
             || self.max_tokens.is_some()
             || self.max_seconds.is_some()
             || self.max_cost_usd.is_some()
-            || self.allow_write;
+            || self.allow_write
+            || self.cross_model_review
+            || self.consultant_model.is_some()
+            || self.without_project_memory;
         ensure!(
             mode == ExecutionMode::Cooperative || !configured,
             "team options require --execution cooperative"
         );
+        if let Some(budget) = self.budget_usd {
+            ensure!(
+                budget.is_finite() && budget > 0.0,
+                "--budget-usd must be positive"
+            );
+        }
+        ensure!(
+            !self.plan || mode != ExecutionMode::Cooperative,
+            "--plan applies to individual and delegated tasks; plan first, then start the team"
+        );
         if mode != ExecutionMode::Cooperative {
-            return Ok(json!({"execution":mode}));
+            let mut body = json!({"execution":mode});
+            if let Some(budget) = self.budget_usd {
+                body["budget_usd"] = json!(budget);
+            }
+            if self.plan {
+                body["mode"] = json!("plan");
+            }
+            return Ok(body);
         }
         let mut options = CooperativeOptions {
             template: self
@@ -60,8 +99,19 @@ impl ExecutionOptions {
             options.limits.max_cost_usd = Some(value);
         }
         options.scope.allow_write = self.allow_write;
+        options.cross_model_review = self.cross_model_review;
+        options.without_project_memory = self.without_project_memory;
+        if let Some(model) = &self.consultant_model {
+            options
+                .role_models
+                .insert(TeamRole::Consultant, model.clone());
+        }
         let options = options.normalized(None)?;
-        Ok(json!({"execution":mode,"cooperative":options}))
+        let mut body = json!({"execution":mode,"cooperative":options});
+        if let Some(budget) = self.budget_usd {
+            body["budget_usd"] = json!(budget);
+        }
+        Ok(body)
     }
 }
 
@@ -76,6 +126,8 @@ pub enum TeamCommand {
     Evidence(Inspect),
     /// Patches members submitted, handed over or left unsubmitted.
     Patches(Inspect),
+    /// What earlier teams on this task's workspace concluded.
+    Memory(Inspect),
     Message {
         task: String,
         #[arg(long)]
@@ -85,8 +137,19 @@ pub enum TeamCommand {
         urgent: bool,
         text: String,
     },
-    Pause(Control),
-    Resume(Control),
+    /// Pause the team, or with --member only that member.
+    Pause(MemberControl),
+    /// Resume the team, or with --member only that member.
+    Resume(MemberControl),
+    /// Remove one member from the team: its activation stops, its work goes
+    /// back to the coordinator and its unsubmitted changes are kept.
+    Retire {
+        task: String,
+        /// Member id or exact name.
+        member: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     Close(Control),
     Cancel(Control),
     Priority {
@@ -96,7 +159,8 @@ pub enum TeamCommand {
     },
     Export {
         task: String,
-        #[arg(long, default_value = "markdown", value_parser = ["json", "markdown"])]
+        /// dead-ends prints what was ruled out or left unsettled (MUERTOS.md).
+        #[arg(long, default_value = "markdown", value_parser = ["json", "markdown", "dead-ends"])]
         format: String,
     },
 }
@@ -109,6 +173,15 @@ pub struct Inspect {
 #[derive(Args, Debug)]
 pub struct Control {
     pub task: String,
+    #[arg(long)]
+    pub reason: Option<String>,
+}
+#[derive(Args, Debug)]
+pub struct MemberControl {
+    pub task: String,
+    /// Apply to this member alone (id or exact name).
+    #[arg(long)]
+    pub member: Option<String>,
     #[arg(long)]
     pub reason: Option<String>,
 }
@@ -151,17 +224,34 @@ pub async fn command(
     priority: Option<i64>,
     reason: Option<&str>,
 ) -> Result<Value> {
+    member_command(client, task, action, None, recipient, priority, reason).await
+}
+
+/// A team command, or with `member` a command on that member alone.
+pub async fn member_command(
+    client: &Client,
+    task: &str,
+    action: &str,
+    member: Option<&str>,
+    recipient: Option<&str>,
+    priority: Option<i64>,
+    reason: Option<&str>,
+) -> Result<Value> {
     identifier(task)?;
     let snapshot = client.get(&format!("/v1/tasks/{task}/team")).await?;
+    let member = member
+        .map(|name| self::recipient(&snapshot, name))
+        .transpose()?;
+    let mut body = json!({
+        "idempotency_key":layeragent_protocol::new_id(),
+        "expected_revision":snapshot["team"]["revision"],
+        "recipient":recipient,"priority":priority,"reason":reason,
+    });
+    if let Some(member) = member {
+        body["member"] = json!(member);
+    }
     client
-        .post(
-            &format!("/v1/tasks/{task}/team/commands/{action}"),
-            json!({
-                "idempotency_key":layeragent_protocol::new_id(),
-                "expected_revision":snapshot["team"]["revision"],
-                "recipient":recipient,"priority":priority,"reason":reason,
-            }),
-        )
+        .post(&format!("/v1/tasks/{task}/team/commands/{action}"), body)
         .await
 }
 
@@ -201,6 +291,9 @@ pub fn summary(value: &Value) -> String {
     if let Some(reason) = team["reason"].as_str() {
         out.push_str(&format!("Motivo: {reason}\n"));
     }
+    if team["options"]["cross_model_review"] == true {
+        out.push_str("Revisión cruzada: un parche se aprueba solo desde otro modelo.\n");
+    }
     if team["pause_pending"] == true {
         out.push_str("Pausa pendiente: las operaciones activas están terminando.\n");
     }
@@ -210,12 +303,39 @@ pub fn summary(value: &Value) -> String {
                 .as_array()
                 .map(|paths| paths.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
+            let model = member["model"]
+                .as_str()
+                .or(member["last_model"].as_str())
+                .or(team["default_model"].as_str());
+            let consult = &member["consult"];
+            let consulting = if member["role"] == "consultant" {
+                let outcome = match consult["outcome"].as_str() {
+                    Some("answered") => "respondió",
+                    Some("unanswered") => "se retiró sin responder",
+                    Some("budget_exhausted") => "presupuesto agotado",
+                    Some("failed") => "falló",
+                    _ => "consultando",
+                };
+                format!(
+                    " · {outcome} · {}/{} tokens",
+                    consult["tokens_used"].as_i64().unwrap_or(0),
+                    consult["budget_tokens"].as_i64().unwrap_or(0)
+                )
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "{} ({}) · {} · {}{}{}{}\n",
+                "{} ({}) · {}{}{} · {}{}{}{}\n",
                 member["name"].as_str().unwrap_or("?"),
                 member["id"].as_str().unwrap_or("?"),
                 member["role"].as_str().unwrap_or("?"),
-                member["state"].as_str().unwrap_or("?"),
+                model.map(|m| format!(" · {m}")).unwrap_or_default(),
+                consulting,
+                match member["operator_hold"].as_str() {
+                    Some("paused") => "pausado por el operador",
+                    Some("retired") => "retirado por el operador",
+                    _ => member["state"].as_str().unwrap_or("?"),
+                },
                 if member["access"] == "write" {
                     " · escribe"
                 } else {
@@ -232,6 +352,119 @@ pub fn summary(value: &Value) -> String {
                     .unwrap_or_default()
             ));
         }
+    }
+    if let Some(rows) = team["usage_by_model"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        out.push_str("Consumo por modelo (estimado, no es la factura del proveedor):\n");
+        for row in rows {
+            let open = row["reserved_tokens"].as_i64().unwrap_or(0)
+                + row["uncertain_tokens"].as_i64().unwrap_or(0);
+            out.push_str(&format!(
+                "  {} · {} activaciones · {} entrada / {} salida tokens · US${:.4}{}\n",
+                row["model"].as_str().unwrap_or("sin registrar"),
+                row["activations"].as_i64().unwrap_or(0),
+                row["input_tokens"].as_i64().unwrap_or(0),
+                row["output_tokens"].as_i64().unwrap_or(0),
+                row["cost_usd"].as_f64().unwrap_or(0.0),
+                if open > 0 {
+                    format!(
+                        " · {open} tokens reservados o inciertos (US${:.4})",
+                        row["estimated_open_cost_usd"].as_f64().unwrap_or(0.0)
+                    )
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    }
+    terminal_text(&out)
+}
+
+/// A task's spending, per model and agent depth, with the hints.
+pub fn cost_summary(value: &Value) -> String {
+    let total = &value["total"];
+    let money = |v: &Value| format!("US${:.4}", v.as_f64().unwrap_or(0.0));
+    let percent = |v: &Value| format!("{:.0}%", v.as_f64().unwrap_or(0.0) * 100.0);
+    let mut out = format!(
+        "Tarea {} · {} · {} llamadas en {} turnos · caché {}{}\n",
+        value["task_id"].as_str().unwrap_or("?"),
+        money(&total["cost_usd"]),
+        total["calls"].as_i64().unwrap_or(0),
+        total["turns"].as_i64().unwrap_or(0),
+        percent(&total["cache_read_ratio"]),
+        value["budget_usd"]
+            .as_f64()
+            .map(|budget| format!(" · presupuesto US${budget:.2}"))
+            .unwrap_or_default(),
+    );
+    out.push_str("Por modelo:\n");
+    for row in value["by_model"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "  {} · {} · {} llamadas · {} entrada / {} salida tokens · caché {}\n",
+            row["model"].as_str().unwrap_or("?"),
+            money(&row["cost_usd"]),
+            row["calls"].as_i64().unwrap_or(0),
+            row["input_tokens"].as_i64().unwrap_or(0),
+            row["output_tokens"].as_i64().unwrap_or(0),
+            percent(&row["cache_read_ratio"]),
+        ));
+    }
+    let depths = value["by_depth"].as_array().cloned().unwrap_or_default();
+    if depths.len() > 1 {
+        out.push_str("Por nivel:\n");
+        for row in &depths {
+            let depth = row["depth"].as_i64().unwrap_or(0);
+            out.push_str(&format!(
+                "  {} · {}\n",
+                if depth == 0 {
+                    "tarea principal".to_string()
+                } else {
+                    format!("subagentes nivel {depth}")
+                },
+                money(&row["cost_usd"]),
+            ));
+        }
+    }
+    let hints: Vec<&str> = value["hints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !hints.is_empty() {
+        out.push_str("Para gastar menos:\n");
+        for hint in hints {
+            out.push_str(&format!("  - {hint}\n"));
+        }
+    }
+    out.push_str(
+        "Costos estimados con los precios configurados; no son la factura del proveedor.\n",
+    );
+    terminal_text(&out)
+}
+
+/// Earlier conclusions on the workspace, one line each.
+pub fn memory_summary(value: &Value) -> String {
+    let items = value["items"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        return "Ningún equipo anterior dejó conclusiones en este workspace.\n".into();
+    }
+    let mut out = String::from("Conclusiones de equipos anteriores en este workspace:\n");
+    for item in &items {
+        let snapshot = match item["same_snapshot"].as_bool() {
+            Some(true) => "mismo snapshot",
+            Some(false) => "snapshot anterior",
+            None => "snapshot sin comparar",
+        };
+        out.push_str(&format!(
+            "- {} · {}: {} — {} ({snapshot})\n",
+            item["task_id"].as_str().unwrap_or("?"),
+            item["state"].as_str().unwrap_or("?"),
+            item["claim"].as_str().unwrap_or(""),
+            item["reason"].as_str().unwrap_or(""),
+        ));
     }
     terminal_text(&out)
 }
@@ -269,6 +502,17 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
         TeamCommand::Objections(args) => client.team_resource(&args.task, "objections").await?,
         TeamCommand::Evidence(args) => client.team_resource(&args.task, "evidence").await?,
         TeamCommand::Patches(args) => client.team_resource(&args.task, "patches").await?,
+        TeamCommand::Memory(args) => {
+            identifier(&args.task)?;
+            let value = client
+                .get(&format!("/v1/tasks/{}/team/memory", args.task))
+                .await?;
+            if !args.json {
+                print!("{}", memory_summary(&value));
+                return Ok(());
+            }
+            value
+        }
         TeamCommand::Message {
             task,
             to,
@@ -276,10 +520,11 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
             text,
         } => message(client, &task, &to, &text, urgent).await?,
         TeamCommand::Pause(args) => {
-            command(
+            member_command(
                 client,
                 &args.task,
                 "pause",
+                args.member.as_deref(),
                 None,
                 None,
                 args.reason.as_deref(),
@@ -287,13 +532,30 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
             .await?
         }
         TeamCommand::Resume(args) => {
-            command(
+            member_command(
                 client,
                 &args.task,
                 "resume",
+                args.member.as_deref(),
                 None,
                 None,
                 args.reason.as_deref(),
+            )
+            .await?
+        }
+        TeamCommand::Retire {
+            task,
+            member,
+            reason,
+        } => {
+            member_command(
+                client,
+                &task,
+                "retire",
+                Some(&member),
+                None,
+                None,
+                reason.as_deref(),
             )
             .await?
         }
@@ -325,15 +587,20 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
         TeamCommand::Export { task, format } => {
             identifier(&task)?;
             let value = client.get(&format!("/v1/tasks/{task}/team/export")).await?;
-            if format == "markdown" {
+            if format != "json" {
+                let field = if format == "dead-ends" {
+                    "dead_ends"
+                } else {
+                    "markdown"
+                };
                 // Exports contain model-written text: never send raw control
                 // sequences to the operator's terminal.
                 print!(
                     "{}",
                     terminal_text(
-                        value["markdown"]
+                        value[field]
                             .as_str()
-                            .context("export markdown missing")?
+                            .with_context(|| format!("export {field} missing"))?
                     )
                 );
                 return Ok(());
@@ -383,9 +650,17 @@ struct StartArgs {
     max_cost_usd: Option<f64>,
     #[arg(long)]
     allow_write: bool,
+    #[arg(long)]
+    cross_model_review: bool,
+    #[arg(long)]
+    consultant_model: Option<String>,
+    #[arg(long)]
+    without_project_memory: bool,
+    #[arg(long)]
+    budget_usd: Option<f64>,
 }
 pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
-    let (options, objective) = text.split_once(" -- ").context("Uso: /team start audit|debug|review [--max-tokens N] [--max-seconds N] [--max-cost-usd N] [--allow-write] -- objetivo")?;
+    let (options, objective) = text.split_once(" -- ").context("Uso: /team start audit|debug|review [--max-tokens N] [--max-seconds N] [--max-cost-usd N] [--allow-write] [--cross-model-review] [--consultant-model ALIAS] [--without-project-memory] [--budget-usd N] -- objetivo")?;
     ensure!(!objective.trim().is_empty(), "objective is required");
     let args =
         StartArgs::try_parse_from(std::iter::once("start").chain(options.split_whitespace()))?;
@@ -396,6 +671,11 @@ pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
         max_seconds: args.max_seconds,
         max_cost_usd: args.max_cost_usd,
         allow_write: args.allow_write,
+        cross_model_review: args.cross_model_review,
+        consultant_model: args.consultant_model,
+        without_project_memory: args.without_project_memory,
+        budget_usd: args.budget_usd,
+        plan: false,
     };
     options.body()?;
     Ok((options, objective.trim().into()))
@@ -429,6 +709,19 @@ mod tests {
             .is_err(),
             "write scope needs --execution cooperative"
         );
+        let (cross, _) = parse_start(
+            "review --allow-write --cross-model-review --consultant-model deepseek -- check it",
+        )?;
+        let cross = cross.body()?;
+        assert_eq!(cross["cooperative"]["cross_model_review"], true);
+        assert_eq!(
+            cross["cooperative"]["role_models"]["consultant"],
+            "deepseek"
+        );
+        assert!(
+            parse_start("review --cross-model-review -- check it").is_err(),
+            "cross-model review needs a team that writes"
+        );
         assert!(
             ExecutionOptions {
                 template: Some("audit".into()),
@@ -443,6 +736,111 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn planning_sends_the_plan_mode_and_never_with_a_team() -> Result<()> {
+        let plan = ExecutionOptions {
+            plan: true,
+            ..Default::default()
+        };
+        assert_eq!(plan.body()?["mode"], "plan");
+        let team = ExecutionOptions {
+            execution: "cooperative".into(),
+            plan: true,
+            ..Default::default()
+        };
+        assert!(team.body().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_budget_reaches_the_task_in_every_mode() -> Result<()> {
+        let individual = ExecutionOptions {
+            execution: "individual".into(),
+            budget_usd: Some(3.0),
+            ..Default::default()
+        };
+        assert_eq!(individual.body()?["budget_usd"], 3.0);
+        let (team, _) = parse_start("audit --budget-usd 4 -- inspect")?;
+        assert_eq!(team.body()?["budget_usd"], 4.0);
+        let invalid = ExecutionOptions {
+            budget_usd: Some(0.0),
+            ..Default::default()
+        };
+        assert!(invalid.body().is_err());
+        let text = cost_summary(&json!({
+            "task_id":"t1","budget_usd":2.0,
+            "total":{"cost_usd":1.2345,"calls":6,"turns":2,"cache_read_ratio":0.4},
+            "by_model":[{"model":"opus","cost_usd":1.2,"calls":5,"input_tokens":90000,"output_tokens":3000,"cache_read_ratio":0.45}],
+            "by_depth":[{"depth":0,"cost_usd":1.0},{"depth":1,"cost_usd":0.2345}],
+            "hints":["Child agents spent 19% of the task."]
+        }));
+        assert!(
+            text.contains(
+                "Tarea t1 · US$1.2345 · 6 llamadas en 2 turnos · caché 40% · presupuesto US$2.00"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  opus · US$1.2000 · 5 llamadas · 90000 entrada / 3000 salida tokens · caché 45%"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("subagentes nivel 1 · US$0.2345"), "{text}");
+        assert!(
+            text.contains("Para gastar menos:\n  - Child agents spent 19% of the task."),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn project_memory_is_on_unless_the_operator_starts_fresh() -> Result<()> {
+        let (options, _) = parse_start("audit -- inspect")?;
+        assert_eq!(
+            options.body()?["cooperative"]["without_project_memory"],
+            false
+        );
+        let (options, _) = parse_start("audit --without-project-memory -- inspect")?;
+        assert_eq!(
+            options.body()?["cooperative"]["without_project_memory"],
+            true
+        );
+        let text = memory_summary(&json!({"items":[
+            {"task_id":"t1","state":"discarded","claim":"storage skips the check","reason":"the gateway rejects first","same_snapshot":false}
+        ]}));
+        assert!(text.contains("- t1 · discarded: storage skips the check — the gateway rejects first (snapshot anterior)"), "{text}");
+        assert!(memory_summary(&json!({"items":[]})).contains("Ningún equipo anterior"));
+        Ok(())
+    }
+
+    #[test]
+    fn summary_shows_models_and_consultations() {
+        let snapshot = json!({"team":{"task_id":"t","state":"active","template":"review","default_model":"opus","options":{"cross_model_review":true},"members":[
+            {"id":"a","name":"analyst","role":"analyst","state":"inactive","access":"read","claimed_paths":[]},
+            {"id":"c","name":"consultant-1","role":"consultant","model":"deepseek","state":"terminated","claimed_paths":[],"consult":{"outcome":"answered","tokens_used":1200,"budget_tokens":150000}}
+        ]}});
+        let text = summary(&snapshot);
+        assert!(
+            text.contains("analyst (a) · analyst · opus · inactive"),
+            "{text}"
+        );
+        assert!(text.contains("consultant-1 (c) · consultant · deepseek · respondió · 1200/150000 tokens · terminated"), "{text}");
+        assert!(text.contains("Revisión cruzada"), "{text}");
+        let spent = json!({"team":{"task_id":"t","state":"active","template":"review","members":[],"usage_by_model":[
+            {"model":"opus","activations":2,"input_tokens":1500,"output_tokens":300,"cost_usd":0.07,"reserved_tokens":0,"uncertain_tokens":0,"estimated_open_cost_usd":0.0},
+            {"model":"deepseek","activations":1,"input_tokens":3000,"output_tokens":400,"cost_usd":0.01,"reserved_tokens":0,"uncertain_tokens":500,"estimated_open_cost_usd":0.004}
+        ]}});
+        let text = summary(&spent);
+        assert!(
+            text.contains(
+                "  opus · 2 activaciones · 1500 entrada / 300 salida tokens · US$0.0700\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("deepseek · 1 activaciones · 3000 entrada / 400 salida tokens · US$0.0100 · 500 tokens reservados o inciertos (US$0.0040)"), "{text}");
+    }
+
     #[test]
     fn names_are_exact_and_ambiguous_names_fail() -> Result<()> {
         let snapshot =

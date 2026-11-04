@@ -102,6 +102,11 @@ fn config() -> Config {
             input_per_million: None,
             output_per_million: None,
             parameters: Default::default(),
+            notes: None,
+            team_access: Default::default(),
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+            prompt_cache: false,
         },
     );
     c.primary = "fixture".into();
@@ -143,6 +148,7 @@ async fn repository_instructions_cannot_grant_revoked_write_authority() -> Resul
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -216,6 +222,7 @@ async fn authorized_execution_keeps_original_arguments_while_durable_copies_are_
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -259,6 +266,7 @@ async fn permission_reload_cancels_active_and_queued_turns() -> Result<()> {
         mode: Default::default(),
         execution: Default::default(),
         cooperative: None,
+        budget_usd: None,
     };
     let mut events = engine.events.subscribe();
     let first_engine = engine.clone();
@@ -346,6 +354,7 @@ async fn complete_turn_persists_replays_and_preserves_user_changes() -> Result<(
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -389,6 +398,7 @@ async fn complete_turn_persists_replays_and_preserves_user_changes() -> Result<(
                     mode: Default::default(),
                     execution: Default::default(),
                     cooperative: None,
+                    budget_usd: None,
                 },
                 CancellationToken::new()
             )
@@ -428,6 +438,7 @@ async fn cancellation_seals_turn_and_keeps_history() -> Result<()> {
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             token,
         )
@@ -554,6 +565,7 @@ async fn tool_output_secrets_never_reach_history_or_events() -> Result<()> {
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -647,6 +659,7 @@ async fn shell_output_streams_as_redacted_events_before_completion() -> Result<(
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -740,6 +753,7 @@ impl LanguageModel for OrchestrationModel {
                     usage: Usage {
                         input_tokens: if first_user == "child:big" { 900 } else { 10 },
                         output_tokens: 10,
+                        ..Default::default()
                     },
                     ..Default::default()
                 })
@@ -812,6 +826,7 @@ fn delegate(workspace: &tempfile::TempDir, prompt: &str) -> RunRequest {
         mode: Default::default(),
         execution: Default::default(),
         cooperative: None,
+        budget_usd: None,
     }
 }
 
@@ -1108,6 +1123,7 @@ fn delegate_ws(workspace: &tempfile::TempDir, prompt: &str) -> RunRequest {
         mode: Default::default(),
         execution: Default::default(),
         cooperative: None,
+        budget_usd: None,
     }
 }
 
@@ -1201,6 +1217,7 @@ async fn session_controls_are_audited_and_auto_compaction_preserves_canonical_hi
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
@@ -1296,11 +1313,113 @@ async fn auto_effort_does_not_stop_a_turn_below_the_configured_output_ceiling() 
                 mode: Default::default(),
                 execution: Default::default(),
                 cooperative: None,
+                budget_usd: None,
             },
             CancellationToken::new(),
         )
         .await?;
     assert_eq!(result.text, "finished within the configured ceiling");
     assert_eq!(result.usage.output_tokens, 3_000);
+    Ok(())
+}
+
+/// A provider that writes the prompt prefix to its cache on the first call
+/// and reads it back on the second.
+struct CachingModel(AtomicUsize);
+#[async_trait]
+impl LanguageModel for CachingModel {
+    async fn infer(
+        &self,
+        _: &Config,
+        _: &str,
+        _: &[Message],
+        _: &[ToolDefinition],
+        _: CancellationToken,
+        _: mpsc::Sender<Delta>,
+    ) -> Result<Completion> {
+        Ok(if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            Completion {
+                calls: vec![ToolCall {
+                    id: "status".into(),
+                    name: "context_status".into(),
+                    arguments: json!({}),
+                    provider_data: serde_json::Value::Null,
+                }],
+                usage: Usage {
+                    input_tokens: 10_000,
+                    output_tokens: 100,
+                    cache_write_tokens: 9_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        } else {
+            Completion {
+                text: "done".into(),
+                usage: Usage {
+                    input_tokens: 10_500,
+                    output_tokens: 50,
+                    cache_read_tokens: 9_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_turn_is_charged_the_cache_prices_of_its_cached_tokens() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let workspace = tempfile::tempdir()?;
+    let mut cfg = config();
+    cfg.policy.write = false;
+    cfg.policy.shell = false;
+    cfg.auto_skills = false;
+    cfg.policy.allowed_tools = vec!["context_status".into()];
+    let model = cfg.models.get_mut("fixture").expect("fixture model");
+    model.input_per_million = Some(3.0);
+    model.output_per_million = Some(15.0);
+    model.cache_read_per_million = Some(0.3);
+    model.cache_write_per_million = Some(3.75);
+    let engine = Engine::with_components(
+        home.path().into(),
+        "default".into(),
+        cfg,
+        Arc::new(CachingModel(AtomicUsize::new(0))),
+        Arc::new(FixtureSandbox {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+    )?;
+    let result = engine
+        .run(
+            Scope::local(),
+            RunRequest {
+                session_id: None,
+                workspace: Some(workspace.path().to_string_lossy().into_owned()),
+                prompt: "check the context twice".into(),
+                model: None,
+                effort: Default::default(),
+                bridge: false,
+                mode: Default::default(),
+                execution: Default::default(),
+                cooperative: None,
+                budget_usd: None,
+            },
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(result.text, "done");
+    assert_eq!(result.usage.cache_write_tokens, 9_000);
+    assert_eq!(result.usage.cache_read_tokens, 9_000);
+    assert_eq!(result.usage.input_tokens, 20_500);
+    let first = (1_000.0 * 3.0 + 9_000.0 * 3.75 + 100.0 * 15.0) / 1e6;
+    let second = (1_500.0 * 3.0 + 9_000.0 * 0.3 + 50.0 * 15.0) / 1e6;
+    assert!(
+        (result.cost_usd - (first + second)).abs() < 1e-9,
+        "{} != {}",
+        result.cost_usd,
+        first + second
+    );
     Ok(())
 }

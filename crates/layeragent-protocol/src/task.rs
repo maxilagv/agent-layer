@@ -120,6 +120,9 @@ pub struct Task {
     pub execution: crate::ExecutionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
+    /// Most the task may spend, child agents included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -147,6 +150,10 @@ pub struct NewTask {
     pub execution: crate::ExecutionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooperative: Option<crate::CooperativeOptions>,
+    /// Most the task may spend, in US dollars at the configured prices,
+    /// child agents included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
 }
 impl NewTask {
     /// Content whose hash makes a repeated request idempotent. The key itself is
@@ -158,7 +165,7 @@ impl NewTask {
             .as_ref()
             .map(|options| options.normalized(None))
             .transpose()?;
-        let body = serde_json::to_vec(&(
+        let fields = (
             &self.workspace,
             &self.session_id,
             &self.objective,
@@ -169,7 +176,12 @@ impl NewTask {
             self.bridge,
             self.execution,
             cooperative,
-        ))?;
+        );
+        // A task without a budget keeps the fingerprint it always had.
+        let body = match self.budget_usd {
+            None => serde_json::to_vec(&fields)?,
+            Some(budget) => serde_json::to_vec(&(fields, budget))?,
+        };
         Ok(hex::encode(Sha256::digest(body)))
     }
 }
@@ -250,12 +262,20 @@ mod tests {
             bridge: false,
             execution: crate::ExecutionMode::Delegated,
             cooperative: None,
+            budget_usd: None,
         };
         let mut other = base.clone();
         other.objective = "ship it".into();
         assert_ne!(
             base.fingerprint().expect("fingerprint"),
             other.fingerprint().expect("fingerprint")
+        );
+        let mut budgeted = base.clone();
+        budgeted.budget_usd = Some(2.0);
+        assert_ne!(
+            base.fingerprint().expect("fingerprint"),
+            budgeted.fingerprint().expect("fingerprint"),
+            "a budget is part of the request"
         );
     }
 }

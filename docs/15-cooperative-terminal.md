@@ -117,11 +117,150 @@ ends, worktrees are removed and unsubmitted changes are kept as retained patches
 Your own uncommitted work in the workspace is preserved: integration only applies
 the approved patch.
 
+## What earlier teams concluded
+
+Each team starts from what earlier teams concluded on the same workspace:
+findings they discarded or left inconclusive (dead ends) and findings they
+reviewed or reproduced. Members get the eight most recent in their first
+prompt, marked as earlier peer conclusions rather than instructions, and
+`team_memory` searches them (by state or text) with each one's latest
+evidence and whether it was recorded on the workspace snapshot the team is
+on now. Conclusions of a team count once it has ended.
+
+This memory is private: only teams of the same tenant and principal on the
+same workspace path see each other's conclusions. Start a team without it:
+
+```bash
+layeragent run "Audit the session code from scratch" --workspace . \
+  --execution cooperative --template audit --without-project-memory
+layeragent team memory TASK_ID                         # earlier conclusions
+layeragent team export TASK_ID --format dead-ends > MUERTOS.md
+```
+
+The dead-ends export lists, as Markdown, the team's discarded and
+inconclusive findings with each step of their history and their evidence,
+the patches rejected or withdrawn, and the dead ends earlier teams on the
+workspace recorded. It contains project content and is redacted like any
+export; review it before sharing it.
+
+## Controlling one member
+
+```bash
+layeragent team pause TASK_ID --member analyst --reason "it is looping"
+layeragent team resume TASK_ID --member analyst
+layeragent team retire TASK_ID analyst --reason "wrong approach"
+```
+
+- **Pause** holds one member while the rest of the team works. Its running
+  activation ends at its next safe boundary (before its next model call)
+  instead of holding a concurrency slot; it is not activated again, and
+  messages to it wait. A team pause and resume do not release it. Idle
+  notices to the coordinator name the members you paused.
+- **Resume** releases it: it is activated again with a runtime notice to
+  continue from its canonical session, followed by the messages that arrived
+  meanwhile.
+- **Retire** removes a member for good; the coordinator cannot be retired.
+  Its running activation is fenced at once and an in-flight provider call is
+  cancelled; what that call had reserved stays charged as uncertain. Its work
+  goes back to the coordinator as pending, its path reservations are
+  released, its open patches are withdrawn (they stay listed), and changes
+  handed to it are kept as retained patches. Once its activation has stopped,
+  its unsubmitted worktree changes are kept as a retained patch and the
+  worktree is removed. Members waiting on its answers are told, its own open
+  questions are resolved, and a retired consultant's consultation ends as
+  `retired`.
+
+`team show` marks paused and retired members. In the interactive terminal use
+`/team pause --member NAME [reason]`, `/team resume --member NAME` and
+`/team retire NAME [reason]`.
+
 Other commands are `team messages`, `team work`, `team objections`,
 `team priority TASK_ID WORK_ID VALUE`, `team close TASK_ID` and
 `team cancel TASK_ID`. Query commands support JSON. Member targets accept an
 exact ID or an unambiguous exact name. Commands use the observed team revision;
 conflicts are displayed instead of silently applying the action to changed state.
+
+## Teams on several models
+
+A team can mix models. Each configured model alias (see the annotated
+[example configuration](../examples/config.toml)) can run members: the team's
+own model runs members without one, `team_add_member` accepts `model`, and
+`cooperative.role_models` sets a model per role. `team_members` shows every
+member's model and the configured aliases, with their model ids, prices, team
+access and your notes, never endpoints or credentials. `team show` and exports
+list each member's model and what each model consumed.
+
+Sending a team's code to a provider is your decision, so each model states
+what it may do in a team:
+
+```toml
+[models.second]
+provider = "second"
+id = "YOUR_SECOND_MODEL"
+context_window = 65536
+team_access = "read"   # "write" (default), "read" or "none"
+notes = "strong at reading large modules"
+```
+
+- **`write`** models run any member, including writers.
+- **`read`** models run members that read, review and approve patches and
+  answer consultations. A member on one cannot switch to writing, and work
+  with reserved paths cannot be handed to it; it hands work that needs file
+  changes to a member on a model that can write.
+- **`none`** models never run a member: they are refused as the team's model,
+  as a role model, for `team_add_member` and for `team_consult`, and are left
+  out of `team_members`.
+
+A team with `--allow-write` needs at least one `write` model. A change to
+these settings applies from each member's next activation: when it would run
+a member on a model that may no longer do so, the supervisor blocks the team
+with the reason instead, and `team resume` continues once the setting allows
+that member's model again. Notes are one line of
+at most 200 bytes; when more than one model may run in the team, each member's
+prompt lists the models with their access and notes.
+
+```bash
+layeragent run "Review and fix the parser" --workspace . \
+  --execution cooperative --template review --allow-write \
+  --cross-model-review --consultant-model second
+```
+
+- **Consultants.** Any member can call `team_consult` with a question and,
+  optionally, a model alias, a token budget (`max_tokens`, 5 000 to 600 000;
+  150 000 by default), a work item or a patch. The runtime brings in a
+  consultant: a read-only member on that model (by default the team's
+  `consultant` role model, then the team's model) that receives the question as
+  its first message. It answers the member that asked, and is then retired by
+  the runtime. It can ask that member one clarifying question and wait for the
+  reply. It never takes work, switches to writing, adds members, consults
+  others or closes the team, never receives broadcasts, and does not count
+  against `max_members`. Up to two consultations run at once and eight over the
+  life of a team. The model must be configured, able to call tools, allowed by
+  the privacy settings (`allowed_providers`, `local_models_only`) and priced when
+  the team has a cost ceiling. A consultant that ends without answering, fails or spends its
+  budget is retired too, its question is resolved, and the member that asked
+  gets a runtime notice; the team carries on.
+- **Cross-model review.** `--cross-model-review` (`cooperative.cross_model_review`
+  in the API) needs `--allow-write` and at least two configured models with
+  different model ids. A patch is then approved only by a member or consultant
+  whose activation runs a different model than the one whose activation
+  submitted it; anyone may still reject it. The model of every activation is
+  recorded when it starts, and each patch records its author's and reviewer's
+  model. Models are compared by id, lowercase and without a vendor prefix, so
+  two aliases or providers serving the same model id count as the same model.
+  `team_consult` with a `patch_id` brings in a reviewer on another model whose
+  decision answers the consultation.
+
+`team show` lists, per model the team ran, its activations, input and output
+tokens and cost from settled usage, plus the tokens still reserved or
+uncertain at their estimate. Costs use the prices you configured and are zero
+for an unpriced model; they are not provider invoices.
+
+A consultation's budget is checked against actual consumption before each of
+its model calls, so the call that crosses the budget completes: a consultation
+can exceed its budget by at most one call. Calls whose consumption is unknown
+count at their reserved estimate. The team's token, cost and time limits still
+apply to every consultation.
 
 ## Interactive terminal
 
@@ -138,7 +277,8 @@ conflicts are displayed instead of silently applying the action to changed state
 ```
 
 `/execution` selects the mode for subsequent prompts. `/team start` explicitly
-creates a cooperative task; add `--allow-write` before `--` to let members write. `/team attach` only observes an existing task;
+creates a cooperative task; add `--allow-write` before `--` to let members write
+and `--without-project-memory` to start without earlier conclusions. `/team attach` only observes an existing task;
 resuming blocked execution requires `/team resume`. The panel opens automatically,
 uses a side view in wide terminals and a switchable view in compact terminals,
 and remains available after completion. Approvals take visual priority and name
@@ -188,14 +328,24 @@ The existing task creation endpoint accepts `execution` and `cooperative` option
 `team_member_event` envelopes identifying the member and activation. Team resource
 queries include `deliveries`, `finding_revisions`, `patches` and `claims`; JSON
 exports also include attributed events and patches. Creating a task with
-`cooperative.scope.allow_write` requires a task policy that allows writes. `GET /v1/tasks/{id}/team/{resource}?tail=N` returns the most
+`cooperative.scope.allow_write` requires a task policy that allows writes, and
+`cooperative.cross_model_review` requires write scope and two models allowed in
+teams with different model ids. A team model, role model or write scope that
+the models' `team_access` does not allow is refused. Member rows carry `last_model` and, for consultants,
+`consult` (who asked, the question, budget, tokens used and outcome); the
+snapshot carries `default_model` and `usage_by_model`. `GET /v1/tasks/{id}/team/{resource}?tail=N` returns the most
 recent rows of a resource (at most 200), and
 `GET /v1/tasks/{id}/team/threads/{message}` returns the reply chain containing a
-message. A task-level correction on a cooperative task is refused; send an
+message. `POST /v1/tasks/{id}/team/commands/{pause|resume|retire}` with a
+`member` applies to that member alone (`retire` requires one); member rows
+carry `operator_hold` (`paused` or `retired`). `GET /v1/tasks/{id}/team/memory`
+(optional `state`, `query`, `limit`) lists earlier conclusions on the task's
+workspace, `cooperative.without_project_memory` starts a team without them, and
+the JSON export carries the dead-ends document as `dead_ends`. A task-level correction on a cooperative task is refused; send an
 operator instruction as a team message instead. Reads and writes retain task, project and principal checks.
 
 Read the [implementation status](10-implementation-status.md) and current
 fingerprinted [verification report](verification.json) for executed checks and
 blocked qualification. Web/desktop team interfaces, native confinement checks of
-worktree writers, investigation memory, cross-mode quality evaluation and live-provider effectiveness
-remain separate work.
+worktree writers, cross-mode quality evaluation, live teams that mix providers
+and live-provider effectiveness remain separate work.

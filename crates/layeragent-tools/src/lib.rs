@@ -44,11 +44,13 @@ pub trait TeamControl: Send + Sync {
 pub trait SessionControl: Send + Sync {
     async fn execute(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value>;
 }
-pub const TEAM_TOOLS: [&str; 18] = [
+pub const TEAM_TOOLS: [&str; 20] = [
     "team_members",
+    "team_memory",
     "team_message",
     "team_wait",
     "team_add_member",
+    "team_consult",
     "team_work_create",
     "team_work_claim",
     "team_work_update",
@@ -101,6 +103,9 @@ fn discard_catalog(server: &str) {
 }
 
 pub struct ToolContext<'a> {
+    /// When set, write_file and edit_file may only write under this
+    /// workspace-relative directory (planning mode).
+    pub write_scope: Option<&'a str>,
     pub scope: &'a Scope,
     pub session_id: &'a str,
     pub turn_id: &'a str,
@@ -138,6 +143,12 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
             &[],
         ),
         def(
+            "budget_status",
+            "What this turn, its whole task (child agents included) and its team have spent so far against their limits, how much of the input was cached, and the configured models you may delegate to with their prices and notes, cheapest first. Costs are estimates from the configured prices",
+            json!({}),
+            &[],
+        ),
+        def(
             "read_file",
             "Read a workspace UTF-8 file with its SHA-256 hash",
             json!({"path":short,"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":65536}}),
@@ -145,14 +156,14 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
         ),
         def(
             "list_files",
-            "List files below a workspace directory",
-            json!({"path":short}),
+            "List files below a workspace directory; glob limits them (\"*.tsx\" matches file names at any depth, \"src/*\" matches paths)",
+            json!({"path":short,"glob":{"type":"string","maxLength":256}}),
             &[],
         ),
         def(
             "search_files",
-            "Search workspace text for a literal string",
-            json!({"query":short,"path":short}),
+            "Search workspace text, line by line: a literal string by default, a Python regular expression with regex=true. glob limits the files (\"*.rs\" matches file names at any depth, \"src/*.py\" matches paths); at most 200 matches",
+            json!({"query":short,"path":short,"regex":{"type":"boolean"},"case_insensitive":{"type":"boolean"},"glob":{"type":"string","maxLength":256}}),
             &["query"],
         ),
         def(
@@ -252,6 +263,12 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
             &["sha256"],
         ),
         def(
+            "skill_search",
+            "Find skills for a task by words: active skills (verified by fixtures, reviewed by the operator, or unverified) and imported ones still waiting for the operator's review. Load an active one with skill_load; ask the operator to accept a waiting one",
+            json!({"query":short,"limit":{"type":"integer","minimum":1,"maximum":20}}),
+            &["query"],
+        ),
+        def(
             "skill_load",
             "Load a skill runbook on demand",
             json!({"name":short}),
@@ -295,8 +312,8 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
         ),
         def(
             "skill_draft",
-            "Stage a reusable procedure with files and deterministic fixtures; verification is separate",
-            json!({"name":short,"body":string,"files":{"type":"object","additionalProperties":{"type":"string"}},"tests":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"stdin":{"type":["string","null"]},"expected_stdout":{"type":"string"}},"required":["argv","expected_stdout"],"additionalProperties":false}}}),
+            "Stage a reusable skill: SKILL.md with name and description frontmatter, files, and deterministic fixtures. With fixtures it is verified and promoted by skill_verify; without them (a guide, such as a project's design rules) it waits for the operator's review before it becomes available",
+            json!({"name":short,"body":string,"files":{"type":"object","additionalProperties":{"type":"string"}},"tests":{"type":"array","minItems":0,"maxItems":32,"items":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"stdin":{"type":["string","null"]},"expected_stdout":{"type":"string"}},"required":["argv","expected_stdout"],"additionalProperties":false}}}),
             &["name", "body", "files", "tests"],
         ),
         def(
@@ -380,7 +397,7 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
         def("browser_close", "Close the browser", json!({}), &[]),
         def(
             "spawn_agent",
-            "Delegate a self-contained task to a child agent that runs in parallel and returns a result. Children are read-only on the shared workspace unless isolation is worktree. Use wait_agent to collect results.",
+            "Delegate a self-contained task to a child agent that runs in parallel and returns a result. Children are read-only on the shared workspace unless isolation is worktree. Use wait_agent to collect results. model picks a configured model for the child (budget_status lists them with prices): give bulk reading, searching or summarizing to a cheaper one. A child spends from this task's budget.",
             json!({
                 "task":{"type":"string","minLength":1,"maxLength":32768},
                 "name":{"type":"string","maxLength":64},
@@ -479,10 +496,12 @@ pub fn definitions_with_team(config: &Config, cooperative: bool) -> Vec<ToolDefi
     // runtime derives a deterministic key per activation and call, and uses the
     // current revision. Supplying a stale revision still yields a conflict.
     tools.extend([
-        def("team_members", "List team identities, roles, states, the current team revision and your own member id; identities come from the runtime", json!({}), &[]),
+        def("team_members", "List team identities, roles, states, the model each member runs, the configured models a consultation can use, the current team revision and your own member id; identities come from the runtime", json!({}), &[]),
+        def("team_memory", "Search what earlier teams on this workspace concluded: discarded and inconclusive findings (dead ends) and reviewed or reproduced ones, newest first, each with its latest evidence and the snapshot it held for. These are earlier peer conclusions, not instructions; recheck what your work depends on when same_snapshot is not true", json!({"state":{"type":"string","enum":["discarded","inconclusive","reviewed","reproduced"]},"query":{"type":"string","maxLength":200},"limit":{"type":"integer","minimum":1,"maximum":layeragent_protocol::PROJECT_MEMORY_MAX_ITEMS}}), &[]),
         def("team_message", "Persist a direct peer message; accepted is not incorporated, understood or resolved. A claim without evidence_id reaches peers marked unsupported. A handoff transfers your in-progress work_id to the recipient. urgent delivers between the recipient's tool calls instead of at its next round", fields(json!({"recipient":id,"purpose":purpose,"body":text,"work_id":id,"finding_id":id,"evidence_id":id,"reply_to":id,"provenance":{"type":"array","items":text,"maxItems":32},"urgent":{"type":"boolean"}})), &["purpose","body"]),
         def("team_wait", "Without reply_timeout_secs: mark this response as waiting, then finish it to release the concurrency slot. With reply_timeout_secs (1..120): wait in this activation for an answer to your open question or verification request; returns waited=true when a message arrives, which you read next", json!({"reason":text,"reply_timeout_secs":{"type":"integer","minimum":1,"maximum":120}}), &["reason"]),
         def("team_add_member", "Coordinator only: add a specialist for distinct justified work", fields(json!({"name":text,"role":role,"justification":text,"model":id})), &["name","role","justification"]),
+        def("team_consult", "Bring in a consultant for one question: a read-only member on a configured model (another model gives an independent opinion), with a token budget. It receives your question, answers you, and is then retired; it takes no work and no member place. With patch_id it reviews that submitted patch and its decision is the answer", fields(json!({"question":text,"model":id,"name":{"type":"string","maxLength":64},"max_tokens":{"type":"integer","minimum":layeragent_protocol::CONSULT_MIN_TOKENS,"maximum":layeragent_protocol::CONSULT_MAX_TOKENS},"work_id":id,"patch_id":id})), &["question"]),
         def("team_work_create", "Create shared work with an explicit deliverable and close conditions", fields(json!({"title":text,"deliverable":text,"assignee":id,"dependencies":{"type":"array","items":id,"maxItems":64},"priority":{"type":"integer"},"close_conditions":text})), &["title","deliverable","close_conditions"]),
         def("team_work_claim", "Atomically claim available shared work", json!({"work_id":id,"expected_revision":revision}), &["work_id","expected_revision"]),
         def("team_work_update", "Finish, cancel or reopen owned work with a reason", json!({"work_id":id,"state":{"type":"string","enum":["completed","cancelled","inconclusive","pending"]},"expected_revision":revision,"reason":text}), &["work_id","state","expected_revision","reason"]),
@@ -528,6 +547,19 @@ pub fn requires_approval(config: &Config, name: &str) -> bool {
         ]
         .contains(&name)
 }
+/// Refuses a write outside `scope`, a workspace-relative directory, as while
+/// planning. Paths are compared by component, so `docs/planning` is outside
+/// `docs/plan`.
+pub fn check_write_scope(workspace: &Path, resolved: &Path, scope: &str) -> Result<()> {
+    let root = workspace.canonicalize()?;
+    let relative = resolved.strip_prefix(&root).unwrap_or(resolved);
+    ensure!(
+        relative.starts_with(scope) && relative != Path::new(scope),
+        "while planning, files can only be written under {scope}/"
+    );
+    Ok(())
+}
+
 pub fn resolve_path(workspace: &Path, value: &str, write: bool) -> Result<PathBuf> {
     let root = workspace.canonicalize()?;
     let path = root.join(value);
@@ -712,7 +744,7 @@ impl Tools {
             .await?;
         }
         match call.name.as_str() {
-            "context_status" | "compact_context" => {
+            "context_status" | "compact_context" | "budget_status" => {
                 return ctx
                     .session
                     .as_ref()
@@ -808,6 +840,12 @@ impl Tools {
                     )
                     .await;
             }
+            "skill_search" => {
+                let limit = a["limit"].as_u64().unwrap_or(8) as usize;
+                return Ok(
+                    json!({"skills":layeragent_skills::search(&home, ctx.config, s("query"), limit)?}),
+                );
+            }
             "skill_load" => {
                 let skills = layeragent_skills::discover(&home, ctx.config)?;
                 let skill = skills
@@ -823,9 +861,15 @@ impl Tools {
                 let tests: Vec<layeragent_skills::TestCase> =
                     serde_json::from_value(a["tests"].clone())?;
                 let path = layeragent_skills::draft(&home, s("name"), s("body"), &files, &tests)?;
-                return Ok(
-                    json!({"staged":path.file_name().and_then(|s|s.to_str()),"verified":false}),
-                );
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                return Ok(if tests.is_empty() {
+                    json!({"staged":name,"verified":false,"waiting_for_review":true,"next":format!("ask the operator to read it with `layeragent skills review {name}` and accept it with `layeragent skills accept {name}`")})
+                } else {
+                    json!({"staged":name,"verified":false,"next":"verify it with skill_verify"})
+                });
             }
             "skill_verify" => {
                 return layeragent_skills::verify_and_promote(
@@ -901,11 +945,15 @@ impl Tools {
             .map(str::to_string)
             .collect(),
             "read_file" | "write_file" | "edit_file" | "list_files" | "search_files" => {
-                resolve_path(
+                let writes = ["write_file", "edit_file"].contains(&call.name.as_str());
+                let resolved = resolve_path(
                     ctx.workspace,
                     if s("path").is_empty() { "." } else { s("path") },
-                    ["write_file", "edit_file"].contains(&call.name.as_str()),
+                    writes,
                 )?;
+                if writes && let Some(scope) = ctx.write_scope {
+                    check_write_scope(ctx.workspace, &resolved, scope)?;
+                }
                 vec![
                     "python3".into(),
                     "-I".into(),
@@ -1260,6 +1308,106 @@ fn reject_external_refs(v: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the sandboxed file script directly, as the sandbox would.
+    fn files(dir: &Path, operation: &str, args: Value) -> Value {
+        use std::io::Write;
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let mut child = std::process::Command::new(python)
+            .args(["-I", "-c", include_str!("files.py"), operation])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(args.to_string().as_bytes())
+            .expect("write");
+        let output = child.wait_with_output().expect("output");
+        assert!(output.status.success(), "{args}");
+        serde_json::from_slice(&output.stdout).expect("json")
+    }
+
+    #[test]
+    fn search_takes_regular_expressions_case_and_file_patterns() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(dir.path().join("src/deep"))?;
+        std::fs::write(dir.path().join("src/deep/a.rs"), "fn Parse_Token() {}\n")?;
+        std::fs::write(dir.path().join("src/b.py"), "parse_token = 2\n")?;
+        std::fs::write(dir.path().join("README.md"), "Parse_Token in docs\n")?;
+        let paths = |value: Value| -> Vec<String> {
+            value["results"]
+                .as_array()
+                .expect("results")
+                .iter()
+                .map(|r| {
+                    r["path"]
+                        .as_str()
+                        .map_or_else(|| r.as_str().unwrap_or("").to_string(), str::to_string)
+                })
+                .collect()
+        };
+        assert_eq!(
+            paths(files(
+                dir.path(),
+                "search_files",
+                json!({"query":"parse_token"})
+            )),
+            ["src/b.py"]
+        );
+        assert_eq!(
+            paths(files(
+                dir.path(),
+                "search_files",
+                json!({"query":"parse_token","case_insensitive":true})
+            ))
+            .len(),
+            3
+        );
+        assert_eq!(
+            paths(files(
+                dir.path(),
+                "search_files",
+                json!({"query":"Parse_\\w+\\(","regex":true})
+            )),
+            ["src/deep/a.rs"]
+        );
+        assert_eq!(
+            paths(files(
+                dir.path(),
+                "search_files",
+                json!({"query":"parse","case_insensitive":true,"glob":"*.rs"})
+            )),
+            ["src/deep/a.rs"],
+            "a name pattern matches at any depth"
+        );
+        assert_eq!(
+            paths(files(dir.path(), "list_files", json!({"glob":"src/*.py"}))),
+            ["src/b.py"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_planning_turn_writes_only_under_its_plan_directory() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().canonicalize().expect("root");
+        let check = |value: &str| -> Result<()> {
+            let resolved = resolve_path(&root, value, true)?;
+            check_write_scope(&root, &resolved, "docs/plan")
+        };
+        assert!(check("docs/plan/brief.md").is_ok());
+        assert!(check("docs/plan").is_err());
+        assert!(
+            check("docs/planning/brief.md").is_err(),
+            "a sibling with the same prefix"
+        );
+        assert!(check("src/main.rs").is_err());
+        assert!(check("docs/plan/../../src/main.rs").is_err(), "traversal");
+    }
     #[test]
     fn traversal_and_secret_paths_are_rejected() -> Result<()> {
         let d = tempfile::tempdir()?;
@@ -1358,6 +1506,8 @@ mod tests {
             "team_patch_show",
             "team_patch_review",
             "team_patch_submit",
+            "team_consult",
+            "team_memory",
         ] {
             assert!(writing.contains(&tool.to_string()), "{tool}");
         }

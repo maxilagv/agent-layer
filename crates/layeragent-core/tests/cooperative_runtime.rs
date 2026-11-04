@@ -40,6 +40,11 @@ fn config() -> Config {
             input_per_million: None,
             output_per_million: None,
             parameters: Default::default(),
+            notes: None,
+            team_access: Default::default(),
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+            prompt_cache: false,
         },
     );
     c.primary = "fixture".into();
@@ -737,6 +742,7 @@ impl BoundaryFixture {
                     recipient: None,
                     reason: Some(format!("fixture {action}")),
                     priority: None,
+                    member: None,
                 },
             )
             .await?;

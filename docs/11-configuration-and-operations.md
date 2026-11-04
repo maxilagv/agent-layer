@@ -10,6 +10,8 @@ layeragent models
 layeragent doctor --json
 ```
 
+`layeragent profile` edits the `[operator]` table and leaves the rest of the file as it is.
+
 Use [examples/config.toml](../examples/config.toml) as an annotated reference. Keep runtime home outside workspaces and credential values outside the configuration file.
 
 ## Useful policy controls
@@ -25,6 +27,13 @@ Use [examples/config.toml](../examples/config.toml) as an annotated reference. K
 | `policy.limits` | Resource ceilings; delegated cgroups are opt-in and fail closed |
 | `privacy.local_models_only` | Forbid remote model endpoints |
 | `privacy.allowed_providers` | Restrict eligible providers and fallbacks |
+| `models.NAME.team_access` | What the model may do in a cooperative team: `write` (default), `read` or `none` |
+| `models.NAME.notes` | One line on the model's strengths, shown to team members choosing a model |
+| `models.NAME.prompt_cache` | Mark the reusable request prefix for Anthropic's prompt cache |
+| `operator.technical` | `none`, `some` or `expert`: fits what the agent builds and how it explains it |
+| `operator.language` / `publish` / `notes` | Answer language, where results get published, anything else in one line |
+| `operator.default_budget_usd` | Budget of tasks that set none (applied only to priced models) |
+| `models.NAME.cache_read_per_million` / `cache_write_per_million` | Prices of cached input; the input price when unset |
 | `browser.enabled` / `allow_domains` | Separate browser network policy |
 
 Default process ceilings include 120 CPU seconds, a 256 MiB individual-file limit and 256 open files. Memory/pid/cgroup quotas need workload-specific configuration and a supporting host. The service template additionally provides aggregate limits.

@@ -24,6 +24,39 @@ El estado se guarda fuera del workspace. Referenciá credenciales mediante varia
 
 El modo `privacy.local_models_only = true` restringe los modelos a endpoints locales. Para un entorno completamente sin conexiones externas también tenés que desactivar/restringir navegador, MCP, canales y red de herramientas.
 
+## Tu perfil, primero el plan y el presupuesto
+
+Contale al agente quién sos; lo usa para decidir qué construir y cómo explicarlo:
+
+```bash
+layeragent profile --technical none --language es --budget-usd 5 --publish "hosting estático"
+layeragent profile            # muestra el perfil
+```
+
+`--technical` acepta `none` (no técnico: prefiere lo más simple que puedas abrir o publicar, como una página HTML), `some` (seguís instrucciones y hacés cambios chicos) o `expert` (desarrollador). `--budget-usd` es el presupuesto de las tareas que no fijan otro, y solo se aplica si el modelo tiene precios configurados.
+
+Para que el agente planifique antes de construir:
+
+```bash
+layeragent run "Una página cinematográfica para vender bicicletas" --workspace . --plan
+```
+
+En modo plan investiga, escribe `docs/plan/` (`brief.md`, `stack.md`, `plan.md`, `acceptance.md`, `costs.md`) y te pide aprobación. No ejecuta comandos ni escribe fuera de `docs/plan/`. En la terminal interactiva usá `/plan <qué construir>`; cuando estés de acuerdo, `/build [notas]` construye lo aprobado.
+
+Para controlar el gasto, `--budget-usd 3` (o `/budget 3` en la terminal) fija lo máximo que puede gastar la tarea, contando sus subagentes. El agente recibe avisos al 50, 80 y 95 % y puede consultar `budget_status`. `layeragent cost TAREA` muestra lo gastado por modelo, cuánto vino de la caché y sugerencias para gastar menos. Los costos son estimados con los precios que configuraste.
+
+## Skills
+
+Las skills son guías que el agente carga cuando una tarea las necesita. El repositorio trae un set inicial (planificar un proyecto, elegir el stack, controlar costos, webs cinematográficas, 3D con three.js y tiendas):
+
+```bash
+layeragent skills import examples/skills
+layeragent skills review cinematic-web     # leela antes de activarla
+layeragent skills accept cinematic-web
+```
+
+Lo importado queda en cuarentena hasta que lo aceptás: el agente no lo usa hasta entonces, aunque `skill_search` puede sugerírtelo. También podés importar otros catálogos con formato `SKILL.md`, desde una carpeta o un repositorio Git `https`.
+
 ## Documentación
 
 - [README principal](../README.md): instalación, capacidades y comandos.

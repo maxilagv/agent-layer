@@ -76,6 +76,29 @@ enum Command {
         json: bool,
     },
     /// Interactive terminal client.
+    /// Tell the agent who you are: how technical, your language, a default
+    /// budget and where you publish. Without options it shows the profile.
+    Profile {
+        #[arg(long, value_parser = ["none", "some", "expert"])]
+        technical: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        budget_usd: Option<f64>,
+        #[arg(long)]
+        publish: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        /// Remove the profile before applying the options.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// What a task spent, per model and agent depth, with hints to spend less.
+    Cost {
+        task: String,
+        #[arg(long)]
+        json: bool,
+    },
     Tui {
         #[arg(short, long, default_value = ".")]
         workspace: PathBuf,
@@ -152,10 +175,14 @@ enum Command {
         action: String,
         provider: String,
     },
+    /// Skills: list, verify, versions, rollback; and for skills from
+    /// catalogs or without fixtures: import (a directory or an https Git
+    /// repository), quarantine, review, accept, reject.
     Skills {
-        #[arg(value_parser=["list","verify","versions","rollback"])]
+        #[arg(value_parser=["list","verify","versions","rollback","import","quarantine","review","accept","reject"])]
         #[arg(default_value = "list")]
         action: String,
+        /// The skill's name, or what to import.
         name: Option<String>,
         #[arg(long)]
         hash: Option<String>,
@@ -277,6 +304,11 @@ async fn entry() -> Result<()> {
                         input_per_million: None,
                         output_per_million: None,
                         parameters: Default::default(),
+                        notes: None,
+                        team_access: Default::default(),
+                        cache_read_per_million: None,
+                        cache_write_per_million: None,
+                        prompt_cache: false,
                     },
                 );
                 c.primary = "primary".into();
@@ -445,6 +477,50 @@ async fn entry() -> Result<()> {
             let client = client::Client::connect(&home, &profile).await?;
             client.print_turn(&session, &prompt, None, json).await?;
         }
+        Command::Profile {
+            technical,
+            language,
+            budget_usd,
+            publish,
+            notes,
+            clear,
+        } => {
+            let profile = setup::set_operator(
+                &home,
+                setup::OperatorUpdate {
+                    technical: technical.as_deref().map(str::parse).transpose()?,
+                    language,
+                    default_budget_usd: budget_usd,
+                    publish,
+                    notes,
+                    clear,
+                },
+            )?;
+            println!(
+                "Nivel técnico: {}\nIdioma: {}\nPresupuesto por defecto: {}\nPublicación: {}\nNotas: {}",
+                profile
+                    .technical
+                    .map_or("sin configurar", |level| level.as_str()),
+                profile.language.as_deref().unwrap_or("sin configurar"),
+                profile
+                    .default_budget_usd
+                    .map_or("sin configurar".to_string(), |budget| format!(
+                        "US${budget:.2}"
+                    )),
+                profile.publish.as_deref().unwrap_or("sin configurar"),
+                profile.notes.as_deref().unwrap_or("sin notas"),
+            );
+        }
+        Command::Cost { task, json } => {
+            team::identifier(&task)?;
+            let client = client::Client::connect(&home, &profile).await?;
+            let report = client.get(&format!("/v1/tasks/{task}/usage")).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", team::cost_summary(&report));
+            }
+        }
         Command::Tui { workspace, session } => {
             let client = client::Client::connect(&home, &profile).await?;
             let session = client.session(session, workspace.clone()).await?;
@@ -540,6 +616,69 @@ async fn entry() -> Result<()> {
                         &hash.context("--hash required")?,
                     )?;
                     println!("Skill version restored");
+                }
+                "import" => {
+                    let source = name.context("a directory or an https Git URL to import")?;
+                    let imported = if source.starts_with("https://") {
+                        skills_from_git(&state, &source)?
+                    } else {
+                        let path = PathBuf::from(&source).canonicalize()?;
+                        layeragent_skills::import(&state, &path, &path.to_string_lossy())?
+                    };
+                    for skill in &imported {
+                        match skill["status"].as_str() {
+                            Some("quarantined") => println!(
+                                "En cuarentena: {} · {}{}",
+                                skill["name"].as_str().unwrap_or("?"),
+                                skill["description"].as_str().unwrap_or(""),
+                                skill["scripts"]
+                                    .as_array()
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| format!(
+                                        " · incluye scripts: {}",
+                                        s.iter()
+                                            .filter_map(|v| v.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    ))
+                                    .unwrap_or_default()
+                            ),
+                            _ => println!(
+                                "Rechazada: {} · {}",
+                                skill["path"],
+                                skill["reason"].as_str().unwrap_or("")
+                            ),
+                        }
+                    }
+                    println!(
+                        "Leelas con `layeragent skills review NOMBRE` y activalas con `layeragent skills accept NOMBRE`."
+                    );
+                }
+                "quarantine" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&layeragent_skills::quarantined(&state)?)?
+                ),
+                "review" => {
+                    let review =
+                        layeragent_skills::review(&state, &name.context("skill name required")?)?;
+                    println!(
+                        "{} · {}\nOrigen: {}\nArchivos: {}\nScripts: {}\nEnlaces: {}\n\n{}",
+                        review["name"].as_str().unwrap_or("?"),
+                        review["description"].as_str().unwrap_or(""),
+                        review["source"].as_str().unwrap_or("desconocido"),
+                        review["files"],
+                        review["scripts"],
+                        review["links"],
+                        team::terminal_text(review["skill_md"].as_str().unwrap_or("")),
+                    );
+                }
+                "accept" => println!(
+                    "{}",
+                    layeragent_skills::accept(&state, &name.context("skill name required")?)?
+                ),
+                "reject" => {
+                    layeragent_skills::reject(&state, &name.context("skill name required")?)?;
+                    println!("Skill descartada");
                 }
                 _ => anyhow::bail!("unknown skills action"),
             }
@@ -783,6 +922,29 @@ async fn serve(home: PathBuf, profile: String, ipc_only: bool) -> Result<()> {
     Ok(())
 }
 
+/// Clones a public catalog without history and imports its skills.
+fn skills_from_git(state: &std::path::Path, url: &str) -> Result<Vec<serde_json::Value>> {
+    ensure!(
+        url.starts_with("https://") && !url.contains(char::is_whitespace) && !url.contains('@'),
+        "only https Git URLs without credentials can be imported"
+    );
+    let scratch = state.join(".skill-import");
+    private_dir(&scratch)?;
+    let checkout = scratch.join(layeragent_protocol::new_id());
+    let imported = (|| {
+        let status = std::process::Command::new("git")
+            .args(["clone", "--depth", "1", "--quiet", "--", url])
+            .arg(&checkout)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .status()
+            .context("git is required to import from a repository")?;
+        ensure!(status.success(), "git clone failed for {url}");
+        layeragent_skills::import(state, &checkout, url)
+    })();
+    let _ = std::fs::remove_dir_all(&checkout);
+    imported
+}
+
 #[cfg(test)]
 mod doctor_tests {
     use super::*;
@@ -819,8 +981,29 @@ mod doctor_tests {
         for command in [
             vec!["team", "watch", "task-one", "--json"],
             vec!["team", "pause", "task-one", "--reason", "wait"],
+            vec!["team", "pause", "task-one", "--member", "reviewer"],
+            vec!["team", "resume", "task-one", "--member", "reviewer"],
+            vec![
+                "team",
+                "retire",
+                "task-one",
+                "reviewer",
+                "--reason",
+                "off track",
+            ],
             vec!["team", "message", "task-one", "--to", "reviewer", "check"],
             vec!["team", "export", "task-one", "--format", "json"],
+            vec!["team", "export", "task-one", "--format", "dead-ends"],
+            vec!["team", "memory", "task-one", "--json"],
+            vec!["cost", "task-one", "--json"],
+            vec!["profile", "--technical", "none", "--language", "es"],
+            vec!["run", "plan the shop", "--plan"],
+            vec!["skills", "import", "examples/skills"],
+            vec!["skills", "quarantine"],
+            vec!["skills", "review", "cinematic-web"],
+            vec!["skills", "accept", "cinematic-web"],
+            vec!["skills", "reject", "cinematic-web"],
+            vec!["run", "build it", "--budget-usd", "3"],
         ] {
             assert!(Args::try_parse_from(std::iter::once("layeragent").chain(command)).is_ok());
         }

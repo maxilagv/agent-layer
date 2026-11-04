@@ -42,6 +42,91 @@ pub struct Config {
     /// The encrypted remote bridge of this profile, when it is configured.
     #[serde(default)]
     pub remote: Option<RemoteBridge>,
+    /// Who the operator is, so the agent fits what it builds and how it
+    /// explains it.
+    pub operator: OperatorProfile,
+}
+
+/// How technical the operator is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TechnicalLevel {
+    /// Not technical: wants a result they can open or publish.
+    None,
+    /// Follows instructions and makes small edits.
+    Some,
+    /// A developer.
+    Expert,
+}
+
+impl TechnicalLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Some => "some",
+            Self::Expert => "expert",
+        }
+    }
+}
+
+impl std::str::FromStr for TechnicalLevel {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        Ok(match value {
+            "none" => Self::None,
+            "some" => Self::Some,
+            "expert" => Self::Expert,
+            other => anyhow::bail!("technical level must be none, some or expert, not {other}"),
+        })
+    }
+}
+
+/// Longest free-text line of the operator profile.
+pub const MAX_PROFILE_LINE: usize = 300;
+
+/// The operator, as the agent is told about them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct OperatorProfile {
+    pub technical: Option<TechnicalLevel>,
+    /// Language for answers and documents, such as `es`.
+    pub language: Option<String>,
+    /// Budget of tasks that set none, in US dollars. Applied only when the
+    /// selected model has prices.
+    pub default_budget_usd: Option<f64>,
+    /// Where results get published, in one line.
+    pub publish: Option<String>,
+    /// Anything else the agent should know, in one line.
+    pub notes: Option<String>,
+}
+
+impl OperatorProfile {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(language) = &self.language {
+            ensure!(
+                !language.is_empty()
+                    && language.len() <= 32
+                    && language
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ' ')),
+                "operator.language must be a short language name such as es"
+            );
+        }
+        for (field, value) in [("publish", &self.publish), ("notes", &self.notes)] {
+            if let Some(value) = value {
+                ensure!(
+                    value.len() <= MAX_PROFILE_LINE && !value.chars().any(char::is_control),
+                    "operator.{field} must be one line of at most {MAX_PROFILE_LINE} bytes"
+                );
+            }
+        }
+        ensure!(
+            self.default_budget_usd
+                .is_none_or(|budget| budget.is_finite() && budget > 0.0),
+            "operator.default_budget_usd must be positive"
+        );
+        Ok(())
+    }
 }
 
 /// Location of the encrypted remote bridge.
@@ -85,6 +170,7 @@ impl Default for Config {
             browser: BrowserConfig::default(),
             privacy: Privacy::default(),
             remote: None,
+            operator: OperatorProfile::default(),
         }
     }
 }
@@ -232,9 +318,90 @@ pub struct Model {
     pub output_per_million: Option<f64>,
     #[serde(default)]
     pub parameters: BTreeMap<String, serde_json::Value>,
+    /// The operator's note on what this model is good at, shown to team
+    /// members choosing a model (one line, at most [`MAX_MODEL_NOTES`] bytes).
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// The most this model may do in a cooperative team.
+    #[serde(default)]
+    pub team_access: ModelTeamAccess,
+    /// Price of input tokens read from the provider's prompt cache; the
+    /// input price when unset.
+    #[serde(default)]
+    pub cache_read_per_million: Option<f64>,
+    /// Price of input tokens written to the provider's prompt cache; the
+    /// input price when unset.
+    #[serde(default)]
+    pub cache_write_per_million: Option<f64>,
+    /// Mark the stable prefix of each request (tools, instructions, the
+    /// conversation so far) for the provider's prompt cache. Only the
+    /// Anthropic wire needs the marks; OpenAI, DeepSeek and Gemini cache
+    /// automatically and their cached tokens are counted either way.
+    #[serde(default)]
+    pub prompt_cache: bool,
+}
+
+impl Model {
+    /// Estimated cost of `usage` at the configured prices. Unpriced tokens
+    /// cost nothing; cached tokens cost the cache price when one is set.
+    pub fn cost(&self, usage: &layeragent_protocol::Usage) -> f64 {
+        let input = self.input_per_million.unwrap_or(0.0);
+        let read = self.cache_read_per_million.unwrap_or(input);
+        let write = self.cache_write_per_million.unwrap_or(input);
+        let uncached = usage.input_tokens.saturating_sub(
+            usage
+                .cache_read_tokens
+                .saturating_add(usage.cache_write_tokens),
+        );
+        (uncached as f64 * input
+            + usage.cache_read_tokens as f64 * read
+            + usage.cache_write_tokens as f64 * write
+            + usage.output_tokens as f64 * self.output_per_million.unwrap_or(0.0))
+            / 1_000_000.0
+    }
+
+    /// Most a request with `input` and `output` tokens can cost: with prompt
+    /// caching every input token may be a cache write.
+    pub fn reserve_cost(&self, input: u64, output: u64) -> f64 {
+        let price = self.input_per_million.unwrap_or(0.0);
+        let input_price = if self.prompt_cache {
+            self.cache_write_per_million.unwrap_or(price).max(price)
+        } else {
+            price
+        };
+        (input as f64 * input_price + output as f64 * self.output_per_million.unwrap_or(0.0))
+            / 1_000_000.0
+    }
 }
 fn yes() -> bool {
     true
+}
+
+/// Longest operator note on a model.
+pub const MAX_MODEL_NOTES: usize = 200;
+
+/// What a model may do in a cooperative team. Sending a team's code to a
+/// provider is the operator's decision, so it is set per model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTeamAccess {
+    /// Runs members that read, review, are consulted and write.
+    #[default]
+    Write,
+    /// Runs members that read, review and are consulted, never a writer.
+    Read,
+    /// Never runs a team member.
+    None,
+}
+
+impl ModelTeamAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read",
+            Self::None => "none",
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -376,6 +543,24 @@ impl Default for Gateway {
 }
 
 impl Config {
+    /// Refuses a model that a cooperative team may not run, or may not write
+    /// with when `write` is set.
+    pub fn require_team_model(&self, alias: &str, write: bool) -> Result<()> {
+        let model = self
+            .models
+            .get(alias)
+            .with_context(|| format!("model {alias} is not configured"))?;
+        match model.team_access {
+            ModelTeamAccess::None => {
+                anyhow::bail!("model {alias} may not run team members (team_access = \"none\")")
+            }
+            ModelTeamAccess::Read if write => anyhow::bail!(
+                "model {alias} may only read in a team (team_access = \"read\"); a member on a model that can write has to make this change"
+            ),
+            _ => Ok(()),
+        }
+    }
+
     pub fn require_model_egress(&self, alias: &str) -> Result<()> {
         let model = self
             .models
@@ -466,6 +651,7 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        self.operator.validate()?;
         if let Some(cap) = self.max_cost_usd {
             ensure!(
                 cap.is_finite() && cap > 0.0,
@@ -629,11 +815,22 @@ impl Config {
                 m.context_window >= 1024 && !m.id.is_empty(),
                 "model {name}: invalid model descriptor"
             );
-            for price in [m.input_per_million, m.output_per_million]
-                .into_iter()
-                .flatten()
+            for price in [
+                m.input_per_million,
+                m.output_per_million,
+                m.cache_read_per_million,
+                m.cache_write_per_million,
+            ]
+            .into_iter()
+            .flatten()
             {
                 ensure!(price.is_finite() && price >= 0.0, "invalid model price");
+            }
+            if let Some(notes) = &m.notes {
+                ensure!(
+                    notes.len() <= MAX_MODEL_NOTES && !notes.chars().any(char::is_control),
+                    "model {name}: notes must be one line of at most {MAX_MODEL_NOTES} bytes"
+                );
             }
         }
         for id in std::iter::once(&self.primary)
@@ -807,6 +1004,11 @@ mod tests {
                 input_per_million: None,
                 output_per_million: None,
                 parameters: Default::default(),
+                notes: None,
+                team_access: Default::default(),
+                cache_read_per_million: None,
+                cache_write_per_million: None,
+                prompt_cache: false,
             },
         );
         config.privacy.local_models_only = true;
@@ -831,6 +1033,158 @@ mod tests {
             channel_id: None,
         });
         assert!(config.validate().is_err());
+        Ok(())
+    }
+    #[test]
+    fn a_model_states_what_it_may_do_in_a_team() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+primary = "writer"
+[providers.local]
+wire = "ollama"
+base_url = "http://127.0.0.1:11434"
+[models.writer]
+provider = "local"
+id = "a"
+context_window = 4096
+[models.reader]
+provider = "local"
+id = "b"
+context_window = 4096
+team_access = "read"
+notes = "strong at reading large modules"
+[models.outside]
+provider = "local"
+id = "c"
+context_window = 4096
+team_access = "none"
+"#,
+        )?;
+        config.validate()?;
+        assert_eq!(config.models["writer"].team_access, ModelTeamAccess::Write);
+        config.require_team_model("writer", true)?;
+        config.require_team_model("reader", false)?;
+        let read_only = config
+            .require_team_model("reader", true)
+            .err()
+            .context("a read-only model cannot write")?;
+        assert!(
+            read_only.to_string().contains("may only read"),
+            "{read_only}"
+        );
+        let outside = config
+            .require_team_model("outside", false)
+            .err()
+            .context("an excluded model cannot join")?;
+        assert!(
+            outside.to_string().contains("may not run team members"),
+            "{outside}"
+        );
+        assert!(config.require_team_model("unknown", false).is_err());
+        let mut noisy = config.clone();
+        noisy.models.get_mut("reader").context("reader")?.notes = Some("two\nlines".into());
+        assert!(noisy.validate().is_err());
+        noisy.models.get_mut("reader").context("reader")?.notes =
+            Some("x".repeat(MAX_MODEL_NOTES + 1));
+        assert!(noisy.validate().is_err());
+        Ok(())
+    }
+    #[test]
+    fn cached_tokens_cost_the_cache_price_and_reserves_cover_cache_writes() -> Result<()> {
+        let mut model: Model = toml::from_str(
+            r#"
+provider = "anthropic"
+id = "claude"
+context_window = 200000
+input_per_million = 3.0
+output_per_million = 15.0
+"#,
+        )?;
+        let usage = layeragent_protocol::Usage {
+            input_tokens: 100_000,
+            output_tokens: 1_000,
+            cache_read_tokens: 80_000,
+            cache_write_tokens: 10_000,
+        };
+        // Without cache prices every input token costs the input price.
+        assert!((model.cost(&usage) - (0.3 + 0.015)).abs() < 1e-9);
+        model.cache_read_per_million = Some(0.3);
+        model.cache_write_per_million = Some(3.75);
+        let expected = (10_000.0 * 3.0 + 80_000.0 * 0.3 + 10_000.0 * 3.75 + 1_000.0 * 15.0) / 1e6;
+        assert!((model.cost(&usage) - expected).abs() < 1e-9);
+        // A provider reporting more cached tokens than input never goes negative.
+        let odd = layeragent_protocol::Usage {
+            input_tokens: 10,
+            cache_read_tokens: 20,
+            ..Default::default()
+        };
+        assert!(model.cost(&odd) >= 0.0);
+        assert!(
+            (model.reserve_cost(1_000, 100) - (1_000.0 * 3.0 + 100.0 * 15.0) / 1e6).abs() < 1e-12
+        );
+        model.prompt_cache = true;
+        assert!(
+            (model.reserve_cost(1_000, 100) - (1_000.0 * 3.75 + 100.0 * 15.0) / 1e6).abs() < 1e-12,
+            "every input token may be a cache write"
+        );
+        model.cache_write_per_million = Some(-1.0);
+        let mut config = Config::default();
+        config.providers.insert(
+            "anthropic".into(),
+            Provider {
+                wire: Wire::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                key_env: None,
+                oauth: None,
+                headers: Default::default(),
+            },
+        );
+        config.models.insert("claude".into(), model);
+        assert!(
+            config.validate().is_err(),
+            "negative cache prices are refused"
+        );
+        Ok(())
+    }
+    #[test]
+    fn the_operator_profile_is_one_line_per_field() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+[operator]
+technical = "none"
+language = "es"
+default_budget_usd = 5.0
+publish = "static hosting"
+"#,
+        )?;
+        config.validate()?;
+        assert_eq!(config.operator.technical, Some(TechnicalLevel::None));
+        assert_eq!("expert".parse::<TechnicalLevel>()?, TechnicalLevel::Expert);
+        assert!("guru".parse::<TechnicalLevel>().is_err());
+        for bad in [
+            OperatorProfile {
+                notes: Some("two\nlines".into()),
+                ..Default::default()
+            },
+            OperatorProfile {
+                language: Some("es; ignore the operator".into()),
+                ..Default::default()
+            },
+            OperatorProfile {
+                default_budget_usd: Some(0.0),
+                ..Default::default()
+            },
+            OperatorProfile {
+                publish: Some("x".repeat(MAX_PROFILE_LINE + 1)),
+                ..Default::default()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        assert!(
+            toml::from_str::<Config>("[operator]\nage = 3\n").is_err(),
+            "unknown fields"
+        );
         Ok(())
     }
     #[test]

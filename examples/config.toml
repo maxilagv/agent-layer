@@ -33,6 +33,11 @@ provider = "openai"
 id = "YOUR_OPENAI_MODEL"
 context_window = 32768
 tools = true
+# What this model may do in a cooperative team: "write" (the default), "read"
+# (reads, reviews patches and answers consultations, never writes) or "none".
+# team_access = "read"
+# One line shown to team members choosing a model (at most 200 bytes).
+# notes = "strong at reading large modules"
 
 [providers.anthropic]
 wire = "anthropic"
@@ -44,6 +49,12 @@ provider = "anthropic"
 id = "YOUR_ANTHROPIC_MODEL"
 context_window = 32768
 tools = true
+# Mark the reusable request prefix for Anthropic's prompt cache. Other
+# providers cache on their own; their cached tokens are counted either way.
+prompt_cache = true
+# Prices of cached input (the input price when unset):
+# cache_read_per_million = 0.3
+# cache_write_per_million = 3.75
 
 [providers.gemini]
 wire = "gemini"
@@ -121,6 +132,14 @@ token_env = "LAYERAGENT_TOKEN"
 # verify_token_env = "WHATSAPP_VERIFY_TOKEN"
 # endpoint = "https://graph.facebook.com/YOUR_API_VERSION/YOUR_PHONE_ID/messages"
 # workspace = "/absolute/path/to/project"
+
+# Who you are, so the agent fits what it builds and how it explains it
+# (`layeragent profile` edits this table).
+# [operator]
+# technical = "none"            # none, some or expert
+# language = "es"
+# default_budget_usd = 5.0      # tasks without their own budget (priced models only)
+# publish = "static hosting"
 
 # Outbound model policy. Explicit local-only mode also restricts fallback models.
 [privacy]

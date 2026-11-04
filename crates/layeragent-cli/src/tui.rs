@@ -367,12 +367,14 @@ async fn team_action(client: &Client, task: &str, text: &str) -> Result<String> 
                 .ok_or_else(|| anyhow::anyhow!("Uso: /team message <miembro> <texto>"))?;
             crate::team::message(client, task, recipient, body, false).await?
         }
-        "pause" | "resume" | "close" | "cancel" => {
+        "pause" | "resume" | "close" | "cancel" | "retire" => {
+            let (member, rest) = member_target(action, rest)?;
             let reason = rest.strip_prefix("--reason ").unwrap_or(rest).trim();
-            crate::team::command(
+            crate::team::member_command(
                 client,
                 task,
                 action,
+                member,
                 None,
                 None,
                 (!reason.is_empty()).then_some(reason),
@@ -399,8 +401,59 @@ async fn team_action(client: &Client, task: &str, text: &str) -> Result<String> 
             )
         }
         _ => anyhow::bail!(
-            "Uso: /team start|attach|show|message|pause|resume|close|cancel|priority|toggle"
+            "Uso: /team start|attach|show|message|pause|resume|retire|close|cancel|priority|toggle"
         ),
     };
     Ok(serde_json::to_string_pretty(&value)?)
+}
+
+/// `/team pause|resume --member M [motivo]` applies to one member and
+/// `/team retire M [motivo]` always does; the rest apply to the team.
+fn member_target<'a>(action: &str, rest: &'a str) -> Result<(Option<&'a str>, &'a str)> {
+    let rest = rest.trim();
+    if action == "retire" {
+        let (member, reason) = rest.split_once(' ').unwrap_or((rest, ""));
+        anyhow::ensure!(!member.is_empty(), "Uso: /team retire <miembro> [motivo]");
+        return Ok((Some(member), reason));
+    }
+    match rest.strip_prefix("--member ") {
+        Some(target) if matches!(action, "pause" | "resume") => {
+            let (member, reason) = target.trim().split_once(' ').unwrap_or((target.trim(), ""));
+            anyhow::ensure!(
+                !member.is_empty(),
+                "Uso: /team {action} --member <miembro> [motivo]"
+            );
+            Ok((Some(member), reason))
+        }
+        Some(_) => anyhow::bail!("/team {action} se aplica a todo el equipo"),
+        None => Ok((None, rest)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::member_target;
+
+    #[test]
+    fn team_commands_name_one_member_only_where_they_can() -> anyhow::Result<()> {
+        assert_eq!(
+            member_target("pause", "--member reviewer stuck")?,
+            (Some("reviewer"), "stuck")
+        );
+        assert_eq!(
+            member_target("resume", "--member reviewer")?,
+            (Some("reviewer"), "")
+        );
+        assert_eq!(
+            member_target("pause", "--reason wait")?,
+            (None, "--reason wait")
+        );
+        assert_eq!(
+            member_target("retire", "analyst off track")?,
+            (Some("analyst"), "off track")
+        );
+        assert!(member_target("retire", "").is_err());
+        assert!(member_target("close", "--member reviewer").is_err());
+        Ok(())
+    }
 }

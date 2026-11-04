@@ -8,7 +8,7 @@ use super::*;
 use layeragent_protocol::TeamAccess;
 use layeragent_storage::{PatchCarry, PatchSubmission, ReviewOutcome};
 use layeragent_tools::git::team as git_team;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 /// Largest diff slice returned by one `team_patch_show` call.
 const SHOW_BYTES: usize = 48 * 1024;
@@ -538,64 +538,133 @@ impl Engine {
             }
         };
         for (member, worktree, base) in worktrees {
-            let path = PathBuf::from(&worktree);
-            let mut retained = None;
-            let mut base = base;
-            // A worktree behind the team workspace still holds changes that
-            // were already integrated; bring it up to date first so only work
-            // that never reached the team workspace is kept.
-            let stale = store
-                .team_writer_state(team, &member)
-                .await
-                .is_ok_and(|state| state.stale);
-            if stale
-                && path.exists()
-                && let Some(old) = base.clone()
-                && let Ok(area) = team_area(self, team)
-            {
-                match git_team::sync(project, &path, &old, &area.join("tmp")).await {
-                    Ok((synced, _)) => base = Some(synced),
-                    Err(error) => {
-                        tracing::warn!(%error, team, member, "stale worktree could not be synced before retiring; its changes are kept against the old base");
-                    }
-                }
-            }
-            if let Some(base) = base
-                && path.exists()
-            {
-                let captured = async {
-                    let file = scratch_file(self, team, "retain")?;
-                    let result = async {
-                        let files = git_team::diff(&path, &base, &file).await?;
-                        Ok::<_, anyhow::Error>(PatchCarry {
-                            base: base.clone(),
-                            files,
-                            body: std::fs::read(&file)?,
-                        })
-                    }
-                    .await;
-                    let _ = std::fs::remove_file(&file);
-                    result
-                }
+            self.retire_member_worktree(store, team, project, &member, &worktree, base)
                 .await;
-                match captured {
-                    Ok(carry) => retained = Some(carry),
-                    Err(error) => {
-                        // Without a capture the worktree is kept for the operator.
-                        tracing::warn!(%error, team, member, "unsubmitted team work could not be captured; worktree kept");
-                        continue;
-                    }
-                }
-            }
-            if let Err(error) = store.team_retire_worktree(team, &member, retained).await {
-                tracing::warn!(%error, team, member, "team worktree could not be retired");
-                continue;
-            }
-            git_team::remove(project, &path).await;
         }
         if let Ok(area) = team_area(self, team) {
             let _ = std::fs::remove_dir_all(area.join("tmp"));
             let _ = std::fs::remove_dir(&area);
+        }
+    }
+
+    /// Removes one member's worktree, keeping its unsubmitted changes as a
+    /// retained patch. A worktree whose changes cannot be captured is kept.
+    pub(crate) async fn retire_member_worktree(
+        &self,
+        store: &Storage,
+        team: &str,
+        project: &Path,
+        member: &str,
+        worktree: &str,
+        base: Option<String>,
+    ) {
+        let path = PathBuf::from(worktree);
+        let mut retained = None;
+        let mut base = base;
+        // A worktree behind the team workspace still holds changes that
+        // were already integrated; bring it up to date first so only work
+        // that never reached the team workspace is kept.
+        let stale = store
+            .team_writer_state(team, member)
+            .await
+            .is_ok_and(|state| state.stale);
+        if stale
+            && path.exists()
+            && let Some(old) = base.clone()
+            && let Ok(area) = team_area(self, team)
+        {
+            match git_team::sync(project, &path, &old, &area.join("tmp")).await {
+                Ok((synced, _)) => base = Some(synced),
+                Err(error) => {
+                    tracing::warn!(%error, team, member, "stale worktree could not be synced before retiring; its changes are kept against the old base");
+                }
+            }
+        }
+        if let Some(base) = base
+            && path.exists()
+        {
+            let captured = async {
+                let file = scratch_file(self, team, "retain")?;
+                let result = async {
+                    let files = git_team::diff(&path, &base, &file).await?;
+                    Ok::<_, anyhow::Error>(PatchCarry {
+                        base: base.clone(),
+                        files,
+                        body: std::fs::read(&file)?,
+                    })
+                }
+                .await;
+                let _ = std::fs::remove_file(&file);
+                result
+            }
+            .await;
+            match captured {
+                Ok(carry) => retained = Some(carry),
+                Err(error) => {
+                    // Without a capture the worktree is kept for the operator.
+                    tracing::warn!(%error, team, member, "unsubmitted team work could not be captured; worktree kept");
+                    return;
+                }
+            }
+        }
+        if let Err(error) = store.team_retire_worktree(team, member, retained).await {
+            tracing::warn!(%error, team, member, "team worktree could not be retired");
+            return;
+        }
+        git_team::remove(project, &path).await;
+    }
+
+    /// Stops the running activation of every member the operator retired and,
+    /// once it has stopped, keeps its unsubmitted changes as a retained patch.
+    pub(crate) async fn stop_retired_members(
+        &self,
+        store: &Storage,
+        team: &str,
+        snapshot: &TeamSnapshot,
+        running: &mut HashMap<String, CancellationToken>,
+        handled: &mut HashSet<String>,
+        project: &Path,
+    ) {
+        let retired: Vec<&str> = snapshot
+            .members
+            .iter()
+            .filter(|member| member["operator_hold"] == "retired")
+            .filter_map(|member| member["id"].as_str())
+            .filter(|member| !handled.contains(*member))
+            .collect();
+        if retired.is_empty() {
+            return;
+        }
+        for member in &retired {
+            if let Some(token) = running.get(*member) {
+                token.cancel();
+            }
+        }
+        let Ok(worktrees) = store.team_worktrees(team).await else {
+            return;
+        };
+        let mut pending: Vec<(String, String, Option<String>)> = worktrees
+            .into_iter()
+            .filter(|(member, _, _)| retired.contains(&member.as_str()))
+            .collect();
+        for member in &retired {
+            // Done once its activation stopped and its worktree, if any, was
+            // captured; a capture that fails is not retried until the team
+            // ends, which keeps that worktree for the operator.
+            if running.contains_key(*member) {
+                continue;
+            }
+            if let Some(index) = pending.iter().position(|(id, _, _)| id == member) {
+                let (member, worktree, base) = pending.swap_remove(index);
+                // Never capture while an approval is being applied.
+                let Ok(gate) = integration_gate(team) else {
+                    continue;
+                };
+                let _order = gate.lock().await;
+                self.retire_member_worktree(store, team, project, &member, &worktree, base)
+                    .await;
+            }
+            handled.insert((*member).to_string());
         }
     }
 }

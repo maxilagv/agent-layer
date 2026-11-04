@@ -54,6 +54,17 @@ impl TeamRuntime {
                     self.context.generation,
                 )
                 .await?;
+            // A member the operator paused on its own gives its slot back
+            // instead of holding it while the rest of the team works.
+            if paused
+                && self
+                    .store
+                    .team_operator_hold(&self.context.team_id, &self.context.member_id)
+                    .await?
+                    == Some(layeragent_storage::OperatorHold::Paused)
+            {
+                bail!(MemberHeld);
+            }
             if !paused {
                 match self
                     .store
@@ -118,6 +129,16 @@ impl TeamRuntime {
             .await
     }
 }
+
+/// The operator paused this member alone; its activation ends here.
+#[derive(Debug)]
+pub(crate) struct MemberHeld;
+impl std::fmt::Display for MemberHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the operator paused this member; the activation ends at this boundary")
+    }
+}
+impl std::error::Error for MemberHeld {}
 
 #[async_trait]
 impl ProviderAdmission for TeamRuntime {
@@ -660,6 +681,10 @@ impl Engine {
         let owner = new_id();
         let activation_cancel = CancellationToken::new();
         let mut jobs = JoinSet::new();
+        // The cancellation token of each member's running activation, so one
+        // member can be stopped without stopping the team.
+        let mut running: HashMap<String, CancellationToken> = HashMap::new();
+        let mut retired = std::collections::HashSet::new();
         let mut changes = store.team_changes(&team);
         let default_model = match model.clone() {
             Some(model) => model,
@@ -676,6 +701,7 @@ impl Engine {
                 return Ok(());
             }
             let snapshot = store.team_snapshot_by_id(&team).await?;
+            self.stop_retired_members(&store, &team, &snapshot, &mut running, &mut retired, Path::new(&task.project)).await;
             match snapshot.state.as_str() {
                 "cancelled" | "failed" => {
                     activation_cancel.cancel();
@@ -782,26 +808,39 @@ impl Engine {
                             let scope = scope.clone();
                             let store = store.clone();
                             let token = activation_cancel.child_token();
+                            running.insert(member.clone(), token.clone());
                             let task_effort = task.effort;
+                            let team = team.clone();
                             jobs.spawn(async move {
                                 let result = engine.run_bound(scope, RunRequest {
                                     session_id: Some(session), workspace: None, prompt, model: Some(selected),
                                     effort: task_effort, bridge: false, mode: RunMode::Normal,
                                     execution: ExecutionMode::Cooperative, cooperative: None,
                                 }, token.clone(), activation.clone()).await;
+                                // An activation the operator stopped by pausing or
+                                // retiring its member ends that member's turn, not
+                                // the team.
+                                let held = match &result {
+                                    Err(_) => store.team_operator_hold(&team, &member).await.ok().flatten(),
+                                    Ok(_) => None,
+                                };
                                 let (state, reason, usage) = match &result {
                                     Ok(result) => (if token.is_cancelled() { "interrupted" } else { "completed" }, None, json!({"input_tokens":result.usage.input_tokens,"output_tokens":result.usage.output_tokens,"cost_usd":result.cost_usd})),
-                                    Err(error) => (if token.is_cancelled() { "interrupted" } else { "failed" }, Some(error.to_string()), json!({})),
+                                    Err(error) => (if token.is_cancelled() || held.is_some() { "interrupted" } else { "failed" }, Some(error.to_string()), json!({})),
                                 };
                                 let _ = store.team_finish_activation(&activation, &member, generation, state, reason.as_deref(), &usage).await;
+                                if let (Some(hold), Err(error)) = (held, &result) {
+                                    tracing::info!(%error, member, ?hold, "activation stopped by the operator");
+                                    return (member, Ok(()));
+                                }
                                 // A consultation that fails or runs out of budget ends
                                 // the consultation, not the team: storage retires the
                                 // consultant and tells the member that asked.
                                 if consultant && let Err(error) = &result && !token.is_cancelled() {
                                     tracing::info!(%error, member, "consultation ended by an error");
-                                    return Ok(());
+                                    return (member, Ok(()));
                                 }
-                                result.map(|_| ())
+                                (member, result.map(|_| ()))
                             });
                         }
                         if !admitted && jobs.is_empty()
@@ -825,7 +864,10 @@ impl Engine {
                     return Ok(());
                 }
                 Some(joined) = jobs.join_next(), if !jobs.is_empty() => {
-                    match joined {
+                    if let Ok((member, _)) = &joined {
+                        running.remove(member);
+                    }
+                    match joined.map(|(_, outcome)| outcome) {
                         Ok(Ok(_)) => {},
                         Ok(Err(error)) => {
                             let state = store.team_snapshot_by_id(&team).await?.state;

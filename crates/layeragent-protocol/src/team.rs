@@ -522,6 +522,10 @@ pub struct TeamCommand {
     pub recipient: Option<String>,
     #[serde(default)]
     pub priority: Option<i64>,
+    /// The one member `pause`, `resume` or `retire` applies to. Without it,
+    /// `pause` and `resume` apply to the whole team.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
 }
 
 /// What one member may do in its next activation. Every member starts reading

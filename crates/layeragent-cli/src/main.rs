@@ -821,6 +821,16 @@ mod doctor_tests {
         for command in [
             vec!["team", "watch", "task-one", "--json"],
             vec!["team", "pause", "task-one", "--reason", "wait"],
+            vec!["team", "pause", "task-one", "--member", "reviewer"],
+            vec!["team", "resume", "task-one", "--member", "reviewer"],
+            vec![
+                "team",
+                "retire",
+                "task-one",
+                "reviewer",
+                "--reason",
+                "off track",
+            ],
             vec!["team", "message", "task-one", "--to", "reviewer", "check"],
             vec!["team", "export", "task-one", "--format", "json"],
         ] {

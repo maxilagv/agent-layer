@@ -739,6 +739,7 @@ impl BoundaryFixture {
                     recipient: None,
                     reason: Some(format!("fixture {action}")),
                     priority: None,
+                    member: None,
                 },
             )
             .await?;

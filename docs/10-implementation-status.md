@@ -60,8 +60,9 @@ Terminal milestone additions and their verification boundaries:
 - CLI supports explicit execution mode, bounded cooperative options, inspect,
   watch, messages, team controls, priority and JSON/Markdown export. TUI supports
   creation/attachment, a responsive retained panel and controls during execution.
-  Attachment does not create or resume work. Pauses and cancellation apply to
-  the whole team; targeted member controls are not implemented.
+  Attachment does not create or resume work. Cancellation applies to the whole
+  team; pause, resume and retirement also apply to one member (see
+  [operator controls per member](#godeye-operator-controls-per-member)).
 - Snapshots include an event cursor and pending approvals. Exports read one
   consistent transaction and retain delivery receipts, finding revisions and
   attributed tool events, with recursive supported-pattern redaction.
@@ -326,6 +327,52 @@ from the `read` model, with consumption reported per model; the other blocks a
 team whose role model became `none` after creation before that model runs.
 Scripted models show the rules hold, not that real models choose well between
 models, and no live run with two providers was made.
+
+## Godeye operator controls per member
+
+Fifth godeye increment: the operator can pause, resume or retire one member
+of a running team without stopping the rest. The operator-facing description
+is in [controlling one member](15-cooperative-terminal.md#controlling-one-member).
+
+- **Pause and resume.** `team pause|resume --member` (a `member` on the team
+  command API) records an operator hold on that member. Its activation ends at
+  its next boundary, so it gives its concurrency slot back; it is no
+  candidate, its messages wait and do not count as pending work for the idle
+  check, and idle notices name it. A team resume keeps it paused. Resuming
+  clears the hold and sends it a runtime notice, which reactivates it even
+  when its work is already in progress, and counts as team progress.
+- **Retirement.** `team retire` (refused for the coordinator) terminates the
+  member in one transaction: its live activation becomes interrupted and its
+  reserved budget uncertain, deliveries to it are cancelled, its work returns
+  to the coordinator as pending, its path claims are released, its open
+  submissions become `withdrawn` and pending handoffs to it `retained`,
+  questions it asked are resolved, and questions waiting on it are resolved
+  with a runtime notice to their senders. The coordinator is told which work
+  and patches were affected. The supervisor then cancels the member's running
+  activation, including an in-flight provider call, and once it has stopped
+  keeps its unsubmitted worktree changes as a retained patch, under the
+  integration lock. An activation stopped by either control ends as
+  interrupted and never fails the team. Migration 012 adds the hold columns.
+
+Verification: storage tests cover a pause that leaves the team active, its
+replay, the paused activation reaching its boundary and being refused
+budget, the member leaving the candidates, the idle notice, a team resume
+keeping it paused, the resume notice, a retirement that fences the
+activation, keeps its reservation uncertain, returns the work, releases
+claims, withdraws the patch, tells the waiting reviewer and the coordinator
+and labels the retained patch, the coordinator refused, and a retired
+consultant reporting to its asker. CLI tests cover the commands, the name to
+id resolution and the terminal syntax. A runtime test in
+`crates/layeragent-core/tests/cooperative_controls.rs` drives a scripted team
+over a real repository: a writer paused after one edit makes no further model
+call while the team goes on, is resumed by notice, edits again and is retired
+during a held provider call; the call is cancelled within seconds (the test
+fails with the supervisor's cancellation removed, the call then staying open
+for its full 20 seconds), the change it made after resuming is kept as a
+retained patch, its worktree is removed, the coordinator cancels the returned
+work and the team completes. The scripted model plays the operator at fixed
+points; this shows the mechanism, not how an operator uses it with real
+models.
 
 ## Cooperative bus hardening increment
 

@@ -796,7 +796,7 @@ mod team_tests {
                             == 1
                     })
                     .unwrap_or(false);
-            return Json(json!({"team":{"task_id":"task-one","state":if first_live {"active"} else {"terminated"},"revision":17,"last_event_seq":5,"members":[]},"task_revision":999})).into_response();
+            return Json(json!({"team":{"task_id":"task-one","state":if first_live {"active"} else {"terminated"},"revision":17,"last_event_seq":5,"members":[{"id":"member-7","name":"reviewer"}]},"task_revision":999})).into_response();
         }
         if uri.ends_with("/team/export") {
             return Json(json!({"messages":[{"id":"first"},{"id":"second"}],"work":[],"findings":[],"evidence":[],"objections":[],"deliveries":[],"finding_revisions":[]})).into_response();
@@ -873,6 +873,48 @@ mod team_tests {
         server.abort();
         Ok(())
     }
+    #[tokio::test]
+    async fn a_member_command_names_the_member_by_id() -> Result<()> {
+        let (client, calls, server) = server().await?;
+        let _ = crate::team::member_command(
+            &client,
+            "task-one",
+            "retire",
+            Some("reviewer"),
+            None,
+            None,
+            Some("off track"),
+        )
+        .await;
+        assert!(
+            crate::team::member_command(
+                &client,
+                "task-one",
+                "pause",
+                Some("nobody"),
+                None,
+                None,
+                None
+            )
+            .await
+            .is_err()
+        );
+        let calls = calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls poisoned"))?;
+        let writes: Vec<_> = calls.iter().filter(|call| call.0 == "POST").collect();
+        assert_eq!(
+            writes.len(),
+            1,
+            "an unknown member is refused before sending"
+        );
+        assert!(writes[0].1.ends_with("/team/commands/retire"));
+        assert_eq!(writes[0].2["member"], "member-7");
+        assert_eq!(writes[0].2["reason"], "off track");
+        server.abort();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn conflicting_commands_use_team_revision_and_are_not_replayed() -> Result<()> {
         let (client, calls, server) = server().await?;

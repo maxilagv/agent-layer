@@ -150,6 +150,8 @@ pub(super) async fn command(
 ) -> ApiResult<Json<Value>> {
     mutable(&identity)?;
     let task = task(&s, &identity, &id).await?;
+    // pause, resume and retire with a member apply to that member alone.
+    let team_wide = command.member.is_none() && action != "retire";
     let result = s
         .engine
         .store(&identity.scope)
@@ -157,7 +159,7 @@ pub(super) async fn command(
         .team_command(&identity.scope, &id, &action, command)
         .await
         .map_err(conflict)?;
-    if action == "cancel" {
+    if team_wide && action == "cancel" {
         s.engine.cancel(&identity.scope, &id)?;
         if let Ok(jobs) = s.jobs.lock()
             && let Some((scope, token)) = jobs.get(&id)
@@ -165,7 +167,7 @@ pub(super) async fn command(
         {
             token.cancel();
         }
-    } else if action == "resume" && task.state == TaskState::Blocked {
+    } else if team_wide && action == "resume" && task.state == TaskState::Blocked {
         let running = s
             .jobs
             .lock()

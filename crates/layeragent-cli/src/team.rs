@@ -101,8 +101,19 @@ pub enum TeamCommand {
         urgent: bool,
         text: String,
     },
-    Pause(Control),
-    Resume(Control),
+    /// Pause the team, or with --member only that member.
+    Pause(MemberControl),
+    /// Resume the team, or with --member only that member.
+    Resume(MemberControl),
+    /// Remove one member from the team: its activation stops, its work goes
+    /// back to the coordinator and its unsubmitted changes are kept.
+    Retire {
+        task: String,
+        /// Member id or exact name.
+        member: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     Close(Control),
     Cancel(Control),
     Priority {
@@ -125,6 +136,15 @@ pub struct Inspect {
 #[derive(Args, Debug)]
 pub struct Control {
     pub task: String,
+    #[arg(long)]
+    pub reason: Option<String>,
+}
+#[derive(Args, Debug)]
+pub struct MemberControl {
+    pub task: String,
+    /// Apply to this member alone (id or exact name).
+    #[arg(long)]
+    pub member: Option<String>,
     #[arg(long)]
     pub reason: Option<String>,
 }
@@ -167,17 +187,34 @@ pub async fn command(
     priority: Option<i64>,
     reason: Option<&str>,
 ) -> Result<Value> {
+    member_command(client, task, action, None, recipient, priority, reason).await
+}
+
+/// A team command, or with `member` a command on that member alone.
+pub async fn member_command(
+    client: &Client,
+    task: &str,
+    action: &str,
+    member: Option<&str>,
+    recipient: Option<&str>,
+    priority: Option<i64>,
+    reason: Option<&str>,
+) -> Result<Value> {
     identifier(task)?;
     let snapshot = client.get(&format!("/v1/tasks/{task}/team")).await?;
+    let member = member
+        .map(|name| self::recipient(&snapshot, name))
+        .transpose()?;
+    let mut body = json!({
+        "idempotency_key":layeragent_protocol::new_id(),
+        "expected_revision":snapshot["team"]["revision"],
+        "recipient":recipient,"priority":priority,"reason":reason,
+    });
+    if let Some(member) = member {
+        body["member"] = json!(member);
+    }
     client
-        .post(
-            &format!("/v1/tasks/{task}/team/commands/{action}"),
-            json!({
-                "idempotency_key":layeragent_protocol::new_id(),
-                "expected_revision":snapshot["team"]["revision"],
-                "recipient":recipient,"priority":priority,"reason":reason,
-            }),
-        )
+        .post(&format!("/v1/tasks/{task}/team/commands/{action}"), body)
         .await
 }
 
@@ -257,7 +294,11 @@ pub fn summary(value: &Value) -> String {
                 member["role"].as_str().unwrap_or("?"),
                 model.map(|m| format!(" · {m}")).unwrap_or_default(),
                 consulting,
-                member["state"].as_str().unwrap_or("?"),
+                match member["operator_hold"].as_str() {
+                    Some("paused") => "pausado por el operador",
+                    Some("retired") => "retirado por el operador",
+                    _ => member["state"].as_str().unwrap_or("?"),
+                },
                 if member["access"] == "write" {
                     " · escribe"
                 } else {
@@ -344,10 +385,11 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
             text,
         } => message(client, &task, &to, &text, urgent).await?,
         TeamCommand::Pause(args) => {
-            command(
+            member_command(
                 client,
                 &args.task,
                 "pause",
+                args.member.as_deref(),
                 None,
                 None,
                 args.reason.as_deref(),
@@ -355,13 +397,30 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
             .await?
         }
         TeamCommand::Resume(args) => {
-            command(
+            member_command(
                 client,
                 &args.task,
                 "resume",
+                args.member.as_deref(),
                 None,
                 None,
                 args.reason.as_deref(),
+            )
+            .await?
+        }
+        TeamCommand::Retire {
+            task,
+            member,
+            reason,
+        } => {
+            member_command(
+                client,
+                &task,
+                "retire",
+                Some(&member),
+                None,
+                None,
+                reason.as_deref(),
             )
             .await?
         }

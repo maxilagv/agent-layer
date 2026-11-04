@@ -16,8 +16,8 @@ mod terminal;
 pub use memory::{EmbeddingWorker, embedding_worker_main};
 pub use tasks::{TaskConflict, TaskCreate};
 pub use team::{
-    EvidenceRecord, PatchCarry, PatchSubmission, ReviewOutcome, TeamConflict, TeamPaused,
-    WriterState,
+    EvidenceRecord, OperatorHold, PatchCarry, PatchSubmission, ReviewOutcome, TeamConflict,
+    TeamPaused, WriterState,
 };
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -68,6 +68,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/009_team_urgent_messages.sql"),
     include_str!("migrations/010_team_writers.sql"),
     include_str!("migrations/011_team_models.sql"),
+    include_str!("migrations/012_team_member_controls.sql"),
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

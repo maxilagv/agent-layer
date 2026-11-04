@@ -838,8 +838,13 @@ impl Storage {
             let at = now_ms();
             let mut kept = None;
             if let Some(carry) = retained.filter(|carry| !carry.files.is_empty()) {
-                let work: Option<String> = tx.query_row("SELECT current_work_id FROM team_members WHERE id=?1", [&member], |r| r.get(0))?;
-                let (id, _) = insert_patch(&tx, &team, "retained", "retained", work.as_deref(), &member, None, "unsubmitted work kept when the team ended", &carry.base, &carry.files, &carry.body, None, at)?;
+                let (work, hold): (Option<String>, Option<String>) = tx.query_row("SELECT current_work_id,operator_hold FROM team_members WHERE id=?1", [&member], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                let summary = if hold.as_deref() == Some("retired") {
+                    "unsubmitted work kept when the operator retired the member"
+                } else {
+                    "unsubmitted work kept when the team ended"
+                };
+                let (id, _) = insert_patch(&tx, &team, "retained", "retained", work.as_deref(), &member, None, summary, &carry.base, &carry.files, &carry.body, None, at)?;
                 kept = Some(id);
             }
             tx.execute("DELETE FROM team_path_claims WHERE team_id=?1 AND member_id=?2", params![team, member])?;

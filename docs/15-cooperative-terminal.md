@@ -117,6 +117,37 @@ ends, worktrees are removed and unsubmitted changes are kept as retained patches
 Your own uncommitted work in the workspace is preserved: integration only applies
 the approved patch.
 
+## Controlling one member
+
+```bash
+layeragent team pause TASK_ID --member analyst --reason "it is looping"
+layeragent team resume TASK_ID --member analyst
+layeragent team retire TASK_ID analyst --reason "wrong approach"
+```
+
+- **Pause** holds one member while the rest of the team works. Its running
+  activation ends at its next safe boundary (before its next model call)
+  instead of holding a concurrency slot; it is not activated again, and
+  messages to it wait. A team pause and resume do not release it. Idle
+  notices to the coordinator name the members you paused.
+- **Resume** releases it: it is activated again with a runtime notice to
+  continue from its canonical session, followed by the messages that arrived
+  meanwhile.
+- **Retire** removes a member for good; the coordinator cannot be retired.
+  Its running activation is fenced at once and an in-flight provider call is
+  cancelled; what that call had reserved stays charged as uncertain. Its work
+  goes back to the coordinator as pending, its path reservations are
+  released, its open patches are withdrawn (they stay listed), and changes
+  handed to it are kept as retained patches. Once its activation has stopped,
+  its unsubmitted worktree changes are kept as a retained patch and the
+  worktree is removed. Members waiting on its answers are told, its own open
+  questions are resolved, and a retired consultant's consultation ends as
+  `retired`.
+
+`team show` marks paused and retired members. In the interactive terminal use
+`/team pause --member NAME [reason]`, `/team resume --member NAME` and
+`/team retire NAME [reason]`.
+
 Other commands are `team messages`, `team work`, `team objections`,
 `team priority TASK_ID WORK_ID VALUE`, `team close TASK_ID` and
 `team cancel TASK_ID`. Query commands support JSON. Member targets accept an
@@ -278,7 +309,9 @@ the models' `team_access` does not allow is refused. Member rows carry `last_mod
 snapshot carries `default_model` and `usage_by_model`. `GET /v1/tasks/{id}/team/{resource}?tail=N` returns the most
 recent rows of a resource (at most 200), and
 `GET /v1/tasks/{id}/team/threads/{message}` returns the reply chain containing a
-message. A task-level correction on a cooperative task is refused; send an
+message. `POST /v1/tasks/{id}/team/commands/{pause|resume|retire}` with a
+`member` applies to that member alone (`retire` requires one); member rows
+carry `operator_hold` (`paused` or `retired`). A task-level correction on a cooperative task is refused; send an
 operator instruction as a team message instead. Reads and writes retain task, project and principal checks.
 
 Read the [implementation status](10-implementation-status.md) and current

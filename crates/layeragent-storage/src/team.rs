@@ -11,7 +11,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 mod consult;
+mod controls;
 mod writers;
+
+pub use controls::OperatorHold;
 pub use writers::{PatchCarry, PatchSubmission, ReviewOutcome, WriterState};
 
 #[derive(Debug, thiserror::Error)]
@@ -1162,13 +1165,16 @@ impl Storage {
         action: &str,
         command: TeamCommand,
     ) -> Result<Value> {
+        if command.member.is_some() || action == "retire" {
+            return self.team_member_command(scope, task, action, command).await;
+        }
         ensure!(
             matches!(action, "pause" | "resume" | "cancel" | "close" | "priority"),
             "unknown team command"
         );
         ensure!(
             action == "priority" || command.recipient.is_none(),
-            "member-targeted controls are not supported; omit recipient for team controls"
+            "recipient names the work of a priority command; name one member with member"
         );
         let scope = scope.clone();
         let task = task.to_string();
@@ -1208,7 +1214,8 @@ impl Storage {
                     settle_active_time(&tx, &team, at)?;
                 }
                 if action == "resume" {
-                    tx.execute("UPDATE team_members SET state=CASE WHEN EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=team_members.id AND a.state IN ('starting','running')) THEN 'working' ELSE 'inactive' END,reason=NULL,updated_at=?2 WHERE team_id=?1 AND state IN ('paused','blocked')", params![team, at])?;
+                    // A member the operator paused on its own stays paused.
+                    tx.execute("UPDATE team_members SET state=CASE WHEN operator_hold='paused' THEN 'paused' WHEN EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=team_members.id AND a.state IN ('starting','running')) THEN 'working' ELSE 'inactive' END,reason=CASE WHEN operator_hold='paused' THEN reason ELSE NULL END,updated_at=?2 WHERE team_id=?1 AND state IN ('paused','blocked')", params![team, at])?;
                     tx.execute("UPDATE team_activations SET pause_boundary=0 WHERE team_id=?1 AND state IN ('starting','running')", [&team])?;
                     tx.execute("UPDATE teams SET active_ms=active_ms+COALESCE(?2-active_since,0),active_since=CASE WHEN EXISTS(SELECT 1 FROM team_activations a WHERE a.team_id=teams.id AND a.state IN ('starting','running')) THEN ?2 ELSE NULL END WHERE id=?1", params![team,at])?;
                 }
@@ -1382,7 +1389,9 @@ impl Storage {
             let tx = c.transaction()?;
             let state: String = tx.query_row("SELECT state FROM teams WHERE id=?1", [&team], |r| r.get(0))?;
             let live: i64 = tx.query_row("SELECT count(*) FROM team_activations WHERE team_id=?1 AND state IN ('starting','running')", [&team], |r| r.get(0))?;
-            let pending: i64 = tx.query_row("SELECT count(*) FROM team_deliveries WHERE team_id=?1 AND state='accepted'", [&team], |r| r.get(0))?;
+            // Messages waiting for a member the operator paused are not work
+            // the rest of the team can make progress on.
+            let pending: i64 = tx.query_row("SELECT count(*) FROM team_deliveries d JOIN team_members m ON m.id=d.recipient_member_id WHERE d.team_id=?1 AND d.state='accepted' AND m.operator_hold IS NULL", [&team], |r| r.get(0))?;
             if state != "active" || live > 0 || pending > 0 {
                 return Ok(None);
             }
@@ -1416,7 +1425,14 @@ impl Storage {
             } else {
                 let coordinator: Option<String> = tx.query_row("SELECT id FROM team_members WHERE team_id=?1 AND role='coordinator' AND state NOT IN ('terminated','failed','paused')", [&team], |r| r.get(0)).optional()?;
                 let Some(coordinator) = coordinator else { return Ok(None) };
-                let diagnostic = "team idle: no member has pending messages or claimable work. Assign distinct work, answer open questions, record inconclusive outcomes, or propose close with team_close.".to_string();
+                let held: Vec<String> = {
+                    let mut q = tx.prepare("SELECT name FROM team_members WHERE team_id=?1 AND operator_hold='paused' ORDER BY created_at,rowid")?;
+                    q.query_map([&team], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+                };
+                let mut diagnostic = "team idle: no member has pending messages or claimable work. Assign distinct work, answer open questions, record inconclusive outcomes, or propose close with team_close.".to_string();
+                if !held.is_empty() {
+                    diagnostic.push_str(&format!(" The operator paused {}; their messages and work wait until the operator resumes them.", held.join(", ")));
+                }
                 runtime_notice(&tx, &team, &coordinator, &diagnostic, at)?;
                 event(&tx, &team, "team_idle", json!({"coordinator":coordinator,"diagnostic":diagnostic}), at)?;
                 diagnostic
@@ -1880,8 +1896,8 @@ fn usage_by_model(c: &Connection, team: &str) -> Result<Vec<Value>> {
 }
 
 fn members(c: &Connection, team: &str) -> Result<Vec<Value>> {
-    let mut q = c.prepare("SELECT id,name,role,model,session_id,state,reason,work_state,current_work_id,activations,initial_assessment IS NOT NULL,created_at,updated_at,access,access_applied,(SELECT json_group_array(p.path) FROM team_path_claims p WHERE p.team_id=m.team_id AND p.member_id=m.id),(SELECT a.model FROM team_activations a WHERE a.member_id=m.id AND a.model IS NOT NULL ORDER BY a.started_at DESC,a.rowid DESC LIMIT 1),consult_asker,consult_question,consult_budget,consult_outcome FROM team_members m WHERE team_id=?1 ORDER BY created_at,rowid")?;
-    let mut rows = q.query_map([team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"reason":r.get::<_,Option<String>>(6)?,"work_state":r.get::<_,String>(7)?,"current_work_id":r.get::<_,Option<String>>(8)?,"activations":r.get::<_,i64>(9)?,"initial_assessment_recorded":r.get::<_,bool>(10)?,"created_at":r.get::<_,i64>(11)?,"updated_at":r.get::<_,i64>(12)?,"access":r.get::<_,String>(13)?,"access_applied":r.get::<_,String>(14)?,"claimed_paths":serde_json::from_str::<Value>(&r.get::<_,String>(15)?).unwrap_or(json!([])),"last_model":r.get::<_,Option<String>>(16)?,"consult":r.get::<_,Option<String>>(17)?.map(|asker| json!({"asker":asker,"question_id":r.get::<_,Option<String>>(18).ok().flatten(),"budget_tokens":r.get::<_,Option<i64>>(19).ok().flatten(),"outcome":r.get::<_,Option<String>>(20).ok().flatten()}))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut q = c.prepare("SELECT id,name,role,model,session_id,state,reason,work_state,current_work_id,activations,initial_assessment IS NOT NULL,created_at,updated_at,access,access_applied,(SELECT json_group_array(p.path) FROM team_path_claims p WHERE p.team_id=m.team_id AND p.member_id=m.id),(SELECT a.model FROM team_activations a WHERE a.member_id=m.id AND a.model IS NOT NULL ORDER BY a.started_at DESC,a.rowid DESC LIMIT 1),consult_asker,consult_question,consult_budget,consult_outcome,operator_hold FROM team_members m WHERE team_id=?1 ORDER BY created_at,rowid")?;
+    let mut rows = q.query_map([team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"reason":r.get::<_,Option<String>>(6)?,"work_state":r.get::<_,String>(7)?,"current_work_id":r.get::<_,Option<String>>(8)?,"activations":r.get::<_,i64>(9)?,"initial_assessment_recorded":r.get::<_,bool>(10)?,"created_at":r.get::<_,i64>(11)?,"updated_at":r.get::<_,i64>(12)?,"access":r.get::<_,String>(13)?,"access_applied":r.get::<_,String>(14)?,"claimed_paths":serde_json::from_str::<Value>(&r.get::<_,String>(15)?).unwrap_or(json!([])),"last_model":r.get::<_,Option<String>>(16)?,"consult":r.get::<_,Option<String>>(17)?.map(|asker| json!({"asker":asker,"question_id":r.get::<_,Option<String>>(18).ok().flatten(),"budget_tokens":r.get::<_,Option<i64>>(19).ok().flatten(),"outcome":r.get::<_,Option<String>>(20).ok().flatten()})),"operator_hold":r.get::<_,Option<String>>(21)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     drop(q);
     for row in &mut rows {
         if row["role"] == "consultant"
@@ -2198,7 +2214,7 @@ fn normalize_request(body: &str) -> String {
 /// Latest point at which the team made verifiable progress or the user intervened.
 fn progress_since(c: &Connection, team: &str) -> Result<i64> {
     Ok(c.query_row(
-        "SELECT COALESCE(max(at),0) FROM (SELECT max(created_at) at FROM team_evidence WHERE team_id=?1 UNION ALL SELECT max(created_at) FROM team_finding_revisions WHERE team_id=?1 UNION ALL SELECT max(created_at) FROM team_messages WHERE team_id=?1 AND sender_kind='user' UNION ALL SELECT max(created_at) FROM team_messages WHERE team_id=?1 AND sender_kind='member' AND purpose='response' AND state='accepted' UNION ALL SELECT max(created_at) FROM team_operations WHERE team_id=?1 AND kind='resume')",
+        "SELECT COALESCE(max(at),0) FROM (SELECT max(created_at) at FROM team_evidence WHERE team_id=?1 UNION ALL SELECT max(created_at) FROM team_finding_revisions WHERE team_id=?1 UNION ALL SELECT max(created_at) FROM team_messages WHERE team_id=?1 AND sender_kind='user' UNION ALL SELECT max(created_at) FROM team_messages WHERE team_id=?1 AND sender_kind='member' AND purpose='response' AND state='accepted' UNION ALL SELECT max(created_at) FROM team_operations WHERE team_id=?1 AND kind IN ('resume','member_resume'))",
         [team],
         |r| r.get(0),
     )?)
@@ -2498,6 +2514,7 @@ mod tests {
                         reason: Some("operator test".into()),
                         recipient: None,
                         priority: None,
+                        member: None,
                     },
                 )
                 .await
@@ -3232,6 +3249,7 @@ mod tests {
             reason: Some("stop".into()),
             recipient: None,
             priority: None,
+            member: None,
         };
         f.store
             .team_command(
@@ -3370,6 +3388,7 @@ mod tests {
                     reason: None,
                     recipient: None,
                     priority: None,
+                    member: None,
                 },
             )
             .await?;
@@ -3456,7 +3475,9 @@ mod tests {
     async fn active_clock_excludes_safe_pause_but_counts_operations_draining() -> Result<()> {
         let f = Fixture::new(CooperativeOptions {
             limits: layeragent_protocol::TeamLimits {
-                max_active_seconds: 1,
+                // Wide margins: a loaded runner can stall between the
+                // writes below without changing what the test shows.
+                max_active_seconds: 30,
                 ..Default::default()
             },
             ..Default::default()
@@ -3500,7 +3521,7 @@ mod tests {
             .write(move |c| {
                 c.execute(
                     "UPDATE teams SET active_since=?2 WHERE id=?1",
-                    params![team, now_ms() - 2000],
+                    params![team, now_ms() - 60_000],
                 )?;
                 Ok(())
             })
@@ -4078,7 +4099,8 @@ mod tests {
                             expected_revision: f.revision().await?,
                             reason: None,
                             recipient: Some("missing".into()),
-                            priority: Some(1)
+                            priority: Some(1),
+                            member: None,
                         }
                     )
                     .await
@@ -5052,6 +5074,285 @@ mod tests {
             )
             .await;
         assert!(late.is_err(), "a retired consultant receives nothing");
+        assert_eq!(
+            f.store.team_snapshot_by_id(&f.team).await?.open_questions,
+            0
+        );
+        Ok(())
+    }
+
+    impl Fixture {
+        fn on_member(&self, key: &str, revision: i64, member: &str) -> TeamCommand {
+            TeamCommand {
+                idempotency_key: key.into(),
+                expected_revision: revision,
+                reason: Some("off track".into()),
+                recipient: None,
+                priority: None,
+                member: Some(member.into()),
+            }
+        }
+
+        async fn control(&self, action: &str, key: &str, member: &str) -> Result<Value> {
+            let command = self.on_member(key, self.revision().await?, member);
+            self.store
+                .team_command(&self.scope, &self.task, action, command)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_operator_pauses_and_resumes_one_member_while_the_team_works() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let (activation, session) = f.activation(&analyst).await?;
+        let command = f.on_member("p1", f.revision().await?, &analyst);
+        let paused = f
+            .store
+            .team_command(&f.scope, &f.task, "pause", command.clone())
+            .await?;
+        assert_eq!(paused["applies"], "next_boundary");
+        let replay = f
+            .store
+            .team_command(&f.scope, &f.task, "pause", command)
+            .await?;
+        assert_eq!(replay, paused, "a repeated key replays the result");
+        assert_eq!(f.store.team_snapshot_by_id(&f.team).await?.state, "active");
+        // Its activation stops at the next boundary; the runtime ends it there.
+        assert!(
+            f.store
+                .team_activation_should_pause(&activation, &session, 1)
+                .await?
+        );
+        assert_eq!(
+            f.store.team_operator_hold(&f.team, &analyst).await?,
+            Some(OperatorHold::Paused)
+        );
+        assert!(
+            f.store
+                .team_reserve(&f.team, &activation, 1, "investigation", 1, 1, 0.0)
+                .await
+                .err()
+                .is_some_and(|e| e.downcast_ref::<TeamPaused>().is_some())
+        );
+        f.finish(&activation, &analyst, "interrupted").await?;
+        let row = f.member_row(&analyst).await?;
+        assert_eq!(row["state"], "paused");
+        assert_eq!(row["operator_hold"], "paused");
+        assert!(
+            f.store
+                .team_candidates(&f.team)
+                .await?
+                .iter()
+                .all(|candidate| candidate["id"] != analyst.as_str())
+        );
+        // A message waiting for it is not progress the team can make.
+        f.store
+            .team_member_message(
+                &f.team,
+                &reviewer,
+                f.message("q", MessagePurpose::Question, Some(analyst.clone()), "why?")
+                    .await?,
+            )
+            .await?;
+        let idle = f.store.team_idle_check(&f.team).await?.context("idle")?;
+        assert!(idle.contains("The operator paused analyst"), "{idle}");
+
+        assert!(
+            f.control("pause", "p2", &analyst).await.is_err(),
+            "already paused"
+        );
+        f.command("pause", "team-pause").await?;
+        f.command("resume", "team-resume").await?;
+        assert_eq!(
+            f.member_row(&analyst).await?["state"],
+            "paused",
+            "a team resume does not release a member the operator paused"
+        );
+        let resumed = f.control("resume", "r1", &analyst).await?;
+        assert_eq!(resumed["member_state"], "inactive");
+        let row = f.member_row(&analyst).await?;
+        assert!(row["operator_hold"].is_null());
+        assert!(
+            f.store
+                .team_candidates(&f.team)
+                .await?
+                .iter()
+                .any(|candidate| candidate["id"] == analyst.as_str())
+        );
+        assert!(f.deliveries_to(&analyst).await?.iter().any(|m| {
+            m["sender_kind"] == "runtime"
+                && m["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains("resumed you"))
+        }));
+        assert!(
+            f.control("resume", "r2", &reviewer).await.is_err(),
+            "only a paused member resumes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retiring_a_member_returns_its_work_and_tells_those_waiting_on_it() -> Result<()> {
+        let f = Fixture::new(writable()).await?;
+        let coordinator = f.member("coordinator").await?;
+        let (analyst, reviewer) = (f.member("analyst").await?, f.member("reviewer").await?);
+        let work = f.owned_work(&analyst, "w").await?;
+        f.write(&analyst, &work, &["src"]).await?;
+        let (activation, session) = f.activation(&analyst).await?;
+        let patch = f
+            .store
+            .team_submit_patch(
+                &f.team,
+                &analyst,
+                f.submission(&work, &["src/lib.rs"], Some(&reviewer)),
+            )
+            .await?;
+        let patch = patch["patch_id"].as_str().context("patch")?.to_string();
+        f.store
+            .team_reserve(&f.team, &activation, 1, "investigation", 100, 100, 0.0)
+            .await?;
+        f.store
+            .team_member_message(
+                &f.team,
+                &reviewer,
+                f.message(
+                    "why",
+                    MessagePurpose::Question,
+                    Some(analyst.clone()),
+                    "why src?",
+                )
+                .await?,
+            )
+            .await?;
+
+        assert!(
+            f.control("retire", "coordinator", &coordinator)
+                .await
+                .is_err(),
+            "the coordinator stays"
+        );
+        let retired = f.control("retire", "x1", &analyst).await?;
+        assert_eq!(
+            retired["retired"]["interrupted_activation"],
+            activation.as_str()
+        );
+        assert_eq!(retired["retired"]["work_returned"], json!([work]));
+        assert_eq!(retired["retired"]["patches_withdrawn"], json!([patch]));
+        assert_eq!(f.store.team_snapshot_by_id(&f.team).await?.state, "active");
+
+        // Its activation is fenced at once and its reservation stays charged.
+        assert!(
+            f.store
+                .team_activation_context(&activation, &session)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            f.store.team_snapshot_by_id(&f.team).await?.reservations["uncertain_tokens"],
+            200
+        );
+        assert!(
+            !f.store
+                .team_finish_activation(&activation, &analyst, 1, "failed", None, &json!({}))
+                .await?,
+            "a late finish changes nothing"
+        );
+        let row = f.member_row(&analyst).await?;
+        assert_eq!(row["state"], "terminated");
+        assert_eq!(row["operator_hold"], "retired");
+        assert_eq!(row["claimed_paths"], json!([]));
+        assert_eq!(
+            f.store.team_operator_hold(&f.team, &analyst).await?,
+            Some(OperatorHold::Retired)
+        );
+
+        let (rows, _) = f
+            .store
+            .team_resource(&f.scope, &f.task, "work", 0, 50)
+            .await?;
+        let returned = rows
+            .iter()
+            .find(|w| w["id"] == work.as_str())
+            .context("work")?;
+        assert_eq!(returned["state"], "pending");
+        assert_eq!(returned["assignee"], coordinator.as_str());
+        f.store
+            .team_claim_work(
+                &f.team,
+                &coordinator,
+                &work,
+                returned["revision"].as_i64().context("revision")?,
+            )
+            .await?;
+
+        let (meta, _) = f.store.team_patch(&f.team, &patch).await?;
+        assert_eq!(meta["state"], "withdrawn");
+        assert!(
+            f.store
+                .team_review_precheck(&f.team, &reviewer, &patch, true)
+                .await
+                .is_err(),
+            "a withdrawn patch cannot be approved"
+        );
+        assert!(f.deliveries_to(&reviewer).await?.iter().any(|m| {
+            m["sender_kind"] == "runtime"
+                && m["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains("will not answer"))
+        }));
+        assert!(f.deliveries_to(&coordinator).await?.iter().any(|m| {
+            m["sender_kind"] == "runtime"
+                && m["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains("pending for you again"))
+        }));
+        assert!(
+            f.control("retire", "x2", &analyst).await.is_err(),
+            "already gone"
+        );
+        assert!(f.control("pause", "x3", &analyst).await.is_err());
+
+        // Its unsubmitted changes are kept, labelled as the operator's doing.
+        let kept = f
+            .store
+            .team_retire_worktree(
+                &f.team,
+                &analyst,
+                Some(PatchCarry {
+                    base: "b".repeat(40),
+                    files: vec!["src/lib.rs".into()],
+                    body: b"diff".to_vec(),
+                }),
+            )
+            .await?
+            .context("retained")?;
+        let (meta, _) = f.store.team_patch(&f.team, &kept).await?;
+        assert!(
+            meta["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("operator retired")),
+            "{meta}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_retired_consultant_tells_the_member_that_asked() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let analyst = f.member("analyst").await?;
+        let consult = f.consult(&analyst, "c", None, None).await?;
+        let consultant = consult["consultant_id"].as_str().context("id")?.to_string();
+        f.control("retire", "c1", &consultant).await?;
+        let row = f.member_row(&consultant).await?;
+        assert_eq!(row["consult"]["outcome"], "retired");
+        assert!(f.deliveries_to(&analyst).await?.iter().any(|m| {
+            m["sender_kind"] == "runtime"
+                && m["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains("will not answer"))
+        }));
         assert_eq!(
             f.store.team_snapshot_by_id(&f.team).await?.open_questions,
             0

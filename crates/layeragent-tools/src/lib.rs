@@ -263,6 +263,12 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
             &["sha256"],
         ),
         def(
+            "skill_search",
+            "Find skills for a task by words: active skills (verified by fixtures, reviewed by the operator, or unverified) and imported ones still waiting for the operator's review. Load an active one with skill_load; ask the operator to accept a waiting one",
+            json!({"query":short,"limit":{"type":"integer","minimum":1,"maximum":20}}),
+            &["query"],
+        ),
+        def(
             "skill_load",
             "Load a skill runbook on demand",
             json!({"name":short}),
@@ -306,8 +312,8 @@ pub fn definitions(config: &Config) -> Vec<ToolDefinition> {
         ),
         def(
             "skill_draft",
-            "Stage a reusable procedure with files and deterministic fixtures; verification is separate",
-            json!({"name":short,"body":string,"files":{"type":"object","additionalProperties":{"type":"string"}},"tests":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"stdin":{"type":["string","null"]},"expected_stdout":{"type":"string"}},"required":["argv","expected_stdout"],"additionalProperties":false}}}),
+            "Stage a reusable skill: SKILL.md with name and description frontmatter, files, and deterministic fixtures. With fixtures it is verified and promoted by skill_verify; without them (a guide, such as a project's design rules) it waits for the operator's review before it becomes available",
+            json!({"name":short,"body":string,"files":{"type":"object","additionalProperties":{"type":"string"}},"tests":{"type":"array","minItems":0,"maxItems":32,"items":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"stdin":{"type":["string","null"]},"expected_stdout":{"type":"string"}},"required":["argv","expected_stdout"],"additionalProperties":false}}}),
             &["name", "body", "files", "tests"],
         ),
         def(
@@ -834,6 +840,12 @@ impl Tools {
                     )
                     .await;
             }
+            "skill_search" => {
+                let limit = a["limit"].as_u64().unwrap_or(8) as usize;
+                return Ok(
+                    json!({"skills":layeragent_skills::search(&home, ctx.config, s("query"), limit)?}),
+                );
+            }
             "skill_load" => {
                 let skills = layeragent_skills::discover(&home, ctx.config)?;
                 let skill = skills
@@ -849,9 +861,15 @@ impl Tools {
                 let tests: Vec<layeragent_skills::TestCase> =
                     serde_json::from_value(a["tests"].clone())?;
                 let path = layeragent_skills::draft(&home, s("name"), s("body"), &files, &tests)?;
-                return Ok(
-                    json!({"staged":path.file_name().and_then(|s|s.to_str()),"verified":false}),
-                );
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                return Ok(if tests.is_empty() {
+                    json!({"staged":name,"verified":false,"waiting_for_review":true,"next":format!("ask the operator to read it with `layeragent skills review {name}` and accept it with `layeragent skills accept {name}`")})
+                } else {
+                    json!({"staged":name,"verified":false,"next":"verify it with skill_verify"})
+                });
             }
             "skill_verify" => {
                 return layeragent_skills::verify_and_promote(
@@ -1294,7 +1312,8 @@ mod tests {
     /// Runs the sandboxed file script directly, as the sandbox would.
     fn files(dir: &Path, operation: &str, args: Value) -> Value {
         use std::io::Write;
-        let mut child = std::process::Command::new("python3")
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let mut child = std::process::Command::new(python)
             .args(["-I", "-c", include_str!("files.py"), operation])
             .current_dir(dir)
             .stdin(std::process::Stdio::piped())

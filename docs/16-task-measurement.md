@@ -125,8 +125,9 @@ selected model. It can only narrow `agents.tree_max_cost_usd`, never widen it.
 
 - **Before each request** the provider reserve may not exceed what is left of
   the budget, so the request that would overspend is refused.
-- **While it works** the agent is told when the task crosses 50%, 80% and 95%
-  of its budget, once each. The token ceiling of the agent tree counts too,
+- **While it works** the turn that owns the task is told when the task
+  crosses 50%, 80% and 95% of its budget, once each; child agents spend from
+  the same budget but are not told, and see it with `budget_status`. The token ceiling of the agent tree counts too,
   so a task without a money budget is still told as it nears
   `agents.tree_max_tokens`.
 - **`budget_status`** shows the turn's tokens, cached share and cost, the

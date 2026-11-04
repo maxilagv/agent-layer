@@ -1138,7 +1138,12 @@ impl Engine {
             {
                 tracing::warn!(%error, "usage ledger unavailable");
             }
-            if let Some(share) = ctl.tree.budget.crossed() {
+            // Notices go to the turn that owns the task: a child could take
+            // one by charging at the moment the tree crosses a share, then
+            // end before reading it.
+            if ctl.depth == 0
+                && let Some(share) = ctl.tree.budget.crossed()
+            {
                 budget_notice = Some(budget_notice_text(&ctl.tree.budget, share));
             }
             usage.add(&completion.usage);

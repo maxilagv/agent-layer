@@ -45,6 +45,18 @@ En modo plan investiga, escribe `docs/plan/` (`brief.md`, `stack.md`, `plan.md`,
 
 Para controlar el gasto, `--budget-usd 3` (o `/budget 3` en la terminal) fija lo máximo que puede gastar la tarea, contando sus subagentes. El agente recibe avisos al 50, 80 y 95 % y puede consultar `budget_status`. `layeragent cost TAREA` muestra lo gastado por modelo, cuánto vino de la caché y sugerencias para gastar menos. Los costos son estimados con los precios que configuraste.
 
+## Skills
+
+Las skills son guías que el agente carga cuando una tarea las necesita. El repositorio trae un set inicial (planificar un proyecto, elegir el stack, controlar costos, webs cinematográficas, 3D con three.js y tiendas):
+
+```bash
+layeragent skills import examples/skills
+layeragent skills review cinematic-web     # leela antes de activarla
+layeragent skills accept cinematic-web
+```
+
+Lo importado queda en cuarentena hasta que lo aceptás: el agente no lo usa hasta entonces, aunque `skill_search` puede sugerírtelo. También podés importar otros catálogos con formato `SKILL.md`, desde una carpeta o un repositorio Git `https`.
+
 ## Documentación
 
 - [README principal](../README.md): instalación, capacidades y comandos.

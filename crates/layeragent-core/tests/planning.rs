@@ -75,7 +75,9 @@ impl Sandbox for ScriptSandbox {
             "only the file script is expected, not {:?}",
             request.argv.first()
         );
-        let mut child = std::process::Command::new("python3")
+        // The runtime names python3; Windows runners call it python.
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let mut child = std::process::Command::new(python)
             .args(&request.argv[1..])
             .current_dir(&request.workspace)
             .stdin(std::process::Stdio::piped())

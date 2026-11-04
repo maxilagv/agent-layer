@@ -119,6 +119,38 @@ test charges a two-round turn that writes then reads the cache at the cache
 prices. No live provider was called: real cache hit rates depend on each
 provider's minimum cacheable size, cache lifetime and prefix stability.
 
+## Skill catalogs, guides and skill search
+
+- **Quarantine.** `layeragent skills import` (a directory, or an `https` Git
+  repository cloned without history and without credentials in the URL)
+  copies every `SKILL.md` directory it finds into `skill-quarantine`, refusing
+  symlinks, secret-looking paths, oversize files or skills, more than 200
+  files and text with detected credentials, without execute bits, with a
+  provenance record. `quarantine`, `review` (the `SKILL.md`, files, scripts
+  and links), `accept` and `reject` manage it. Quarantined skills are never
+  discovered or offered.
+- **Reviewed skills.** `accept` moves a skill into the registry with a review
+  record of its hash; discovery marks it `reviewed`, distinct from `verified`
+  by fixtures, and stops marking it when its files change. Records of a skill
+  are not part of its hash. Extra frontmatter keys are ignored.
+- **Guides.** `skill_draft` without fixtures quarantines the draft instead of
+  staging it; `skill_verify` refuses it and names the operator's command.
+- **Search.** `skill_search` ranks active skills by words in the name,
+  description and body, and lists matching quarantined ones as waiting.
+- **Starter catalog.** `examples/skills` ships six guides: project kickoff,
+  stack choice, cost control, cinematic web, three.js 3D (with optional
+  Blender in background mode) and storefront.
+
+Verification: skills tests import a catalog with an extra frontmatter key, a
+script and a link next to a skill carrying a credential and, on Unix, one with
+a symlink; check that only the first is quarantined, that nothing in
+quarantine is discovered, the review contents, search before and after
+acceptance, the reviewed mark and its loss on change, replacement and
+rejection, and a guide draft refused by `skill_verify` and accepted by the
+operator. Another test imports the shipped catalog and requires all six to
+quarantine. The guides' advice is written for real tasks but has not been
+measured with real models.
+
 ## Planning first, the operator profile and file search
 
 - **Planning mode.** `RunMode::Plan` (`run --plan`, `/plan` in the TUI, task
@@ -169,7 +201,10 @@ The agent can now see and steer its own spending; see
   adds the column.
 - **Notices.** The tree budget tracks its spend and announces 50%, 80% and
   95% of the larger of its token and cost shares once each, as a runtime
-  message entering the conversation between rounds, like a correction.
+  message entering the root turn's conversation between rounds, like a
+  correction. Only the root turn takes announcements: a child charging at the
+  moment the tree crossed a share could otherwise take one and end before
+  reading it (seen as a lost 50% notice on a macOS CI run).
 - **`budget_status`.** A session tool reporting the turn's usage, cached share
   and cost, the task's spend and limits, a member's team usage and limits,
   and the delegable models with prices and notes, cheapest first.

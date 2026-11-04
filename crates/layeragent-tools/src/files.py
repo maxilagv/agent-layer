@@ -88,12 +88,12 @@ else:
             if not wanted(relative):
                 continue
             if operation == 'list_files':
-                results.append(str(file.relative_to(root)))
+                results.append(relative)
             elif file.stat().st_size <= 1024 * 1024:
                 try:
                     for number, line in enumerate(file.read_text().splitlines(), 1):
                         if matcher(line):
-                            results.append({'path': str(file.relative_to(root)), 'line': number, 'text': line[:1024]})
+                            results.append({'path': relative, 'line': number, 'text': line[:1024]})
                             if len(results) >= 200:
                                 break
                 except (UnicodeError, OSError):

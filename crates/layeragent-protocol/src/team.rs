@@ -221,6 +221,9 @@ pub struct CooperativeOptions {
     /// A patch is approved only by a member running a different model than
     /// the one that wrote it. Rejections are not restricted.
     pub cross_model_review: bool,
+    /// Start without what earlier teams on the same workspace concluded.
+    /// By default members are told those conclusions and can search them.
+    pub without_project_memory: bool,
 }
 impl CooperativeOptions {
     pub fn normalized(&self, token_ceiling: Option<u64>) -> Result<Self> {
@@ -636,7 +639,17 @@ pub struct TeamExport {
     #[serde(default)]
     pub patches: Vec<Value>,
     pub markdown: String,
+    /// What did not work out, as Markdown: discarded and inconclusive
+    /// findings with their evidence, rejected and withdrawn patches, and
+    /// the dead ends earlier teams on this workspace recorded.
+    #[serde(default)]
+    pub dead_ends: String,
 }
+
+/// Conclusions of earlier teams listed in a member's first prompt.
+pub const PROJECT_MEMORY_PROMPT_ITEMS: usize = 8;
+/// Most conclusions `team_memory` returns at once.
+pub const PROJECT_MEMORY_MAX_ITEMS: usize = 50;
 
 pub fn template_instructions(template: TeamTemplate) -> &'static str {
     match template {

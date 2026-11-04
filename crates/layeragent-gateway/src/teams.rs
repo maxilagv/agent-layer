@@ -99,6 +99,40 @@ pub(super) async fn resource(
     Ok(Json(json!({"items":items,"next":next})))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct MemoryParams {
+    state: Option<String>,
+    query: Option<String>,
+    limit: Option<usize>,
+}
+
+/// What earlier teams of the same owner concluded on this task's workspace.
+pub(super) async fn memory(
+    State(s): State<ApiState>,
+    axum::Extension(identity): axum::Extension<Identity>,
+    Path(id): Path<String>,
+    Query(params): Query<MemoryParams>,
+) -> ApiResult<Json<Value>> {
+    task(&s, &identity, &id).await?;
+    let items = s
+        .engine
+        .store(&identity.scope)
+        .await?
+        .team_project_memory_scoped(
+            &identity.scope,
+            &id,
+            layeragent_storage::MemoryQuery {
+                state: params.state,
+                text: params.query,
+                limit: params
+                    .limit
+                    .unwrap_or(layeragent_protocol::PROJECT_MEMORY_MAX_ITEMS),
+            },
+        )
+        .await?;
+    Ok(Json(json!({"items":items})))
+}
+
 pub(super) async fn thread(
     State(s): State<ApiState>,
     axum::Extension(identity): axum::Extension<Identity>,
@@ -314,6 +348,7 @@ mod tests {
                 .route("/v1/tasks/{id}/team/messages", get(messages).post(message))
                 .route("/v1/tasks/{id}/team/commands/{action}", post(command))
                 .route("/v1/tasks/{id}/team/threads/{message}", get(thread))
+                .route("/v1/tasks/{id}/team/memory", get(memory))
                 .route("/v1/tasks/{id}/team/{resource}", get(resource))
                 .layer(axum::Extension(identity))
                 .with_state(self.state.clone())

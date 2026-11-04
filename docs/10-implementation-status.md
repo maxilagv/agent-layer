@@ -82,7 +82,7 @@ declared window, plus the requested output ceiling); no adapter provides an exac
 count. Interrupted in-flight requests retain uncertain reservations until their
 consumption is explicitly reconciled; cancellation does not release that capacity.
 
-Pending: private investigation memory and `MUERTOS.md` export, web/desktop team interfaces, the
+Pending: web/desktop team interfaces, the
 cross-mode evaluator, live-provider evaluation and the complete P0/P1 traceability
 table. An initial assessment is recorded but is not an isolation guarantee against
 seeing peer conclusions; review checks a different reviewer and linked current
@@ -373,6 +373,45 @@ retained patch, its worktree is removed, the coordinator cancels the returned
 work and the team completes. The scripted model plays the operator at fixed
 points; this shows the mechanism, not how an operator uses it with real
 models.
+
+## Godeye project memory and dead ends
+
+Sixth godeye increment: teams learn what earlier teams on the same workspace
+concluded, and an export collects what did not work out. The operator-facing
+description is in
+[what earlier teams concluded](15-cooperative-terminal.md#what-earlier-teams-concluded).
+
+- **Project memory.** Findings in a concluded state (discarded, inconclusive,
+  reviewed, reproduced) of ended teams with the same tenant, principal and
+  workspace path are a team's project memory; nothing crosses principals or
+  workspaces, and a running team's conclusions are not memory yet. Each entry
+  carries its claim, final reason, the snapshot it held for, whether that is
+  the asking team's current snapshot (when both are known), the earlier task
+  and its latest evidence (output capped), redacted. Every member's first
+  prompt lists the eight most recent as earlier peer conclusions, not
+  instructions, with claims and reasons reduced to one line of at most 200
+  bytes; consultants are not given the list. `team_memory` filters by state or
+  text (at most 50 entries). `cooperative.without_project_memory`
+  (`--without-project-memory`) starts a team without it, and `team_memory`
+  then returns nothing.
+- **Dead ends.** The export's `dead_ends` Markdown lists the team's discarded
+  and inconclusive findings with their revision history and evidence
+  (invocation, exit code, observed output, error), rejected and withdrawn
+  patches, and earlier teams' dead ends on the workspace. `team export
+  --format dead-ends` prints it, for example into `MUERTOS.md`; `team memory`
+  and `GET /v1/tasks/{id}/team/memory` list the project memory.
+
+Verification: a storage test covers memory appearing only once the earlier
+team ended, open hypotheses left out, the evidence and snapshot comparison,
+state and text filters, a refused state, isolation from another principal on
+the same path and from another workspace, and both teams' dead-ends documents.
+CLI tests cover the option, the commands and the rendering. A runtime test in
+`crates/layeragent-core/tests/cooperative_memory.rs` runs two scripted teams
+after an earlier one that discarded a hypothesis with evidence and left
+another inconclusive: the next team's first prompt lists both, its coordinator
+finds the evidence with `team_memory`, and a team started without project
+memory is told nothing. Scripted models show the mechanism, not that a real
+model rechecks or uses earlier conclusions well.
 
 ## Cooperative bus hardening increment
 

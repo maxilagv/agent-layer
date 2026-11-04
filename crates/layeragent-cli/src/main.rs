@@ -833,6 +833,8 @@ mod doctor_tests {
             ],
             vec!["team", "message", "task-one", "--to", "reviewer", "check"],
             vec!["team", "export", "task-one", "--format", "json"],
+            vec!["team", "export", "task-one", "--format", "dead-ends"],
+            vec!["team", "memory", "task-one", "--json"],
         ] {
             assert!(Args::try_parse_from(std::iter::once("layeragent").chain(command)).is_ok());
         }

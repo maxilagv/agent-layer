@@ -226,6 +226,7 @@ pub fn router(state: ApiState) -> Router {
             post(teams::command),
         )
         .route("/v1/tasks/{id}/team/threads/{message}", get(teams::thread))
+        .route("/v1/tasks/{id}/team/memory", get(teams::memory))
         .route("/v1/tasks/{id}/team/{resource}", get(teams::resource))
         .route("/v1/artifacts/{hash}", get(tasks::artifact))
         .route("/v1/connections", get(connections::connections))

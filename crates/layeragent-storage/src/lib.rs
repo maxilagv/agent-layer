@@ -16,8 +16,8 @@ mod terminal;
 pub use memory::{EmbeddingWorker, embedding_worker_main};
 pub use tasks::{TaskConflict, TaskCreate};
 pub use team::{
-    EvidenceRecord, OperatorHold, PatchCarry, PatchSubmission, ReviewOutcome, TeamConflict,
-    TeamPaused, WriterState,
+    EvidenceRecord, MemoryQuery, OperatorHold, PatchCarry, PatchSubmission, ReviewOutcome,
+    TeamConflict, TeamPaused, WriterState,
 };
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;

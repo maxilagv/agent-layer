@@ -117,6 +117,32 @@ ends, worktrees are removed and unsubmitted changes are kept as retained patches
 Your own uncommitted work in the workspace is preserved: integration only applies
 the approved patch.
 
+## What earlier teams concluded
+
+Each team starts from what earlier teams concluded on the same workspace:
+findings they discarded or left inconclusive (dead ends) and findings they
+reviewed or reproduced. Members get the eight most recent in their first
+prompt, marked as earlier peer conclusions rather than instructions, and
+`team_memory` searches them (by state or text) with each one's latest
+evidence and whether it was recorded on the workspace snapshot the team is
+on now. Conclusions of a team count once it has ended.
+
+This memory is private: only teams of the same tenant and principal on the
+same workspace path see each other's conclusions. Start a team without it:
+
+```bash
+layeragent run "Audit the session code from scratch" --workspace . \
+  --execution cooperative --template audit --without-project-memory
+layeragent team memory TASK_ID                         # earlier conclusions
+layeragent team export TASK_ID --format dead-ends > MUERTOS.md
+```
+
+The dead-ends export lists, as Markdown, the team's discarded and
+inconclusive findings with each step of their history and their evidence,
+the patches rejected or withdrawn, and the dead ends earlier teams on the
+workspace recorded. It contains project content and is redacted like any
+export; review it before sharing it.
+
 ## Controlling one member
 
 ```bash
@@ -251,7 +277,8 @@ apply to every consultation.
 ```
 
 `/execution` selects the mode for subsequent prompts. `/team start` explicitly
-creates a cooperative task; add `--allow-write` before `--` to let members write. `/team attach` only observes an existing task;
+creates a cooperative task; add `--allow-write` before `--` to let members write
+and `--without-project-memory` to start without earlier conclusions. `/team attach` only observes an existing task;
 resuming blocked execution requires `/team resume`. The panel opens automatically,
 uses a side view in wide terminals and a switchable view in compact terminals,
 and remains available after completion. Approvals take visual priority and name
@@ -311,11 +338,14 @@ recent rows of a resource (at most 200), and
 `GET /v1/tasks/{id}/team/threads/{message}` returns the reply chain containing a
 message. `POST /v1/tasks/{id}/team/commands/{pause|resume|retire}` with a
 `member` applies to that member alone (`retire` requires one); member rows
-carry `operator_hold` (`paused` or `retired`). A task-level correction on a cooperative task is refused; send an
+carry `operator_hold` (`paused` or `retired`). `GET /v1/tasks/{id}/team/memory`
+(optional `state`, `query`, `limit`) lists earlier conclusions on the task's
+workspace, `cooperative.without_project_memory` starts a team without them, and
+the JSON export carries the dead-ends document as `dead_ends`. A task-level correction on a cooperative task is refused; send an
 operator instruction as a team message instead. Reads and writes retain task, project and principal checks.
 
 Read the [implementation status](10-implementation-status.md) and current
 fingerprinted [verification report](verification.json) for executed checks and
 blocked qualification. Web/desktop team interfaces, native confinement checks of
-worktree writers, investigation memory, cross-mode quality evaluation, live
-teams that mix providers and live-provider effectiveness remain separate work.
+worktree writers, cross-mode quality evaluation, live teams that mix providers
+and live-provider effectiveness remain separate work.

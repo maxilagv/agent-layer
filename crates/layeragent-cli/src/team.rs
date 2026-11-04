@@ -29,6 +29,9 @@ pub struct ExecutionOptions {
     /// none.
     #[arg(long)]
     pub consultant_model: Option<String>,
+    /// Start without what earlier teams on this workspace concluded.
+    #[arg(long)]
+    pub without_project_memory: bool,
 }
 impl ExecutionOptions {
     pub fn body(&self) -> Result<Value> {
@@ -44,7 +47,8 @@ impl ExecutionOptions {
             || self.max_cost_usd.is_some()
             || self.allow_write
             || self.cross_model_review
-            || self.consultant_model.is_some();
+            || self.consultant_model.is_some()
+            || self.without_project_memory;
         ensure!(
             mode == ExecutionMode::Cooperative || !configured,
             "team options require --execution cooperative"
@@ -71,6 +75,7 @@ impl ExecutionOptions {
         }
         options.scope.allow_write = self.allow_write;
         options.cross_model_review = self.cross_model_review;
+        options.without_project_memory = self.without_project_memory;
         if let Some(model) = &self.consultant_model {
             options
                 .role_models
@@ -92,6 +97,8 @@ pub enum TeamCommand {
     Evidence(Inspect),
     /// Patches members submitted, handed over or left unsubmitted.
     Patches(Inspect),
+    /// What earlier teams on this task's workspace concluded.
+    Memory(Inspect),
     Message {
         task: String,
         #[arg(long)]
@@ -123,7 +130,8 @@ pub enum TeamCommand {
     },
     Export {
         task: String,
-        #[arg(long, default_value = "markdown", value_parser = ["json", "markdown"])]
+        /// dead-ends prints what was ruled out or left unsettled (MUERTOS.md).
+        #[arg(long, default_value = "markdown", value_parser = ["json", "markdown", "dead-ends"])]
         format: String,
     },
 }
@@ -345,6 +353,30 @@ pub fn summary(value: &Value) -> String {
     terminal_text(&out)
 }
 
+/// Earlier conclusions on the workspace, one line each.
+pub fn memory_summary(value: &Value) -> String {
+    let items = value["items"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        return "Ningún equipo anterior dejó conclusiones en este workspace.\n".into();
+    }
+    let mut out = String::from("Conclusiones de equipos anteriores en este workspace:\n");
+    for item in &items {
+        let snapshot = match item["same_snapshot"].as_bool() {
+            Some(true) => "mismo snapshot",
+            Some(false) => "snapshot anterior",
+            None => "snapshot sin comparar",
+        };
+        out.push_str(&format!(
+            "- {} · {}: {} — {} ({snapshot})\n",
+            item["task_id"].as_str().unwrap_or("?"),
+            item["state"].as_str().unwrap_or("?"),
+            item["claim"].as_str().unwrap_or(""),
+            item["reason"].as_str().unwrap_or(""),
+        ));
+    }
+    terminal_text(&out)
+}
+
 /// Neutralize terminal escapes and invisible directional overrides in remote text.
 pub fn terminal_text(text: &str) -> String {
     text.chars()
@@ -378,6 +410,17 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
         TeamCommand::Objections(args) => client.team_resource(&args.task, "objections").await?,
         TeamCommand::Evidence(args) => client.team_resource(&args.task, "evidence").await?,
         TeamCommand::Patches(args) => client.team_resource(&args.task, "patches").await?,
+        TeamCommand::Memory(args) => {
+            identifier(&args.task)?;
+            let value = client
+                .get(&format!("/v1/tasks/{}/team/memory", args.task))
+                .await?;
+            if !args.json {
+                print!("{}", memory_summary(&value));
+                return Ok(());
+            }
+            value
+        }
         TeamCommand::Message {
             task,
             to,
@@ -452,15 +495,20 @@ pub async fn dispatch(client: &Client, action: TeamCommand) -> Result<()> {
         TeamCommand::Export { task, format } => {
             identifier(&task)?;
             let value = client.get(&format!("/v1/tasks/{task}/team/export")).await?;
-            if format == "markdown" {
+            if format != "json" {
+                let field = if format == "dead-ends" {
+                    "dead_ends"
+                } else {
+                    "markdown"
+                };
                 // Exports contain model-written text: never send raw control
                 // sequences to the operator's terminal.
                 print!(
                     "{}",
                     terminal_text(
-                        value["markdown"]
+                        value[field]
                             .as_str()
-                            .context("export markdown missing")?
+                            .with_context(|| format!("export {field} missing"))?
                     )
                 );
                 return Ok(());
@@ -514,9 +562,11 @@ struct StartArgs {
     cross_model_review: bool,
     #[arg(long)]
     consultant_model: Option<String>,
+    #[arg(long)]
+    without_project_memory: bool,
 }
 pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
-    let (options, objective) = text.split_once(" -- ").context("Uso: /team start audit|debug|review [--max-tokens N] [--max-seconds N] [--max-cost-usd N] [--allow-write] [--cross-model-review] [--consultant-model ALIAS] -- objetivo")?;
+    let (options, objective) = text.split_once(" -- ").context("Uso: /team start audit|debug|review [--max-tokens N] [--max-seconds N] [--max-cost-usd N] [--allow-write] [--cross-model-review] [--consultant-model ALIAS] [--without-project-memory] -- objetivo")?;
     ensure!(!objective.trim().is_empty(), "objective is required");
     let args =
         StartArgs::try_parse_from(std::iter::once("start").chain(options.split_whitespace()))?;
@@ -529,6 +579,7 @@ pub fn parse_start(text: &str) -> Result<(ExecutionOptions, String)> {
         allow_write: args.allow_write,
         cross_model_review: args.cross_model_review,
         consultant_model: args.consultant_model,
+        without_project_memory: args.without_project_memory,
     };
     options.body()?;
     Ok((options, objective.trim().into()))
@@ -589,6 +640,26 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn project_memory_is_on_unless_the_operator_starts_fresh() -> Result<()> {
+        let (options, _) = parse_start("audit -- inspect")?;
+        assert_eq!(
+            options.body()?["cooperative"]["without_project_memory"],
+            false
+        );
+        let (options, _) = parse_start("audit --without-project-memory -- inspect")?;
+        assert_eq!(
+            options.body()?["cooperative"]["without_project_memory"],
+            true
+        );
+        let text = memory_summary(&json!({"items":[
+            {"task_id":"t1","state":"discarded","claim":"storage skips the check","reason":"the gateway rejects first","same_snapshot":false}
+        ]}));
+        assert!(text.contains("- t1 · discarded: storage skips the check — the gateway rejects first (snapshot anterior)"), "{text}");
+        assert!(memory_summary(&json!({"items":[]})).contains("Ningún equipo anterior"));
+        Ok(())
+    }
+
     #[test]
     fn summary_shows_models_and_consultations() {
         let snapshot = json!({"team":{"task_id":"t","state":"active","template":"review","default_model":"opus","options":{"cross_model_review":true},"members":[

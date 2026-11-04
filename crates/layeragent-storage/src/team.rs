@@ -4,17 +4,19 @@ use crate::Storage;
 use anyhow::{Context, Result, ensure};
 use layeragent_protocol::{
     CooperativeOptions, FindingInput, FindingState, FindingTransition, Message, MessagePurpose,
-    Scope, TeamCommand, TeamExport, TeamMemberInput, TeamMessageInput, TeamRole, TeamSnapshot,
-    TeamTemplate, TeamWorkInput, new_id, now_ms, template_instructions,
+    PROJECT_MEMORY_MAX_ITEMS, Scope, TeamCommand, TeamExport, TeamMemberInput, TeamMessageInput,
+    TeamRole, TeamSnapshot, TeamTemplate, TeamWorkInput, new_id, now_ms, template_instructions,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 mod consult;
 mod controls;
+mod memory;
 mod writers;
 
 pub use controls::OperatorHold;
+pub use memory::MemoryQuery;
 pub use writers::{PatchCarry, PatchSubmission, ReviewOutcome, WriterState};
 
 #[derive(Debug, thiserror::Error)]
@@ -1560,11 +1562,21 @@ impl Storage {
                 evidence,
                 patches,
                 markdown: String::new(),
+                dead_ends: String::new(),
             };
             // Model text and runtime tool output share one sanitization boundary.
             let mut safe = serde_json::to_value(&export)?;
             layeragent_protocol::redact::redact_value(&mut safe);
             export = serde_json::from_value(safe)?;
+            let earlier = memory::project_memory(
+                &tx,
+                &team,
+                &MemoryQuery {
+                    limit: PROJECT_MEMORY_MAX_ITEMS,
+                    ..Default::default()
+                },
+            )?;
+            export.dead_ends = memory::dead_ends_markdown(&export, &earlier);
             export.markdown = markdown_export(
                 &export.team,
                 &export.work,
@@ -5356,6 +5368,254 @@ mod tests {
         assert_eq!(
             f.store.team_snapshot_by_id(&f.team).await?.open_questions,
             0
+        );
+        Ok(())
+    }
+
+    impl Fixture {
+        /// Another cooperative team in the same store, for `principal` on
+        /// `workspace`.
+        async fn sibling(
+            &self,
+            principal: &str,
+            workspace: &str,
+            key: &str,
+        ) -> Result<(Scope, String, String)> {
+            let scope = Scope {
+                tenant: "test".into(),
+                principal: principal.into(),
+            };
+            let created = self
+                .store
+                .create_task_with_execution(
+                    &scope,
+                    workspace,
+                    None,
+                    "audit again",
+                    "fixture",
+                    key,
+                    "sha",
+                    EffortLevel::Auto,
+                    RunMode::Normal,
+                    false,
+                    ExecutionMode::Cooperative,
+                    Some(CooperativeOptions::default()),
+                )
+                .await?;
+            let task = match created {
+                crate::TaskCreate::Created(task) | crate::TaskCreate::Replayed(task) => task,
+            };
+            let team = task.team_id.clone().context("team")?;
+            Ok((scope, task.id, team))
+        }
+
+        async fn conclude(
+            &self,
+            member: &str,
+            key: &str,
+            claim: &str,
+            state: FindingState,
+            snapshot: &str,
+        ) -> Result<String> {
+            let created = self
+                .store
+                .team_create_finding(
+                    &self.team,
+                    member,
+                    FindingInput {
+                        idempotency_key: key.into(),
+                        expected_revision: self.revision().await?,
+                        claim: claim.into(),
+                        state: FindingState::Hypothesis,
+                        reason: "initial read".into(),
+                        evidence_ids: vec![],
+                        snapshot_sha256: None,
+                    },
+                )
+                .await?;
+            let id = created["id"].as_str().context("id")?.to_string();
+            let evidence = if state == FindingState::Discarded {
+                vec![self.evidence(member, &id, snapshot, true, None).await?]
+            } else {
+                vec![]
+            };
+            self.store
+                .team_transition_finding(
+                    &self.team,
+                    member,
+                    &id,
+                    FindingTransition {
+                        idempotency_key: format!("{key}-end"),
+                        expected_revision: 1,
+                        state,
+                        reason: format!("{claim}: settled by the check"),
+                        evidence_ids: evidence,
+                        snapshot_sha256: (state == FindingState::Discarded)
+                            .then(|| snapshot.into()),
+                        environmental_failure: false,
+                    },
+                )
+                .await?;
+            Ok(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn later_teams_on_the_workspace_see_what_earlier_ones_concluded() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let analyst = f.member("analyst").await?;
+        let snapshot = "c".repeat(64);
+        f.store.team_snapshot_changed(&f.team, &snapshot).await?;
+        let discarded = f
+            .conclude(
+                &analyst,
+                "d",
+                "storage skips the token check",
+                FindingState::Discarded,
+                &snapshot,
+            )
+            .await?;
+        f.conclude(
+            &analyst,
+            "i",
+            "the cache leaks sessions",
+            FindingState::Inconclusive,
+            &snapshot,
+        )
+        .await?;
+        f.store
+            .team_create_finding(
+                &f.team,
+                &analyst,
+                FindingInput {
+                    idempotency_key: "open".into(),
+                    expected_revision: f.revision().await?,
+                    claim: "still a hypothesis".into(),
+                    state: FindingState::Hypothesis,
+                    reason: "not checked".into(),
+                    evidence_ids: vec![],
+                    snapshot_sha256: None,
+                },
+            )
+            .await?;
+        let workspace = f._dir.path().to_string_lossy().into_owned();
+        let (later_scope, later_task, later) = f.sibling("alice", &workspace, "later").await?;
+        let all = MemoryQuery {
+            limit: 50,
+            ..Default::default()
+        };
+        assert!(
+            f.store
+                .team_project_memory(&later, all.clone())
+                .await?
+                .is_empty(),
+            "a running team's conclusions are not memory yet"
+        );
+        f.command("cancel", "end-first").await?;
+        let memory = f.store.team_project_memory(&later, all.clone()).await?;
+        assert_eq!(memory.len(), 2, "open hypotheses are left out: {memory:?}");
+        let ruled_out = memory
+            .iter()
+            .find(|m| m["finding_id"] == discarded.as_str())
+            .context("discarded")?;
+        assert_eq!(ruled_out["state"], "discarded");
+        assert_eq!(ruled_out["task_id"], f.task.as_str());
+        assert_eq!(ruled_out["evidence"]["invocation"], "true");
+        assert_eq!(ruled_out["valid_for_snapshot"], snapshot.as_str());
+        assert!(
+            ruled_out["same_snapshot"].is_null(),
+            "the later team has no snapshot yet"
+        );
+        f.store.team_snapshot_changed(&later, &snapshot).await?;
+        let memory = f
+            .store
+            .team_project_memory(
+                &later,
+                MemoryQuery {
+                    state: Some("discarded".into()),
+                    ..all.clone()
+                },
+            )
+            .await?;
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory[0]["same_snapshot"], true);
+        let found = f
+            .store
+            .team_project_memory(
+                &later,
+                MemoryQuery {
+                    text: Some("CACHE".into()),
+                    ..all.clone()
+                },
+            )
+            .await?;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["state"], "inconclusive");
+        assert!(
+            f.store
+                .team_project_memory(
+                    &later,
+                    MemoryQuery {
+                        state: Some("hypothesis".into()),
+                        ..all.clone()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        // Memory stays with its owner and its workspace.
+        let (_, _, other_owner) = f.sibling("bob", &workspace, "bob").await?;
+        assert!(
+            f.store
+                .team_project_memory(&other_owner, all.clone())
+                .await?
+                .is_empty()
+        );
+        let (_, _, elsewhere) = f
+            .sibling("alice", "/elsewhere/project", "elsewhere")
+            .await?;
+        assert!(
+            f.store
+                .team_project_memory(&elsewhere, all.clone())
+                .await?
+                .is_empty()
+        );
+
+        // The dead-ends export lists this team's and the earlier ones.
+        let export = f.store.team_export(&f.scope, &f.task).await?;
+        assert!(
+            export
+                .dead_ends
+                .contains("### discarded — storage skips the token check"),
+            "{}",
+            export.dead_ends
+        );
+        assert!(
+            export.dead_ends.contains("- Evidence `"),
+            "{}",
+            export.dead_ends
+        );
+        assert!(
+            export
+                .dead_ends
+                .contains("### inconclusive — the cache leaks sessions")
+        );
+        assert!(!export.dead_ends.contains("still a hypothesis"));
+        let later_export = f.store.team_export(&later_scope, &later_task).await?;
+        assert!(
+            later_export
+                .dead_ends
+                .contains("## Earlier teams on this workspace")
+                && later_export.dead_ends.contains("discarded (task `"),
+            "{}",
+            later_export.dead_ends
+        );
+        assert_eq!(
+            f.store
+                .team_project_memory_scoped(&later_scope, &later_task, all)
+                .await?
+                .len(),
+            2
         );
         Ok(())
     }

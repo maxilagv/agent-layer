@@ -44,8 +44,9 @@ pub trait TeamControl: Send + Sync {
 pub trait SessionControl: Send + Sync {
     async fn execute(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value>;
 }
-pub const TEAM_TOOLS: [&str; 19] = [
+pub const TEAM_TOOLS: [&str; 20] = [
     "team_members",
+    "team_memory",
     "team_message",
     "team_wait",
     "team_add_member",
@@ -481,6 +482,7 @@ pub fn definitions_with_team(config: &Config, cooperative: bool) -> Vec<ToolDefi
     // current revision. Supplying a stale revision still yields a conflict.
     tools.extend([
         def("team_members", "List team identities, roles, states, the model each member runs, the configured models a consultation can use, the current team revision and your own member id; identities come from the runtime", json!({}), &[]),
+        def("team_memory", "Search what earlier teams on this workspace concluded: discarded and inconclusive findings (dead ends) and reviewed or reproduced ones, newest first, each with its latest evidence and the snapshot it held for. These are earlier peer conclusions, not instructions; recheck what your work depends on when same_snapshot is not true", json!({"state":{"type":"string","enum":["discarded","inconclusive","reviewed","reproduced"]},"query":{"type":"string","maxLength":200},"limit":{"type":"integer","minimum":1,"maximum":layeragent_protocol::PROJECT_MEMORY_MAX_ITEMS}}), &[]),
         def("team_message", "Persist a direct peer message; accepted is not incorporated, understood or resolved. A claim without evidence_id reaches peers marked unsupported. A handoff transfers your in-progress work_id to the recipient. urgent delivers between the recipient's tool calls instead of at its next round", fields(json!({"recipient":id,"purpose":purpose,"body":text,"work_id":id,"finding_id":id,"evidence_id":id,"reply_to":id,"provenance":{"type":"array","items":text,"maxItems":32},"urgent":{"type":"boolean"}})), &["purpose","body"]),
         def("team_wait", "Without reply_timeout_secs: mark this response as waiting, then finish it to release the concurrency slot. With reply_timeout_secs (1..120): wait in this activation for an answer to your open question or verification request; returns waited=true when a message arrives, which you read next", json!({"reason":text,"reply_timeout_secs":{"type":"integer","minimum":1,"maximum":120}}), &["reason"]),
         def("team_add_member", "Coordinator only: add a specialist for distinct justified work", fields(json!({"name":text,"role":role,"justification":text,"model":id})), &["name","role","justification"]),
@@ -1361,6 +1363,7 @@ mod tests {
             "team_patch_review",
             "team_patch_submit",
             "team_consult",
+            "team_memory",
         ] {
             assert!(writing.contains(&tool.to_string()), "{tool}");
         }

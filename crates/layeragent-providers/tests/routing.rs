@@ -34,6 +34,8 @@ async fn transient_failure_uses_only_authorized_fallback() -> Result<()> {
                 input_per_million: None,
                 output_per_million: None,
                 parameters: Default::default(),
+                notes: None,
+                team_access: Default::default(),
             },
         );
     }

@@ -5,6 +5,7 @@
 //! question and is retired by storage. Every member's model is visible to
 //! peers, so a team can pick a reviewer on a different model.
 use super::*;
+use layeragent_config::ModelTeamAccess;
 use layeragent_protocol::{
     CONSULT_DEFAULT_TOKENS, MAX_ACTIVE_CONSULTANTS, MAX_CONSULTATIONS, TeamConsultInput,
     model_identity,
@@ -56,6 +57,23 @@ fn identity(config: &Config, alias: &str) -> Option<String> {
     config.models.get(alias).map(|m| model_identity(&m.id))
 }
 
+/// The model alias a member's next activation runs.
+pub(super) fn member_alias(snapshot: &TeamSnapshot, member: &str) -> Option<String> {
+    let row = snapshot.members.iter().find(|m| m["id"] == member)?;
+    member_model(snapshot, row)
+}
+
+/// Refuses to let `member` write when its model may only read in teams.
+pub(super) fn require_writer_model(
+    config: &Config,
+    snapshot: &TeamSnapshot,
+    member: &str,
+) -> Result<()> {
+    let alias = member_alias(snapshot, member)
+        .with_context(|| format!("the model of member {member} is not known"))?;
+    config.require_team_model(&alias, true)
+}
+
 /// The model identity a member would review with, if it is known.
 pub(super) fn member_identity(
     config: &Config,
@@ -84,11 +102,13 @@ pub(super) fn members_view(
             row
         })
         .collect();
+    // Models the operator keeps out of teams are not offered at all.
     let models: Vec<Value> = config
         .models
         .iter()
+        .filter(|(_, model)| model.team_access != ModelTeamAccess::None)
         .map(|(alias, model)| {
-            json!({"alias":alias,"provider":model.provider,"model_id":model_identity(&model.id),"context_window":model.context_window,"tools":model.tools || model.emulate_tools,"input_per_million":model.input_per_million,"output_per_million":model.output_per_million})
+            json!({"alias":alias,"provider":model.provider,"model_id":model_identity(&model.id),"team_access":model.team_access.as_str(),"notes":model.notes,"context_window":model.context_window,"tools":model.tools || model.emulate_tools,"input_per_million":model.input_per_million,"output_per_million":model.output_per_million})
         })
         .collect();
     let active = snapshot
@@ -115,6 +135,48 @@ pub(super) fn members_view(
         "models":models,
         "consultations":{"running":active,"used":used,"max_running":MAX_ACTIVE_CONSULTANTS,"max_total":MAX_CONSULTATIONS,"default_budget_tokens":CONSULT_DEFAULT_TOKENS},
     })
+}
+
+/// Most models listed in an activation prompt; `team_members` lists all.
+const PROMPT_MODELS: usize = 8;
+
+/// One line naming the models a member can bring in, with what the operator
+/// allows each to do and the operator's note, when there is a choice.
+pub(super) fn models_line(config: &Config) -> Option<String> {
+    let usable: Vec<String> = config
+        .models
+        .iter()
+        .filter(|(_, model)| model.team_access != ModelTeamAccess::None)
+        .map(|(alias, model)| {
+            let access = match model.team_access {
+                ModelTeamAccess::Read => "reads and reviews only",
+                _ => "can write",
+            };
+            match &model.notes {
+                Some(notes) => {
+                    format!("{alias} ({}, {access}: {notes})", model_identity(&model.id))
+                }
+                None => format!("{alias} ({}, {access})", model_identity(&model.id)),
+            }
+        })
+        .collect();
+    if usable.len() < 2 {
+        return None;
+    }
+    let mut line = format!(
+        " Models the operator allows in this team: {}",
+        usable
+            .iter()
+            .take(PROMPT_MODELS)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    if usable.len() > PROMPT_MODELS {
+        line.push_str("; more in team_members");
+    }
+    line.push('.');
+    Some(line)
 }
 
 /// The activation prompt of a consultant.
@@ -168,6 +230,7 @@ impl EngineTeamControl {
         let configured = ctx.config.models.get(&alias).with_context(|| {
             format!("unknown model {alias}; team_members lists the configured models")
         })?;
+        ctx.config.require_team_model(&alias, false)?;
         ensure!(
             configured.tools || configured.emulate_tools,
             "model {alias} cannot call tools, and a consultant answers through team_message"

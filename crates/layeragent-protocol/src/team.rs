@@ -606,6 +606,11 @@ pub struct TeamSnapshot {
     /// Model alias of members without their own, as the supervisor last ran it.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Consumption per model the team's activations ran, in order of first
+    /// use: activations, settled tokens and cost, and tokens still reserved
+    /// or uncertain at their estimate.
+    #[serde(default)]
+    pub usage_by_model: Vec<Value>,
     pub created_at: i64,
     pub updated_at: i64,
 }

@@ -1365,6 +1365,8 @@ mod tests {
             input_per_million: None,
             output_per_million: None,
             parameters: Default::default(),
+            notes: None,
+            team_access: Default::default(),
         };
         let (_, body) =
             format_request(&provider, &model, std::slice::from_ref(&message), &[], 100)?;

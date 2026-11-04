@@ -9,7 +9,9 @@ read the shared team workspace; when the operator creates the task with write
 scope, a member can switch to writing in its own worktree (see
 [cooperative writers](#godeye-cooperative-writers)). Members can run different
 models, bring in consultants and require cross-model review (see
-[teams on several models](#godeye-teams-on-several-models)).
+[teams on several models](#godeye-teams-on-several-models)); the operator
+decides per model what it may do in a team (see
+[model rules](#godeye-model-rules-and-usage-by-model)).
 The [terminal guide](15-cooperative-terminal.md) includes a local scripted demo,
 controls and an optional native check. Actual outcomes for the maintained source
 fingerprint belong to `verification.json`; fixture success does not establish
@@ -277,6 +279,53 @@ mechanisms, not that two real providers interoperate in one team, nor that a
 different model reviews better. No live run with two providers was made for
 this increment. The sandbox is the same test double as for writers and does
 not certify confinement.
+
+## Godeye model rules and usage by model
+
+Fourth godeye increment: the operator states per model what it may do in a
+team, members see the operator's note on each model, and the team reports what
+each model consumed. The operator-facing description is in
+[teams on several models](15-cooperative-terminal.md#teams-on-several-models).
+
+- **Team access per model.** `models.NAME.team_access` is `write` (the
+  default, the previous behaviour), `read` or `none`. Task creation refuses a
+  team model or role model that is `none`, write scope without any `write`
+  model, and cross-model review unless two models allowed in teams have
+  different model ids. `team_add_member` and `team_consult` refuse a `none`
+  model. `team_access mode=write` is refused for a member whose model is
+  `read`, and so is a handoff of work with reserved paths to such a member;
+  review and approval are allowed on `read` models. The supervisor checks the
+  current configuration before every activation and blocks the team with the
+  reason when a member's model may no longer run it, or may no longer write
+  for a writing member. Checks during an activation use the configuration it
+  started with.
+- **Notes.** `models.NAME.notes` is one line of at most 200 bytes. With more
+  than one model allowed in the team, every member's prompt lists those models
+  with their model id, access and note (at most eight; `team_members` lists
+  all), and a member on a `read` model is told it reviews and hands over work
+  needing changes. `team_members` adds `team_access` and `notes` to each model
+  and leaves out `none` models.
+- **Usage by model.** The snapshot's `usage_by_model` groups the team's
+  activations by recorded model: activations, settled input and output tokens
+  and cost, and tokens and estimated cost still reserved or uncertain.
+  `team show` and the Markdown export print it. Figures are the runtime's
+  accounting with configured prices, not provider invoices.
+
+Verification: a configuration test covers parsing, the default, the three
+levels and note validation. A gateway test covers a refused excluded team or
+role model, an excluded model not counting toward cross-model review, write
+scope without a writer model, and accepted read-only teams. A storage test
+covers usage grouped per model, including an interrupted call kept at its
+estimate, and the Markdown section; a CLI test covers its rendering. Two
+runtime tests in `crates/layeragent-core/tests/cooperative_consult.rs` drive
+scripted teams: one checks the prompt's model list and `team_members`, refuses
+an excluded model for a new member and a consultation, refuses writing to the
+reviewer on a `read` model, which hands the work to the writer, refuses the
+writer handing reserved work back, and integrates the writer's patch approved
+from the `read` model, with consumption reported per model; the other blocks a
+team whose role model became `none` after creation before that model runs.
+Scripted models show the rules hold, not that real models choose well between
+models, and no live run with two providers was made.
 
 ## Cooperative bus hardening increment
 

@@ -164,7 +164,12 @@ impl EngineTeamControl {
         ))
     }
 
-    pub(super) async fn access(&self, ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
+    pub(super) async fn access(
+        &self,
+        ctx: &ToolContext<'_>,
+        snapshot: &TeamSnapshot,
+        args: &Value,
+    ) -> Result<Value> {
         let store = &self.runtime.store;
         let context = &self.runtime.context;
         let (team, member) = (&context.team_id, &context.member_id);
@@ -198,6 +203,7 @@ impl EngineTeamControl {
                     self.engine.config().await.policy.write,
                     "operator policy does not allow writing"
                 );
+                consult::require_writer_model(ctx.config, snapshot, member)?;
                 let work = required(args, "work_id")?;
                 let paths: Vec<String> = args["paths"]
                     .as_array()
@@ -442,7 +448,12 @@ impl EngineTeamControl {
 
     /// A handoff from a writing member also carries its unsubmitted changes to
     /// the reserved paths of that work, which then leave the sender's worktree.
-    pub(super) async fn handoff(&self, args: &Value) -> Result<Value> {
+    pub(super) async fn handoff(
+        &self,
+        ctx: &ToolContext<'_>,
+        snapshot: &TeamSnapshot,
+        args: &Value,
+    ) -> Result<Value> {
         let store = &self.runtime.store;
         let context = &self.runtime.context;
         let (team, member) = (&context.team_id, &context.member_id);
@@ -455,6 +466,18 @@ impl EngineTeamControl {
             .filter(|(_, w)| w == &work)
             .map(|(p, _)| p.clone())
             .collect();
+        // Reserved paths and unsubmitted changes travel with the work, and
+        // only a member on a model that may write can carry them on.
+        if !claims.is_empty()
+            && let Some(alias) = input
+                .recipient
+                .as_deref()
+                .and_then(|recipient| consult::member_alias(snapshot, recipient))
+        {
+            ctx.config.require_team_model(&alias, true).map_err(|error| {
+                anyhow::anyhow!("this work reserves paths, so its recipient has to write: {error}; submit the changes first, or hand the work to a member on a model that can write")
+            })?;
+        }
         let mut carry = None;
         if let (Some(worktree), Some(base)) = (&state.worktree, &state.base)
             && !claims.is_empty()

@@ -232,9 +232,43 @@ pub struct Model {
     pub output_per_million: Option<f64>,
     #[serde(default)]
     pub parameters: BTreeMap<String, serde_json::Value>,
+    /// The operator's note on what this model is good at, shown to team
+    /// members choosing a model (one line, at most [`MAX_MODEL_NOTES`] bytes).
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// The most this model may do in a cooperative team.
+    #[serde(default)]
+    pub team_access: ModelTeamAccess,
 }
 fn yes() -> bool {
     true
+}
+
+/// Longest operator note on a model.
+pub const MAX_MODEL_NOTES: usize = 200;
+
+/// What a model may do in a cooperative team. Sending a team's code to a
+/// provider is the operator's decision, so it is set per model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTeamAccess {
+    /// Runs members that read, review, are consulted and write.
+    #[default]
+    Write,
+    /// Runs members that read, review and are consulted, never a writer.
+    Read,
+    /// Never runs a team member.
+    None,
+}
+
+impl ModelTeamAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read",
+            Self::None => "none",
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -376,6 +410,24 @@ impl Default for Gateway {
 }
 
 impl Config {
+    /// Refuses a model that a cooperative team may not run, or may not write
+    /// with when `write` is set.
+    pub fn require_team_model(&self, alias: &str, write: bool) -> Result<()> {
+        let model = self
+            .models
+            .get(alias)
+            .with_context(|| format!("model {alias} is not configured"))?;
+        match model.team_access {
+            ModelTeamAccess::None => {
+                anyhow::bail!("model {alias} may not run team members (team_access = \"none\")")
+            }
+            ModelTeamAccess::Read if write => anyhow::bail!(
+                "model {alias} may only read in a team (team_access = \"read\"); a member on a model that can write has to make this change"
+            ),
+            _ => Ok(()),
+        }
+    }
+
     pub fn require_model_egress(&self, alias: &str) -> Result<()> {
         let model = self
             .models
@@ -635,6 +687,12 @@ impl Config {
             {
                 ensure!(price.is_finite() && price >= 0.0, "invalid model price");
             }
+            if let Some(notes) = &m.notes {
+                ensure!(
+                    notes.len() <= MAX_MODEL_NOTES && !notes.chars().any(char::is_control),
+                    "model {name}: notes must be one line of at most {MAX_MODEL_NOTES} bytes"
+                );
+            }
         }
         for id in std::iter::once(&self.primary)
             .chain(self.fallbacks.iter())
@@ -807,6 +865,8 @@ mod tests {
                 input_per_million: None,
                 output_per_million: None,
                 parameters: Default::default(),
+                notes: None,
+                team_access: Default::default(),
             },
         );
         config.privacy.local_models_only = true;
@@ -831,6 +891,60 @@ mod tests {
             channel_id: None,
         });
         assert!(config.validate().is_err());
+        Ok(())
+    }
+    #[test]
+    fn a_model_states_what_it_may_do_in_a_team() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+primary = "writer"
+[providers.local]
+wire = "ollama"
+base_url = "http://127.0.0.1:11434"
+[models.writer]
+provider = "local"
+id = "a"
+context_window = 4096
+[models.reader]
+provider = "local"
+id = "b"
+context_window = 4096
+team_access = "read"
+notes = "strong at reading large modules"
+[models.outside]
+provider = "local"
+id = "c"
+context_window = 4096
+team_access = "none"
+"#,
+        )?;
+        config.validate()?;
+        assert_eq!(config.models["writer"].team_access, ModelTeamAccess::Write);
+        config.require_team_model("writer", true)?;
+        config.require_team_model("reader", false)?;
+        let read_only = config
+            .require_team_model("reader", true)
+            .err()
+            .context("a read-only model cannot write")?;
+        assert!(
+            read_only.to_string().contains("may only read"),
+            "{read_only}"
+        );
+        let outside = config
+            .require_team_model("outside", false)
+            .err()
+            .context("an excluded model cannot join")?;
+        assert!(
+            outside.to_string().contains("may not run team members"),
+            "{outside}"
+        );
+        assert!(config.require_team_model("unknown", false).is_err());
+        let mut noisy = config.clone();
+        noisy.models.get_mut("reader").context("reader")?.notes = Some("two\nlines".into());
+        assert!(noisy.validate().is_err());
+        noisy.models.get_mut("reader").context("reader")?.notes =
+            Some("x".repeat(MAX_MODEL_NOTES + 1));
+        assert!(noisy.validate().is_err());
         Ok(())
     }
     #[test]

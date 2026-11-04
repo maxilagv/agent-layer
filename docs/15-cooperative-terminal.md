@@ -129,8 +129,38 @@ A team can mix models. Each configured model alias (see the annotated
 [example configuration](../examples/config.toml)) can run members: the team's
 own model runs members without one, `team_add_member` accepts `model`, and
 `cooperative.role_models` sets a model per role. `team_members` shows every
-member's model and the configured aliases, with their model ids and prices,
-never endpoints or credentials. `team show` and exports list each member's model.
+member's model and the configured aliases, with their model ids, prices, team
+access and your notes, never endpoints or credentials. `team show` and exports
+list each member's model and what each model consumed.
+
+Sending a team's code to a provider is your decision, so each model states
+what it may do in a team:
+
+```toml
+[models.second]
+provider = "second"
+id = "YOUR_SECOND_MODEL"
+context_window = 65536
+team_access = "read"   # "write" (default), "read" or "none"
+notes = "strong at reading large modules"
+```
+
+- **`write`** models run any member, including writers.
+- **`read`** models run members that read, review and approve patches and
+  answer consultations. A member on one cannot switch to writing, and work
+  with reserved paths cannot be handed to it; it hands work that needs file
+  changes to a member on a model that can write.
+- **`none`** models never run a member: they are refused as the team's model,
+  as a role model, for `team_add_member` and for `team_consult`, and are left
+  out of `team_members`.
+
+A team with `--allow-write` needs at least one `write` model. A change to
+these settings applies from each member's next activation: when it would run
+a member on a model that may no longer do so, the supervisor blocks the team
+with the reason instead, and `team resume` continues once the setting allows
+that member's model again. Notes are one line of
+at most 200 bytes; when more than one model may run in the team, each member's
+prompt lists the models with their access and notes.
 
 ```bash
 layeragent run "Review and fix the parser" --workspace . \
@@ -163,6 +193,11 @@ layeragent run "Review and fix the parser" --workspace . \
   two aliases or providers serving the same model id count as the same model.
   `team_consult` with a `patch_id` brings in a reviewer on another model whose
   decision answers the consultation.
+
+`team show` lists, per model the team ran, its activations, input and output
+tokens and cost from settled usage, plus the tokens still reserved or
+uncertain at their estimate. Costs use the prices you configured and are zero
+for an unpriced model; they are not provider invoices.
 
 A consultation's budget is checked against actual consumption before each of
 its model calls, so the call that crosses the budget completes: a consultation
@@ -236,10 +271,11 @@ The existing task creation endpoint accepts `execution` and `cooperative` option
 queries include `deliveries`, `finding_revisions`, `patches` and `claims`; JSON
 exports also include attributed events and patches. Creating a task with
 `cooperative.scope.allow_write` requires a task policy that allows writes, and
-`cooperative.cross_model_review` requires write scope and two configured models
-with different model ids. Member rows carry `last_model` and, for consultants,
+`cooperative.cross_model_review` requires write scope and two models allowed in
+teams with different model ids. A team model, role model or write scope that
+the models' `team_access` does not allow is refused. Member rows carry `last_model` and, for consultants,
 `consult` (who asked, the question, budget, tokens used and outcome); the
-snapshot carries `default_model`. `GET /v1/tasks/{id}/team/{resource}?tail=N` returns the most
+snapshot carries `default_model` and `usage_by_model`. `GET /v1/tasks/{id}/team/{resource}?tail=N` returns the most
 recent rows of a resource (at most 200), and
 `GET /v1/tasks/{id}/team/threads/{message}` returns the reply chain containing a
 message. A task-level correction on a cooperative task is refused; send an

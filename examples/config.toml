@@ -33,6 +33,11 @@ provider = "openai"
 id = "YOUR_OPENAI_MODEL"
 context_window = 32768
 tools = true
+# What this model may do in a cooperative team: "write" (the default), "read"
+# (reads, reviews patches and answers consultations, never writes) or "none".
+# team_access = "read"
+# One line shown to team members choosing a model (at most 200 bytes).
+# notes = "strong at reading large modules"
 
 [providers.anthropic]
 wire = "anthropic"

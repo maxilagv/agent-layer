@@ -306,13 +306,15 @@ impl TeamControl for EngineTeamControl {
         match name {
             "team_members" => Ok(consult::members_view(ctx.config, &snapshot, &current)),
             "team_consult" => self.consult(ctx, &snapshot, args).await,
-            "team_message" if args["purpose"] == "handoff" => self.handoff(args).await,
+            "team_message" if args["purpose"] == "handoff" => {
+                self.handoff(ctx, &snapshot, args).await
+            }
             "team_message" => {
                 store
                     .team_member_message(team, member, serde_json::from_value(args.clone())?)
                     .await
             }
-            "team_access" => self.access(ctx, args).await,
+            "team_access" => self.access(ctx, &snapshot, args).await,
             "team_patch_submit" => self.submit(ctx, args).await,
             "team_patch_show" => self.show(args).await,
             "team_patch_review" => self.review(ctx, args).await,
@@ -344,6 +346,7 @@ impl TeamControl for EngineTeamControl {
                         .models
                         .get(model)
                         .with_context(|| format!("unknown role model {model}"))?;
+                    ctx.config.require_team_model(model, false)?;
                     // Unpriced usage is charged as zero, which would silently
                     // escape a team cost ceiling.
                     ensure!(
@@ -699,6 +702,7 @@ impl Engine {
                         let mut admission_error = None;
                         let mut admitted = false;
                         let config = self.config().await;
+                        let models = consult::models_line(&config);
                         for candidate in candidates.into_iter().take(capacity) {
                             let member = candidate["id"].as_str().context("member id")?.to_string();
                             // The model is fixed and recorded when the activation
@@ -707,6 +711,13 @@ impl Engine {
                                 .as_str()
                                 .map(str::to_string)
                                 .unwrap_or_else(|| default_model.clone());
+                            // The operator may have changed what a model may do
+                            // since the team started: stop instead of running it.
+                            if let Err(error) = config.require_team_model(&selected, candidate["access"] == "write") {
+                                let reason = format!("member {member} cannot be activated: {error}; change the model's team_access, then resume");
+                                store.team_runtime_state(&team, "blocked", Some(&reason)).await?;
+                                break;
+                            }
                             let identity = config.models.get(&selected).map(|m| model_identity(&m.id));
                             let started =
                                 match store.team_start_activation_with_model(&team, &member, &owner, Some(&selected), identity.as_deref()).await {
@@ -764,7 +775,8 @@ impl Engine {
                                 }
                             };
                             let initial = candidate["activations"].as_i64() == Some(0);
-                            let prompt = activation_prompt(&task, &snapshot, &candidate, &selected, initial);
+                            let may_write = config.require_team_model(&selected, true).is_ok();
+                            let prompt = activation_prompt(&task, &snapshot, &candidate, &selected, models.as_deref(), may_write, initial);
                             let consultant = candidate["role"] == "consultant";
                             let engine = self.clone();
                             let scope = scope.clone();
@@ -846,6 +858,8 @@ fn activation_prompt(
     snapshot: &TeamSnapshot,
     member: &Value,
     model: &str,
+    models: Option<&str>,
+    may_write: bool,
     initial: bool,
 ) -> String {
     let role = member["role"].as_str().unwrap_or("specialist");
@@ -871,12 +885,17 @@ fn activation_prompt(
         .is_some_and(|m| m["access"] == "write");
     prompt.push_str(if !snapshot.options.scope.allow_write {
         " Access: read; this team cannot change files."
+    } else if !may_write {
+        " Access: read. The operator lets your model only read in this team: you review patches with team_patch_show and team_patch_review, and hand work that needs file changes to a member on a model that can write."
     } else if writing {
         " Access: write. You work in your own worktree of the team workspace; nobody sees your changes until another member approves your patch. Change only paths you reserved, submit with team_patch_submit naming a reviewer, and switch back with team_access mode=read when you no longer need to write."
     } else {
         " Access: read. When your work needs file changes, claim the work item, then call team_access with mode=write, its work_id and the paths you will change; your next activation runs in your own worktree. Review other members' patches with team_patch_show and team_patch_review."
     });
     prompt.push_str(&format!(" You run model {model}; team_members shows every member's model and the configured models. For a second opinion from another model, use team_consult: it brings in a read-only consultant for one question, which answers you and then leaves."));
+    if let Some(models) = models {
+        prompt.push_str(models);
+    }
     if snapshot.options.cross_model_review {
         prompt.push_str(" Cross-model review is required: a patch is approved only by a member or consultant running a different model than the one that wrote it. When nobody on another model is free, consult one with team_consult and the patch_id.");
     }

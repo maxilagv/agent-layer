@@ -42,6 +42,8 @@ fn config() -> Config {
             input_per_million: None,
             output_per_million: None,
             parameters: Default::default(),
+            notes: None,
+            team_access: Default::default(),
         },
     );
     c.primary = "fixture".into();

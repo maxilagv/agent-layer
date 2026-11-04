@@ -156,8 +156,24 @@ pub(super) async fn create(
                 .into());
             }
         }
+        // The operator decides per model what may run in a team.
+        let selected = r.model.clone().unwrap_or_else(|| config.primary.clone());
+        for alias in std::iter::once(&selected).chain(options.role_models.values()) {
+            config.require_team_model(alias, false)?;
+        }
+        use layeragent_config::ModelTeamAccess;
+        if options.scope.allow_write
+            && !config
+                .models
+                .values()
+                .any(|model| model.team_access == ModelTeamAccess::Write)
+        {
+            return Err(anyhow::anyhow!(
+                "cooperative write scope needs a configured model with team_access = \"write\""
+            )
+            .into());
+        }
         if options.limits.max_cost_usd.is_some() {
-            let selected = r.model.clone().unwrap_or_else(|| config.primary.clone());
             for alias in std::iter::once(&selected).chain(options.role_models.values()) {
                 let model = config
                     .models
@@ -179,11 +195,12 @@ pub(super) async fn create(
             let distinct: std::collections::BTreeSet<String> = config
                 .models
                 .values()
+                .filter(|model| model.team_access != ModelTeamAccess::None)
                 .map(|model| layeragent_protocol::model_identity(&model.id))
                 .collect();
             if distinct.len() < 2 {
                 return Err(anyhow::anyhow!(
-                    "cross-model review needs at least two configured models with different model ids"
+                    "cross-model review needs at least two models allowed in teams with different model ids"
                 )
                 .into());
             }

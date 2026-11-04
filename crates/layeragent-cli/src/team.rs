@@ -275,6 +275,32 @@ pub fn summary(value: &Value) -> String {
             ));
         }
     }
+    if let Some(rows) = team["usage_by_model"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        out.push_str("Consumo por modelo (estimado, no es la factura del proveedor):\n");
+        for row in rows {
+            let open = row["reserved_tokens"].as_i64().unwrap_or(0)
+                + row["uncertain_tokens"].as_i64().unwrap_or(0);
+            out.push_str(&format!(
+                "  {} · {} activaciones · {} entrada / {} salida tokens · US${:.4}{}\n",
+                row["model"].as_str().unwrap_or("sin registrar"),
+                row["activations"].as_i64().unwrap_or(0),
+                row["input_tokens"].as_i64().unwrap_or(0),
+                row["output_tokens"].as_i64().unwrap_or(0),
+                row["cost_usd"].as_f64().unwrap_or(0.0),
+                if open > 0 {
+                    format!(
+                        " · {open} tokens reservados o inciertos (US${:.4})",
+                        row["estimated_open_cost_usd"].as_f64().unwrap_or(0.0)
+                    )
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    }
     terminal_text(&out)
 }
 
@@ -517,6 +543,18 @@ mod tests {
         );
         assert!(text.contains("consultant-1 (c) · consultant · deepseek · respondió · 1200/150000 tokens · terminated"), "{text}");
         assert!(text.contains("Revisión cruzada"), "{text}");
+        let spent = json!({"team":{"task_id":"t","state":"active","template":"review","members":[],"usage_by_model":[
+            {"model":"opus","activations":2,"input_tokens":1500,"output_tokens":300,"cost_usd":0.07,"reserved_tokens":0,"uncertain_tokens":0,"estimated_open_cost_usd":0.0},
+            {"model":"deepseek","activations":1,"input_tokens":3000,"output_tokens":400,"cost_usd":0.01,"reserved_tokens":0,"uncertain_tokens":500,"estimated_open_cost_usd":0.004}
+        ]}});
+        let text = summary(&spent);
+        assert!(
+            text.contains(
+                "  opus · 2 activaciones · 1500 entrada / 300 salida tokens · US$0.0700\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("deepseek · 1 activaciones · 3000 entrada / 400 salida tokens · US$0.0100 · 500 tokens reservados o inciertos (US$0.0040)"), "{text}");
     }
 
     #[test]

@@ -829,8 +829,8 @@ impl Storage {
     pub async fn team_candidates(&self, team: &str) -> Result<Vec<Value>> {
         let team = team.to_string();
         self.read(move |c| {
-            let mut q = c.prepare("SELECT m.id,m.name,m.role,m.model,m.session_id,m.activations,m.consult_asker,m.consult_question,m.consult_budget,(SELECT s.name FROM team_members s WHERE s.id=m.consult_asker) FROM team_members m WHERE m.team_id=?1 AND m.state IN ('inactive','waiting_response') AND NOT EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=m.id AND a.state IN ('starting','running')) AND (m.activations=0 OR EXISTS(SELECT 1 FROM team_deliveries d WHERE d.recipient_member_id=m.id AND d.state='accepted') OR EXISTS(SELECT 1 FROM team_work w WHERE w.assignee=m.id AND w.state IN ('pending','assigned')) OR (m.access='write' AND m.access_applied='read')) ORDER BY m.role='coordinator' DESC,m.created_at,m.rowid")?;
-            let rows = q.query_map([&team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"activations":r.get::<_,i64>(5)?,"consult":r.get::<_,Option<String>>(6)?.map(|asker| json!({"asker":asker,"question_id":r.get::<_,Option<String>>(7).ok().flatten(),"budget_tokens":r.get::<_,Option<i64>>(8).ok().flatten(),"asker_name":r.get::<_,Option<String>>(9).ok().flatten()}))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut q = c.prepare("SELECT m.id,m.name,m.role,m.model,m.session_id,m.activations,m.consult_asker,m.consult_question,m.consult_budget,(SELECT s.name FROM team_members s WHERE s.id=m.consult_asker),m.access FROM team_members m WHERE m.team_id=?1 AND m.state IN ('inactive','waiting_response') AND NOT EXISTS(SELECT 1 FROM team_activations a WHERE a.member_id=m.id AND a.state IN ('starting','running')) AND (m.activations=0 OR EXISTS(SELECT 1 FROM team_deliveries d WHERE d.recipient_member_id=m.id AND d.state='accepted') OR EXISTS(SELECT 1 FROM team_work w WHERE w.assignee=m.id AND w.state IN ('pending','assigned')) OR (m.access='write' AND m.access_applied='read')) ORDER BY m.role='coordinator' DESC,m.created_at,m.rowid")?;
+            let rows = q.query_map([&team], |r| Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"model":r.get::<_,Option<String>>(3)?,"session_id":r.get::<_,Option<String>>(4)?,"activations":r.get::<_,i64>(5)?,"consult":r.get::<_,Option<String>>(6)?.map(|asker| json!({"asker":asker,"question_id":r.get::<_,Option<String>>(7).ok().flatten(),"budget_tokens":r.get::<_,Option<i64>>(8).ok().flatten(),"asker_name":r.get::<_,Option<String>>(9).ok().flatten()})),"access":r.get::<_,String>(10)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         }).await
     }
@@ -1849,11 +1849,34 @@ fn team_snapshot(c: &Connection, team: &str) -> Result<TeamSnapshot> {
         open_questions: open as u64,
         pending_approvals,
         default_model,
+        usage_by_model: usage_by_model(c, team)?,
         last_event_seq: c.query_row("SELECT last_event_seq FROM tasks WHERE id=?1", [&task], |r| r.get(0))?,
         pause_pending: state == "paused" && c.query_row("SELECT EXISTS(SELECT 1 FROM team_activations WHERE team_id=?1 AND state IN ('starting','running') AND pause_boundary=0)", [team], |r| r.get::<_, bool>(0))?,
         created_at: created,
         updated_at: updated,
     })
+}
+
+/// What each model the team ran consumed. Settled figures come from the
+/// provider's reported usage; reserved and uncertain ones are estimates.
+fn usage_by_model(c: &Connection, team: &str) -> Result<Vec<Value>> {
+    let settled = |field: &str| {
+        format!(
+            "COALESCE(sum(CASE WHEN r.state='settled' THEN COALESCE(json_extract(r.actual_usage,'$.{field}'),0) ELSE 0 END),0)"
+        )
+    };
+    let mut q = c.prepare(&format!(
+        "SELECT a.model,a.model_identity,count(DISTINCT a.id),{},{},{},COALESCE(sum(CASE WHEN r.state='reserved' THEN r.input_tokens+r.output_tokens ELSE 0 END),0),COALESCE(sum(CASE WHEN r.state='uncertain' THEN r.input_tokens+r.output_tokens ELSE 0 END),0),COALESCE(sum(CASE WHEN r.state IN ('reserved','uncertain') THEN r.estimated_cost_usd ELSE 0 END),0) FROM team_activations a LEFT JOIN team_reservations r ON r.activation_id=a.id WHERE a.team_id=?1 GROUP BY a.model,a.model_identity ORDER BY min(a.started_at),min(a.rowid)",
+        settled("input_tokens"),
+        settled("output_tokens"),
+        settled("cost_usd"),
+    ))?;
+    let rows = q
+        .query_map([team], |r| {
+            Ok(json!({"model":r.get::<_,Option<String>>(0)?,"model_id":r.get::<_,Option<String>>(1)?,"activations":r.get::<_,i64>(2)?,"input_tokens":r.get::<_,i64>(3)?,"output_tokens":r.get::<_,i64>(4)?,"cost_usd":r.get::<_,f64>(5)?,"reserved_tokens":r.get::<_,i64>(6)?,"uncertain_tokens":r.get::<_,i64>(7)?,"estimated_open_cost_usd":r.get::<_,f64>(8)?}))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 fn members(c: &Connection, team: &str) -> Result<Vec<Value>> {
@@ -2275,6 +2298,26 @@ fn markdown_export(
             inline(&json!(model)),
             consult
         ));
+    }
+    if !team.usage_by_model.is_empty() {
+        out.push_str("\n## Usage by model\n");
+        for row in &team.usage_by_model {
+            let open = row["reserved_tokens"].as_i64().unwrap_or(0)
+                + row["uncertain_tokens"].as_i64().unwrap_or(0);
+            out.push_str(&format!(
+                "- {}: {} activations, {} input and {} output tokens, ${:.4}{}\n",
+                inline(&json!(row["model"].as_str().unwrap_or("unrecorded"))),
+                row["activations"].as_i64().unwrap_or(0),
+                row["input_tokens"].as_i64().unwrap_or(0),
+                row["output_tokens"].as_i64().unwrap_or(0),
+                row["cost_usd"].as_f64().unwrap_or(0.0),
+                if open > 0 {
+                    format!("; {open} tokens reserved or uncertain")
+                } else {
+                    String::new()
+                }
+            ));
+        }
     }
     out.push_str("\n## Work\n");
     for row in work {
@@ -5012,6 +5055,74 @@ mod tests {
         assert_eq!(
             f.store.team_snapshot_by_id(&f.team).await?.open_questions,
             0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn usage_is_reported_per_model_the_team_ran() -> Result<()> {
+        let f = Fixture::new(CooperativeOptions::default()).await?;
+        let analyst = f.member("analyst").await?;
+        let reviewer = f.member("reviewer").await?;
+        let spend = |activation: String, input: u64, output: u64, cost: f64| {
+            let store = f.store.clone();
+            let team = f.team.clone();
+            async move {
+                let reservation = store
+                    .team_reserve(&team, &activation, 1, "investigation", 100, 100, 0.01)
+                    .await?;
+                store
+                    .team_settle_reservation(
+                        &reservation,
+                        &activation,
+                        Some(&layeragent_protocol::Usage {
+                            input_tokens: input,
+                            output_tokens: output,
+                        }),
+                        cost,
+                        false,
+                    )
+                    .await
+            }
+        };
+        let (opus, _) = f.activation_on(&analyst, "claude-opus-5-5").await?;
+        spend(opus.clone(), 1_000, 200, 0.05).await?;
+        spend(opus.clone(), 500, 100, 0.02).await?;
+        f.finish(&opus, &analyst, "completed").await?;
+        let (deepseek, _) = f.activation_on(&reviewer, "deepseek-chat").await?;
+        spend(deepseek.clone(), 3_000, 400, 0.01).await?;
+        // A call cut short stays charged at its estimate.
+        f.store
+            .team_reserve(&f.team, &deepseek, 1, "review", 300, 200, 0.004)
+            .await?;
+        f.finish(&deepseek, &reviewer, "interrupted").await?;
+
+        let snapshot = f.store.team_snapshot_by_id(&f.team).await?;
+        let rows = &snapshot.usage_by_model;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["model"], "claude-opus-5-5", "first used first");
+        assert_eq!(rows[0]["activations"], 1);
+        assert_eq!(rows[0]["input_tokens"], 1_500);
+        assert_eq!(rows[0]["output_tokens"], 300);
+        assert!((rows[0]["cost_usd"].as_f64().context("cost")? - 0.07).abs() < 1e-9);
+        assert_eq!(rows[0]["uncertain_tokens"], 0);
+        assert_eq!(rows[1]["model_id"], "deepseek-chat");
+        assert_eq!(rows[1]["input_tokens"], 3_000);
+        assert_eq!(rows[1]["uncertain_tokens"], 500);
+        assert!(
+            (rows[1]["estimated_open_cost_usd"]
+                .as_f64()
+                .context("estimate")?
+                - 0.004)
+                .abs()
+                < 1e-9
+        );
+
+        let export = f.store.team_export(&f.scope, &f.task).await?;
+        assert!(
+            export.markdown.contains("## Usage by model\n- claude-opus-5-5: 1 activations, 1500 input and 300 output tokens, $0.0700\n- deepseek-chat: 1 activations, 3000 input and 400 output tokens, $0.0100; 500 tokens reserved or uncertain"),
+            "{}",
+            export.markdown
         );
         Ok(())
     }

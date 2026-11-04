@@ -33,6 +33,8 @@ fn model(id: &str) -> Model {
         input_per_million: None,
         output_per_million: None,
         parameters: Default::default(),
+        notes: None,
+        team_access: Default::default(),
     }
 }
 
@@ -163,6 +165,11 @@ enum Scenario {
     Review,
     /// The consultant spends its budget before answering.
     Overspend,
+    /// The reviewer's model may only read: it cannot write, so it hands the
+    /// work to the writer, which cannot hand reserved work back to it, but
+    /// it can approve the writer's patch. A model kept out of teams is
+    /// neither offered nor accepted.
+    Access,
 }
 
 struct TeamModel {
@@ -347,6 +354,156 @@ impl TeamModel {
                 }
             }
             (Scenario::Overspend, "consultant-1") => call("team_members", json!({})),
+            (Scenario::Access, "coordinator") => {
+                let integrated =
+                    peer("observation").is_some_and(|m| body(&m.content).contains("integrated"));
+                match last_tool.as_deref() {
+                    None if !ever("team_members") => {
+                        assert!(
+                            prompt.contains("Models the operator allows in this team: ")
+                                && prompt.contains("reader (reader-model, reads and reviews only: strong at reading large modules)")
+                                && prompt.contains("opus (claude-opus-5-5, can write)")
+                                && !prompt.contains("outside"),
+                            "the prompt names the models a member can bring in: {prompt}"
+                        );
+                        call("team_members", json!({}))
+                    }
+                    Some("team_members") => {
+                        let view: Value = serde_json::from_str(&last_result).unwrap();
+                        let models = view["models"].as_array().unwrap();
+                        assert!(models.iter().all(|m| m["alias"] != "outside"), "{view}");
+                        let reader = models.iter().find(|m| m["alias"] == "reader").unwrap();
+                        assert_eq!(reader["team_access"], "read");
+                        assert_eq!(reader["notes"], "strong at reading large modules");
+                        call(
+                            "team_add_member",
+                            json!({"name":"outsider","role":"analyst","justification":"try the excluded model","model":"outside"}),
+                        )
+                    }
+                    Some("team_add_member") => {
+                        assert!(
+                            last_result.contains("may not run team members"),
+                            "{last_result}"
+                        );
+                        call(
+                            "team_consult",
+                            json!({"question":"Is the parser safe?","model":"outside"}),
+                        )
+                    }
+                    Some("team_consult") => {
+                        assert!(
+                            last_result.contains("may not run team members"),
+                            "{last_result}"
+                        );
+                        call(
+                            "team_work_create",
+                            json!({"title":"rename the helper","deliverable":"integrated patch","assignee":ids["reviewer"],"close_conditions":"patch integrated"}),
+                        )
+                    }
+                    Some("team_work_create") => {
+                        let work = serde_json::from_str::<Value>(&last_result).unwrap_or_default();
+                        call(
+                            "team_message",
+                            json!({"recipient":ids["reviewer"],"purpose":"observation","body":"Please rename the helper in src/lib.rs.","work_id":work["id"]}),
+                        )
+                    }
+                    _ if integrated && !ever("team_close") => {
+                        call("team_close", json!({"reason":"the rename is integrated"}))
+                    }
+                    _ => text("coordinating"),
+                }
+            }
+            (Scenario::Access, "reviewer") => {
+                assert!(
+                    prompt.contains("The operator lets your model only read in this team"),
+                    "{prompt}"
+                );
+                let work = peer("observation").map(|m| header(&m.content, "work"));
+                let review = peer("verification_request").map(|m| body(&m.content).to_string());
+                if let Some(review) = review {
+                    let patch = word_after(&review, "review patch ");
+                    if !ever("team_patch_show") {
+                        call("team_patch_show", json!({"patch_id":patch}))
+                    } else if !ever("team_patch_review") {
+                        call(
+                            "team_patch_review",
+                            json!({"patch_id":patch,"verdict":"approve","reason":"the rename is complete"}),
+                        )
+                    } else if last_tool.as_deref() == Some("team_patch_review") {
+                        assert!(last_result.contains("integrated"), "{last_result}");
+                        call(
+                            "team_message",
+                            json!({"recipient":ids["coordinator"],"purpose":"observation","body":"the rename is integrated"}),
+                        )
+                    } else {
+                        text("reviewed")
+                    }
+                } else if let Some(work) = work {
+                    match last_tool.as_deref() {
+                        _ if !ever("team_work_claim") => call(
+                            "team_work_claim",
+                            json!({"work_id":work,"expected_revision":1}),
+                        ),
+                        Some("team_work_claim") => call(
+                            "team_access",
+                            json!({"mode":"write","work_id":work,"paths":["src"],"reason":"the rename changes src/lib.rs"}),
+                        ),
+                        Some("team_access") => {
+                            assert!(last_result.contains("may only read"), "{last_result}");
+                            call(
+                                "team_message",
+                                json!({"recipient":ids["analyst"],"purpose":"handoff","work_id":work,"body":"My model may only read here; please make the rename."}),
+                            )
+                        }
+                        _ => text("handed over"),
+                    }
+                } else {
+                    text("no work yet")
+                }
+            }
+            (Scenario::Access, "analyst") => {
+                let Some(work) = peer("handoff").map(|m| header(&m.content, "work")) else {
+                    return (name, text("no work yet"));
+                };
+                if !writing {
+                    if !ever("team_work_claim") {
+                        // Created, claimed by the reviewer, handed over.
+                        call(
+                            "team_work_claim",
+                            json!({"work_id":work,"expected_revision":3}),
+                        )
+                    } else if !ever("team_access") {
+                        call(
+                            "team_access",
+                            json!({"mode":"write","work_id":work,"paths":["src"],"reason":"the rename changes src/lib.rs"}),
+                        )
+                    } else {
+                        text("waiting for my worktree")
+                    }
+                } else if !ever("write_file") {
+                    call(
+                        "write_file",
+                        json!({"path":"src/lib.rs","content":"pub fn renamed() {}\n"}),
+                    )
+                } else if count("team_message") == 0 {
+                    // Reserved work cannot go back to a member that only reads.
+                    call(
+                        "team_message",
+                        json!({"recipient":ids["reviewer"],"purpose":"handoff","work_id":work,"body":"Take it back?"}),
+                    )
+                } else if !ever("team_patch_submit") {
+                    assert!(
+                        last_result.contains("recipient has to write"),
+                        "{last_result}"
+                    );
+                    call(
+                        "team_patch_submit",
+                        json!({"work_id":work,"summary":"rename helper to renamed","reviewer":ids["reviewer"]}),
+                    )
+                } else {
+                    text("patch submitted")
+                }
+            }
             _ => text("idle"),
         };
         (name, decision)
@@ -440,10 +597,32 @@ async fn run_team(scenario: Scenario) -> Result<Outcome> {
 
     let ids = Arc::new(Mutex::new(BTreeMap::new()));
     let log = Arc::new(Mutex::new(Vec::new()));
+    let mut config = config();
+    if scenario == Scenario::Access {
+        config.models.insert(
+            "reader".into(),
+            Model {
+                team_access: layeragent_config::ModelTeamAccess::Read,
+                notes: Some("strong at reading large modules".into()),
+                ..model("reader-model")
+            },
+        );
+        config.models.insert(
+            "outside".into(),
+            Model {
+                team_access: layeragent_config::ModelTeamAccess::None,
+                ..model("outside-model")
+            },
+        );
+        // Only the fixture provider: the excluded model is refused for its
+        // team access, not for egress.
+        config.models.remove("remote");
+        config.models.remove("deepseek");
+    }
     let engine = Engine::with_components(
         home.path().into(),
         "default".into(),
-        config(),
+        config,
         Arc::new(TeamModel {
             ids: ids.clone(),
             log: log.clone(),
@@ -464,6 +643,13 @@ async fn run_team(scenario: Scenario) -> Result<Outcome> {
     if scenario == Scenario::Review {
         options.scope.allow_write = true;
         options.cross_model_review = true;
+    }
+    if scenario == Scenario::Access {
+        options.scope.allow_write = true;
+        options
+            .role_models
+            .insert(TeamRole::Reviewer, "reader".into());
+        options.limits.max_members = 4;
     }
     let task = match store
         .create_task_with_execution(
@@ -649,5 +835,171 @@ async fn a_consultation_that_runs_out_of_budget_does_not_fail_the_team() -> Resu
         1,
         "{summary:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_model_that_may_only_read_reviews_but_never_writes() -> Result<()> {
+    let Outcome {
+        store,
+        scope,
+        task,
+        team,
+        project,
+        steps,
+    } = run_team(Scenario::Access).await?;
+    let summary = summary(&steps);
+    assert_eq!(task.state, TaskState::Completed, "{summary:?}");
+    assert_eq!(
+        std::fs::read_to_string(project.join("src/lib.rs"))?,
+        "pub fn renamed() {}\n"
+    );
+    for step in &steps {
+        let expected = if step.member == "reviewer" {
+            "reader"
+        } else {
+            "opus"
+        };
+        assert_eq!(step.model, expected, "{summary:?}");
+        assert_ne!(step.model, "outside", "{summary:?}");
+    }
+    // The reviewer never got write tools; the writer did.
+    assert!(
+        steps
+            .iter()
+            .filter(|s| s.member == "reviewer")
+            .all(|s| !s.tools.contains(&"write_file".to_string()))
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.member == "analyst" && s.tools.contains(&"write_file".to_string()))
+    );
+    let patches = store
+        .team_resource(&scope, &task.id, "patches", 0, 50)
+        .await?
+        .0;
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert_eq!(patches[0]["state"], "integrated");
+    assert_eq!(patches[0]["author_model"], "claude-opus-5-5");
+    assert_eq!(patches[0]["reviewer_model"], "reader-model");
+    let members = store.team_members(&team).await?;
+    assert!(
+        members.iter().all(|m| m["name"] != "outsider"
+            && m["model"] != "outside"
+            && m["role"] != "consultant"),
+        "the excluded model never joined: {members:?}"
+    );
+    let reviewer = members.iter().find(|m| m["name"] == "reviewer").unwrap();
+    assert_eq!(reviewer["access"], "read");
+    // Each model's consumption is reported on its own.
+    let snapshot = store.team_snapshot_by_id(&team).await?;
+    let models: Vec<&str> = snapshot
+        .usage_by_model
+        .iter()
+        .filter_map(|row| row["model"].as_str())
+        .collect();
+    assert_eq!(models, ["opus", "reader"], "{:?}", snapshot.usage_by_model);
+    assert!(
+        snapshot
+            .usage_by_model
+            .iter()
+            .all(|row| row["input_tokens"].as_i64() > Some(0))
+    );
+    Ok(())
+}
+
+/// The operator can change a model's team access after a team starts; the
+/// supervisor then blocks the team instead of running that model.
+#[tokio::test]
+async fn a_member_on_a_model_excluded_after_the_team_started_blocks_the_team() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let project = tempfile::tempdir()?;
+    let mut config = config();
+    config.models.insert(
+        "outside".into(),
+        Model {
+            team_access: layeragent_config::ModelTeamAccess::None,
+            ..model("outside-model")
+        },
+    );
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let engine = Engine::with_components(
+        home.path().into(),
+        "default".into(),
+        config,
+        Arc::new(TeamModel {
+            ids: Arc::new(Mutex::new(BTreeMap::new())),
+            log: log.clone(),
+            scenario: Scenario::Overspend,
+        }),
+        Arc::new(FileSandbox),
+    )?;
+    let scope = Scope::local();
+    let store = engine.store(&scope).await?;
+    // Storage records whatever the gateway accepted; this team was created
+    // while the analyst's model was still allowed.
+    let mut options = CooperativeOptions::default();
+    options.limits.max_concurrency = 1;
+    options
+        .role_models
+        .insert(TeamRole::Analyst, "outside".into());
+    let task = match store
+        .create_task_with_execution(
+            &scope,
+            &project.path().canonicalize()?.to_string_lossy(),
+            None,
+            "Investigate the parser",
+            "local",
+            &new_id(),
+            &"h".repeat(64),
+            EffortLevel::Auto,
+            RunMode::Normal,
+            false,
+            ExecutionMode::Cooperative,
+            Some(options),
+        )
+        .await?
+    {
+        TaskCreate::Created(task) | TaskCreate::Replayed(task) => task,
+    };
+    let team = task.team_id.clone().expect("team");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let run = tokio::spawn({
+        let (engine, scope, task, cancel) = (
+            engine.clone(),
+            scope.clone(),
+            task.id.clone(),
+            cancel.clone(),
+        );
+        async move { engine.run_cooperative(scope, task, None, cancel).await }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let snapshot = loop {
+        let snapshot = store.team_snapshot_by_id(&team).await?;
+        if snapshot.state == "blocked" {
+            break snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "team never blocked: {}",
+            snapshot.state
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let reason = snapshot.reason.clone().unwrap_or_default();
+    assert!(
+        reason.contains("may not run team members") && reason.contains("team_access"),
+        "{reason}"
+    );
+    let steps = log.lock().unwrap().clone();
+    assert!(!steps.is_empty(), "the coordinator ran first");
+    assert!(
+        steps.iter().all(|s| s.model != "outside"),
+        "{:?}",
+        summary(&steps)
+    );
+    cancel.cancel();
+    let _ = run.await?;
     Ok(())
 }

@@ -185,3 +185,134 @@ async fn approval_without_the_observed_revision_is_a_conflict() -> Result<()> {
     assert_eq!(status, StatusCode::CONFLICT);
     Ok(())
 }
+
+/// A daemon whose models carry the given team access; the first is primary.
+fn team_models_app(
+    models: &[(&str, &str, layeragent_config::ModelTeamAccess)],
+) -> Result<(axum::Router, tempfile::TempDir)> {
+    let home = tempfile::tempdir()?;
+    let mut config = Config::default();
+    config.providers.insert(
+        "local".into(),
+        layeragent_config::Provider {
+            wire: layeragent_config::Wire::Ollama,
+            base_url: "http://127.0.0.1:9".into(),
+            key_env: None,
+            oauth: None,
+            headers: Default::default(),
+        },
+    );
+    for (alias, id, access) in models {
+        config.models.insert(
+            (*alias).into(),
+            layeragent_config::Model {
+                provider: "local".into(),
+                id: (*id).into(),
+                context_window: 32768,
+                tools: true,
+                emulate_tools: false,
+                input_per_million: None,
+                output_per_million: None,
+                parameters: Default::default(),
+                notes: None,
+                team_access: *access,
+            },
+        );
+    }
+    config.primary = models[0].0.into();
+    config.policy.write = true;
+    let engine = Engine::with_components(
+        home.path().into(),
+        "default".into(),
+        config,
+        Arc::new(NoopModel),
+        Arc::new(NoopSandbox),
+    )?;
+    Ok((router(ApiState::new(engine, true)), home))
+}
+
+async fn create_team(
+    app: &axum::Router,
+    key: &str,
+    model: Option<&str>,
+    cooperative: Value,
+) -> Result<(StatusCode, Value)> {
+    let directory = tempfile::tempdir()?;
+    let workspace = directory
+        .path()
+        .canonicalize()?
+        .to_string_lossy()
+        .into_owned();
+    let mut body = json!({"workspace": workspace, "objective": "review it", "executor": "local", "execution": "cooperative", "cooperative": cooperative});
+    if let Some(model) = model {
+        body["model"] = json!(model);
+    }
+    call(app, "POST", "/v1/tasks", Some(key), body).await
+}
+
+#[tokio::test]
+async fn a_team_runs_only_the_models_the_operator_allows() -> Result<()> {
+    use layeragent_config::ModelTeamAccess::{None as Out, Read, Write};
+    let (app, _home) = team_models_app(&[
+        ("writer", "model-a", Write),
+        ("reader", "model-b", Read),
+        ("outside", "model-c", Out),
+    ])?;
+    let (status, refused) = create_team(&app, "k1", Some("outside"), json!({})).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("may not run team members"),
+        "{refused}"
+    );
+    let (status, refused) = create_team(
+        &app,
+        "k2",
+        None,
+        json!({"role_models": {"reviewer": "outside"}}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    // A read-only model runs members and reviews; writing needs the writer.
+    let cross = json!({"scope": {"allow_write": true}, "cross_model_review": true, "role_models": {"reviewer": "reader"}});
+    let (status, created) = create_team(&app, "k3", Some("reader"), cross.clone()).await?;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    // An excluded model does not count as the second model.
+    let (app, _home) =
+        team_models_app(&[("writer", "model-a", Write), ("outside", "model-c", Out)])?;
+    let (status, refused) = create_team(
+        &app,
+        "k4",
+        None,
+        json!({"scope": {"allow_write": true}, "cross_model_review": true}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("two models allowed in teams"),
+        "{refused}"
+    );
+
+    // Write scope needs some model that may write.
+    let (app, _home) = team_models_app(&[("reader", "model-b", Read)])?;
+    let (status, refused) =
+        create_team(&app, "k5", None, json!({"scope": {"allow_write": true}})).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains("team_access"),
+        "{refused}"
+    );
+    let (status, created) = create_team(&app, "k6", None, json!({})).await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a read-only team on it is fine: {created}"
+    );
+    Ok(())
+}

@@ -96,6 +96,8 @@ pub fn discover(home: &Path, config: &Config) -> Result<Vec<Skill>> {
     Ok(found.into_values().collect())
 }
 fn parse_frontmatter(raw: &str) -> Result<Frontmatter> {
+    // Files written or checked out on Windows end their lines with CRLF.
+    let raw = raw.replace("\r\n", "\n");
     let body = raw
         .strip_prefix("---\n")
         .context("skill needs YAML frontmatter")?;
@@ -576,6 +578,27 @@ mod tests {
         assert_eq!(quarantined(home.path())?[0]["source"], "agent draft");
         accept(home.path(), "bike-brand")?;
         assert!(discover(home.path(), &Config::default())?[0].reviewed);
+        Ok(())
+    }
+
+    #[test]
+    fn a_skill_with_windows_line_endings_is_read_like_any_other() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = tempfile::tempdir()?;
+        let dir = catalog.path().join("crlf-guide");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\r\nname: crlf-guide\r\ndescription: Written on Windows\r\n---\r\nKeep it simple.\r\n",
+        )?;
+        let imported = import(home.path(), catalog.path(), "crlf")?;
+        assert_eq!(imported[0]["status"], "quarantined", "{imported:?}");
+        assert_eq!(imported[0]["description"], "Written on Windows");
+        accept(home.path(), "crlf-guide")?;
+        assert_eq!(
+            discover(home.path(), &Config::default())?[0].name,
+            "crlf-guide"
+        );
         Ok(())
     }
 

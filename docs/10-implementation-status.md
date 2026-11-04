@@ -132,7 +132,9 @@ provider's minimum cacheable size, cache lifetime and prefix stability.
 - **Reviewed skills.** `accept` moves a skill into the registry with a review
   record of its hash; discovery marks it `reviewed`, distinct from `verified`
   by fixtures, and stops marking it when its files change. Records of a skill
-  are not part of its hash. Extra frontmatter keys are ignored.
+  are not part of its hash. Extra frontmatter keys are ignored, and a
+  `SKILL.md` with Windows line endings reads like any other (a Windows CI
+  checkout first showed every shipped skill refused).
 - **Guides.** `skill_draft` without fixtures quarantines the draft instead of
   staging it; `skill_verify` refuses it and names the operator's command.
 - **Search.** `skill_search` ranks active skills by words in the name,
